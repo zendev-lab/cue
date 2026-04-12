@@ -43,6 +43,7 @@ pub enum AppMsg {
     // Socket lifecycle
     Connected,
     Disconnected,
+    Reconnected { writer: WriterHandle },
     Response { id: u32, payload: ResponsePayload },
     ServerEvent(EventPayload),
 
@@ -154,6 +155,12 @@ impl AppState {
                 self.connected = false;
                 self.writer = None;
                 self.status_bar.update(StatusBarMsg::SetConnected(false));
+            }
+
+            AppMsg::Reconnected { writer } => {
+                self.writer = Some(writer);
+                self.connected = true;
+                self.status_bar.update(StatusBarMsg::SetConnected(true));
             }
 
             AppMsg::Response { id: _, payload } => {

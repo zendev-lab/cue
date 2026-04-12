@@ -1,10 +1,8 @@
 //! `cue` — TUI entry point for cue-shell.
 //!
-//! 1. Try to connect to the cued daemon socket.
+//! 1. Try to connect to the cued daemon (reusing the connection for TUI).
 //! 2. If not running, auto-start `cued start` and retry with backoff.
-//! 3. Initialize the terminal (crossterm raw mode, alternate screen).
-//! 4. Run the TUI event loop.
-//! 5. Restore the terminal on exit.
+//! 3. Run the TUI event loop with auto-reconnect on disconnect.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,10 +11,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::info;
 
+use cue_tui::CuedClient;
 use cue_tui::client::default_socket_path;
 
 fn main() -> Result<()> {
-    // Initialize logging.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -25,7 +23,6 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Build the tokio runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -37,14 +34,13 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     let socket_path = socket_path_from_env();
 
-    // Try to auto-start the daemon if not running.
-    ensure_daemon_running(&socket_path).await;
+    // Connect (auto-starting daemon if needed). The client is reused by TUI.
+    let client = ensure_daemon_running(&socket_path).await;
 
-    // Run the TUI (handles connect, terminal setup, event loop, teardown).
-    cue_tui::run(&socket_path).await
+    // Run the TUI with socket_path for auto-reconnect on disconnect.
+    cue_tui::run(&socket_path, client).await
 }
 
-/// Resolve socket path, respecting `CUE_SOCKET` env override.
 fn socket_path_from_env() -> PathBuf {
     if let Ok(path) = std::env::var("CUE_SOCKET") {
         PathBuf::from(path)
@@ -53,14 +49,25 @@ fn socket_path_from_env() -> PathBuf {
     }
 }
 
-/// If the daemon socket doesn't exist, attempt to start `cued start`
-/// and wait for it to be ready.
-async fn ensure_daemon_running(socket_path: &Path) {
-    if socket_path.exists() {
-        return;
+/// Try to connect to the daemon, auto-starting it if needed.
+///
+/// Returns the connected client for the TUI to reuse (no double-connect).
+/// Returns `None` for offline mode with auto-reconnect.
+async fn ensure_daemon_running(socket_path: &Path) -> Option<CuedClient> {
+    // Try direct connect first.
+    if let Ok(client) = CuedClient::connect(socket_path).await {
+        info!("cued already running");
+        return Some(client);
     }
 
-    info!("cued not running, attempting to start…");
+    // Connection failed. Clean up stale socket if present.
+    if socket_path.exists() {
+        info!("stale socket detected, removing {}", socket_path.display());
+        std::fs::remove_file(socket_path).ok();
+    }
+
+    // Auto-start the daemon.
+    info!("cued not running, attempting to start");
     let cued_bin = std::env::var("CUE_DAEMON_BIN").unwrap_or_else(|_| "cued".into());
     let _child = Command::new(&cued_bin)
         .arg("start")
@@ -69,16 +76,17 @@ async fn ensure_daemon_running(socket_path: &Path) {
         .stderr(std::process::Stdio::null())
         .spawn();
 
-    // Wait for socket to appear with backoff: 100ms, 200ms, 400ms, 800ms, 1600ms.
+    // Retry connect with backoff: 100ms, 200ms, 400ms, 800ms, 1600ms.
     let mut delay = Duration::from_millis(100);
     for _ in 0..5 {
         tokio::time::sleep(delay).await;
-        if socket_path.exists() {
-            info!("cued socket appeared after auto-start");
-            return;
+        if let Ok(client) = CuedClient::connect(socket_path).await {
+            info!("connected after auto-start");
+            return Some(client);
         }
         delay *= 2;
     }
 
-    tracing::warn!("cued did not start in time — will run in offline mode");
+    tracing::warn!("cued did not start in time, entering offline mode");
+    None
 }
