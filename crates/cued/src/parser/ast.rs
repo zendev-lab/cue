@@ -34,6 +34,8 @@ pub enum Argument {
         schedule: CronScheduleAst,
         body: ChainNode,
     },
+    /// Entity ID with optional byte count (for `:tail J3 1024`).
+    TailRef(IdKind, u32, Option<usize>),
     /// No argument (`:jobs`, `:agents`, `:help`).
     Empty,
 }

@@ -241,6 +241,32 @@ impl Parser {
                 Ok(Argument::Chain(self.parse_chain()?))
             }
 
+            // Tail: IdRef + optional byte count
+            "tail" => {
+                if let Token::IdRef(kind, n) = self.peek().clone() {
+                    self.advance();
+                    let bytes = match self.peek().clone() {
+                        Token::Word(w) => {
+                            if let Ok(b) = w.parse::<usize>() {
+                                self.advance();
+                                Some(b)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    Ok(Argument::TailRef(kind, n, bytes))
+                } else {
+                    Err(ParseError {
+                        span: self.peek_span(),
+                        message: ":tail requires an ID (e.g. J1)".into(),
+                        kind: ParseErrorKind::InvalidIdRef,
+                        suggestions: vec![":tail J1".into(), ":tail J1 1024".into()],
+                    })
+                }
+            }
+
             // IdRef argument
             "kill" | "retry" | "out" | "err" | "fg" | "wait" | "send" | "cancel" | "pause"
             | "resume" | "probe" => {
@@ -564,9 +590,9 @@ fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 
 fn suggest_command(name: &str) -> Vec<String> {
     let commands = [
-        "run", "kill", "retry", "out", "err", "fg", "wait", "send", "cancel", "jobs", "agents",
-        "crons", "scopes", "ask", "spawn", "confirm", "escalate", "probe", "cron", "env", "cd",
-        "scope", "help", "config", "log", "pause", "resume", "clear", "quit",
+        "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
+        "agents", "crons", "scopes", "ask", "spawn", "confirm", "escalate", "probe", "cron",
+        "env", "cd", "scope", "help", "config", "log", "pause", "resume", "clear", "quit",
     ];
     commands
         .iter()

@@ -37,7 +37,10 @@ pub enum ResolvedCommand {
     /// Retry a failed job.
     Retry { id: String },
     /// View stdout.
-    Out { id: String },
+    Out {
+        id: String,
+        tail_bytes: Option<usize>,
+    },
     /// View stderr.
     Err { id: String },
     /// Foreground attach.
@@ -200,7 +203,16 @@ impl Resolver {
             },
             "out" => ResolvedCommand::Out {
                 id: extract_id(argument),
+                tail_bytes: None,
             },
+            "tail" => {
+                let (id, bytes) = extract_tail_ref(argument);
+                // Default to 8 KiB tail when no explicit byte count is given.
+                ResolvedCommand::Out {
+                    id,
+                    tail_bytes: Some(bytes.unwrap_or(8192)),
+                }
+            }
             "err" => ResolvedCommand::Err {
                 id: extract_id(argument),
             },
@@ -312,6 +324,14 @@ fn extract_id(arg: Argument) -> String {
     match arg {
         Argument::IdRef(k, n) => format!("{k}{n}"),
         _ => String::new(),
+    }
+}
+
+fn extract_tail_ref(arg: Argument) -> (String, Option<usize>) {
+    match arg {
+        Argument::TailRef(k, n, bytes) => (format!("{k}{n}"), bytes),
+        Argument::IdRef(k, n) => (format!("{k}{n}"), None),
+        _ => (String::new(), None),
     }
 }
 

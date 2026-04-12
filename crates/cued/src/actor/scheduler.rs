@@ -1184,9 +1184,56 @@ async fn handle_command(
             }
         }
 
+        // ── :out / :tail → read job output ──
+        ResolvedCommand::Out { id, tail_bytes } => {
+            let Some(job_id) = parse_job_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_FOUND,
+                    format!("invalid job id: {id}"),
+                );
+            };
+
+            // Determine how many bytes to request.  None ⇒ entire ring buffer.
+            let request_bytes =
+                tail_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
+
+            // Try to read from the live ring buffer via ProcessMgr.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let sent = sys
+                .process_mgr
+                .send(ProcessMgrMsg::GetOutput {
+                    job_id,
+                    tail_bytes: request_bytes,
+                    reply: tx,
+                })
+                .await;
+            if sent.is_err() {
+                return ResponsePayload::err(
+                    error_code::INTERNAL,
+                    "process_mgr unreachable",
+                );
+            }
+
+            match rx.await {
+                Ok(Some(data)) => {
+                    let truncated = data.len() >= request_bytes;
+                    let text = String::from_utf8_lossy(&data).into_owned();
+                    ResponsePayload::Ok(OkPayload::Output {
+                        id,
+                        data: text,
+                        truncated,
+                    })
+                }
+                // Process entry already cleaned up — fall back to log file.
+                Ok(None) => read_output_from_log(job_id, &id, request_bytes).await,
+                Err(_) => {
+                    ResponsePayload::err(error_code::INTERNAL, "process_mgr reply dropped")
+                }
+            }
+        }
+
         // Stubs for commands not yet implemented.
         ResolvedCommand::Retry { id }
-        | ResolvedCommand::Out { id }
         | ResolvedCommand::Err { id }
         | ResolvedCommand::Fg { id }
         | ResolvedCommand::Wait { id }
@@ -1230,6 +1277,44 @@ fn parse_cron_id(s: &str) -> Option<CronId> {
     s.strip_prefix('C')
         .and_then(|n| n.parse::<u32>().ok())
         .map(CronId)
+}
+
+/// Fall back to reading a completed job's log file from disk.
+///
+/// The log lives at `<output_dir>/J<n>.log`.  File I/O is offloaded to the
+/// blocking thread-pool so the async runtime is not stalled.
+async fn read_output_from_log(
+    job_id: JobId,
+    display_id: &str,
+    tail_bytes: usize,
+) -> ResponsePayload {
+    let id = display_id.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let path = crate::dirs::output_dir().join(format!("{job_id}.log"));
+        std::fs::read(path)
+    })
+    .await
+    {
+        Ok(Ok(data)) => {
+            let truncated = data.len() > tail_bytes;
+            let trimmed = if truncated {
+                &data[data.len() - tail_bytes..]
+            } else {
+                &data
+            };
+            let text = String::from_utf8_lossy(trimmed).into_owned();
+            ResponsePayload::Ok(OkPayload::Output {
+                id,
+                data: text,
+                truncated,
+            })
+        }
+        Ok(Err(_)) => ResponsePayload::err(
+            error_code::NOT_FOUND,
+            format!("no output found for {id}"),
+        ),
+        Err(_) => ResponsePayload::err(error_code::INTERNAL, "blocking task panicked"),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
