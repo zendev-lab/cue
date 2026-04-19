@@ -27,6 +27,7 @@ enum Cli {
     Start {
         #[allow(dead_code)]
         fg: bool,
+        force: bool,
         socket: Option<PathBuf>,
     },
     Stop {
@@ -53,8 +54,12 @@ fn start_cmd() -> impl bpaf::Parser<Cli> {
         .long("fg")
         .help("Run in foreground")
         .switch();
+    let force = bpaf::short('F')
+        .long("force")
+        .help("Kill any running daemon and start fresh")
+        .switch();
     let socket = socket_arg();
-    bpaf::construct!(Cli::Start { fg, socket })
+    bpaf::construct!(Cli::Start { fg, force, socket })
         .to_options()
         .command("start")
         .help("Start the daemon")
@@ -107,7 +112,7 @@ fn main() {
         }
     };
     let result = match cmd {
-        Cli::Start { fg, socket } => run_start(fg, socket),
+        Cli::Start { fg, force, socket } => run_start(fg, force, socket),
         Cli::Stop { socket } => run_stop(socket),
         Cli::Status { socket } => run_status(socket),
         Cli::Gateway { stdio, socket } => run_gateway(stdio, socket),
@@ -120,8 +125,12 @@ fn main() {
 
 // ── Start ──
 
-fn run_start(fg: bool, socket_override: Option<PathBuf>) -> Result<()> {
-    ensure_not_running()?;
+fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<()> {
+    if force {
+        force_stop_if_running()?;
+    } else {
+        ensure_not_running()?;
+    }
 
     if fg {
         return run_start_foreground(socket_override);
@@ -385,7 +394,7 @@ fn implicit_start_args_only(args: &[OsString]) -> bool {
         };
 
         match arg {
-            "-f" | "--fg" => {}
+            "-f" | "--fg" | "-F" | "--force" => {}
             "--socket" => expecting_socket_path = true,
             _ if arg.starts_with("--socket=") => {}
             _ => return false,
@@ -393,6 +402,54 @@ fn implicit_start_args_only(args: &[OsString]) -> bool {
     }
 
     !expecting_socket_path
+}
+
+/// Kill any running daemon and wait for it to exit (used by `--force`).
+fn force_stop_if_running() -> Result<()> {
+    let pid_path = cued::dirs::pid_path();
+    let socket_path = cued::dirs::socket_path();
+
+    if !pid_path.exists() {
+        return Ok(());
+    }
+
+    let Ok(content) = std::fs::read_to_string(&pid_path) else {
+        std::fs::remove_file(&pid_path).ok();
+        return Ok(());
+    };
+
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        std::fs::remove_file(&pid_path).ok();
+        return Ok(());
+    };
+
+    if !is_process_alive(pid) {
+        std::fs::remove_file(&pid_path).ok();
+        std::fs::remove_file(&socket_path).ok();
+        return Ok(());
+    }
+
+    println!("cued: sending SIGTERM to pid {pid}");
+    // SAFETY: standard POSIX signal.
+    let rc = unsafe { libc_kill(pid as i32, 15) }; // 15 = SIGTERM
+    if rc != 0 {
+        anyhow::bail!("failed to send SIGTERM to pid {pid}");
+    }
+
+    // Poll for up to 5 s.
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !is_process_alive(pid) {
+            println!("cued: previous daemon stopped");
+            std::fs::remove_file(&pid_path).ok();
+            std::fs::remove_file(&socket_path).ok();
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "cued: pid {pid} did not exit within 5 s after SIGTERM; try `kill -9 {pid}` manually"
+    );
 }
 
 fn ensure_not_running() -> Result<()> {
