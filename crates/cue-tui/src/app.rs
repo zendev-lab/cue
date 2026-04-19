@@ -1125,6 +1125,26 @@ impl AppState {
         let Some(card) = self.main_view.cards.get(index).cloned() else {
             return;
         };
+
+        // For running jobs, route to the live view based on open_hint instead
+        // of showing a static preview.
+        if let Some(job_id) = self
+            .job_cards
+            .iter()
+            .find(|&(_, &card_idx)| card_idx == index)
+            .map(|(id, _)| id.clone())
+            && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
+            && matches!(job.status, JobStatus::Running)
+        {
+            let command = if matches!(job.open_hint, JobOpenHint::Fg) {
+                format!(":fg {}", job.id)
+            } else {
+                format!(":tail {}", job.id)
+            };
+            self.update(AppMsg::Submit(command));
+            return;
+        }
+
         let title = card
             .label
             .clone()
@@ -3060,7 +3080,7 @@ fn fg_key_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
                 Some(ch.to_string().into_bytes())
             }
         }
-        KeyCode::Enter => Some(vec![b'\n']),
+        KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Esc => Some(vec![0x1b]),
