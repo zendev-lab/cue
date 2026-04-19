@@ -158,13 +158,14 @@ CREATE TABLE scope_head (
     hash TEXT NOT NULL REFERENCES scopes(hash)
 );
 
--- Cron definitions (restored on daemon restart)
+-- Cron registry + history (restored on daemon restart)
 CREATE TABLE crons (
     id          TEXT PRIMARY KEY,   -- C1, C2, ...
-    schedule    TEXT NOT NULL,      -- serialized CronSchedule
-    pipeline    TEXT NOT NULL,      -- raw pipeline string
-    scope_hash  TEXT NOT NULL REFERENCES scopes(hash),
-    paused      INTEGER NOT NULL DEFAULT 0,
+    schedule    TEXT NOT NULL,
+    command     TEXT NOT NULL,      -- raw command / chain text
+    enabled     INTEGER NOT NULL DEFAULT 1, -- legacy mirror of runnable state
+    scope_hash  BLOB,
+    status      TEXT,               -- scheduled / paused / completed / expired
     created_at  TEXT NOT NULL
 );
 
@@ -184,12 +185,17 @@ CREATE TABLE jobs_history (
 -- Agent history
 CREATE TABLE agents_history (
     id          TEXT PRIMARY KEY,  -- A1, A2, ...
-    kind        TEXT NOT NULL,     -- Cli, Api
+    kind        TEXT NOT NULL,     -- legacy compatibility mirror of backend
+    backend     TEXT,              -- configured ACP backend/profile name
     role        TEXT NOT NULL,     -- Planner, Executor
-    command     TEXT,              -- spawn command (for CLI agents)
-    state       TEXT NOT NULL,
-    started_at  TEXT,
-    finished_at TEXT NOT NULL
+    status      TEXT NOT NULL,
+    session_id  TEXT,              -- ACP session id for resume/session-load
+    model       TEXT,              -- optional model override
+    scope_hash  BLOB,              -- scope snapshot used to relaunch the runtime
+    transcript  TEXT NOT NULL,     -- persisted session transcript for reconnect/restart hydration
+    last_role   TEXT,              -- last appended transcript role, used to continue chunk formatting
+    created_at  TEXT NOT NULL,
+    finished_at TEXT
 );
 
 -- Config overrides (mode param defaults from config.toml, cached)

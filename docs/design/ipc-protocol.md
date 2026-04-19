@@ -5,6 +5,10 @@
 - **Unix domain socket**: `$XDG_RUNTIME_DIR/cue-shell/cued.sock`
 - Fallback: `$HOME/.cue-shell/cued.sock`
 - Single bidirectional connection per client
+- `cued gateway --stdio` relays the exact same byte stream over stdin/stdout for SSH-style remote clients
+- Phase-1 remote support uses the system OpenSSH client and a client profile with
+  an explicit `gateway_command` (typically `cued gateway --stdio`) plus an
+  explicit `start_command` for the manual remote daemon start step
 
 ## 2. Framing
 
@@ -40,8 +44,8 @@ enum Message {
 // Request: Eval (user command)
 {"type": "request", "id": 1, "payload": {"Eval": {"input": ":run(retry=3) cargo test", "mode": "Job"}}}
 
-// Response (success — Eval resolved to RunJob)
-{"type": "response", "id": 1, "payload": {"Ok": {"JobCreated": {"job_id": "J1"}}}}
+// Response (success — Eval resolved to a serial chain)
+{"type": "response", "id": 1, "payload": {"Ok": {"ChainCreated": {"chain_id": "CH1", "job_ids": ["J1"], "chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Running", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": null, "start_scope": null, "end_scope": null, "open_hint": null}]}}}}}
 
 // Response (error)
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "unexpected token '||?' at position 15"}}}
@@ -50,7 +54,7 @@ enum Message {
 {"type": "request", "id": 2, "payload": {"Subscribe": {"channels": ["jobs", "agents", "output:J1"]}}}
 
 // Event
-{"type": "event", "payload": {"JobStateChanged": {"job_id": "J1", "old_state": "Pending", "new_state": "Running"}}}
+{"type": "event", "payload": {"ChainProgress": {"chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Done", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": "S@32b17bec", "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Running", "job_id": "J2", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}]}}}}
 
 // Request: Complete (editor service)
 {"type": "request", "id": 3, "payload": {"Complete": {"input": ":ru", "cursor": 3, "mode": "Job"}}}
@@ -114,11 +118,15 @@ enum RequestPayload {
     Subscribe { channels: Vec<String> },
     Unsubscribe { channels: Vec<String> },
 
-    // :fg mode (raw I/O proxy)
-    FgAttach { id: String },  // J1 or A1 (CLI Agent only)
+    // :fg mode (job pty attach or agent session foreground)
+    FgAttach { id: String },  // J1 or A1
     FgDetach {},
     FgInput { data: Vec<u8> },  // raw bytes from TUI keyboard
     FgResize { cols: u16, rows: u16 },  // terminal resize
+
+    // Structured agent session controls used by the TUI foreground view
+    AgentPrompt { id: String, prompt: String },
+    AgentCancel { id: String },
 
     // Editor services (completion & highlighting)
     Complete { input: String, cursor: usize, mode: Mode },
@@ -140,28 +148,37 @@ enum ResponsePayload {
 
 enum OkPayload {
     Ack {},  // generic success (Subscribe, Kill, FgDetach, etc.)
-    JobCreated { job_id: String },
-    ChainCreated { chain_id: String, job_ids: Vec<String> },
+    JobCreated {
+        job_id: String,
+        start_scope: Option<String>,
+        open_hint: JobOpenHint,
+        chain_id: Option<String>,
+        chain_index: Option<usize>,
+        chain_total: Option<usize>,
+    },  // scope snapshot used when the job starts; open_hint tells the TUI whether running jobs should open as :out or :fg
+    ChainCreated { chain_id: String, job_ids: Vec<String>, chain: ChainInfo },
     AgentSpawned { agent_id: String },
     CronAdded { cron_id: String },
-    ScopeCreated { hash: String, label: Option<String> },
+    ScopeCreated { hash: String, label: Option<String>, summary: String },
 
     JobInfo(JobInfo),
+    AgentInfo(AgentInfo),      // includes persisted transcript + last_role for UI hydration
     JobList(Vec<JobInfo>),
-    AgentList(Vec<AgentInfo>),
-    CronList(Vec<CronInfo>),
+    AgentList(Vec<AgentInfo>), // same AgentInfo payload, used by reconnect/sidebar snapshots
+    CronList(Vec<CronInfo>),   // includes persisted cron status/history for reconnect snapshots
     ScopeInfo(ScopeInfo),
     Output { id: String, data: String, truncated: bool },
 
     // Eval can return any of the above depending on the parsed command.
     // Additionally, some commands produce text output:
     EvalText { text: String },  // for :help, :env list, etc.
+    ConfirmRequest { prompt: String },
 
     // Editor services
     CompletionList { items: Vec<CompletionItem> },
     HighlightResult { spans: Vec<HighlightSpan> },
 
-    FgAttached { id: String },
+    FgAttached { id: String },  // J<n> = live PTY attach; A<n> = foreground session view opened
     Pong {},
 }
 
@@ -185,8 +202,24 @@ struct HighlightSpan {
 ```rust
 enum EventPayload {
     // Job events (channel: "jobs")
-    JobStateChanged { job_id: String, old_state: JobState, new_state: JobState },
-    JobCreated { job_id: String, pipeline: String },
+    JobStateChanged {
+        job_id: String,
+        old_state: JobState,
+        new_state: JobState,
+        end_scope: Option<String>,
+        chain_id: Option<String>,
+        chain_index: Option<usize>,
+    },
+    JobCreated {
+        job_id: String,
+        pipeline: String,
+        start_scope: Option<String>,
+        open_hint: JobOpenHint,
+        chain_id: Option<String>,
+        chain_index: Option<usize>,
+        chain_total: Option<usize>,
+    },
+    ChainProgress { chain: ChainInfo },
     JobRemoved { job_id: String },
 
     // Agent events (channel: "agents")
@@ -210,13 +243,58 @@ enum EventPayload {
 
     // :fg events (no channel — only sent to fg-attached client)
     FgOutput { data: Vec<u8> },  // raw pty output
-    FgExited { id: String, reason: String },  // process exited while in :fg
+    FgExited { id: String, reason: String },  // process exited while in :fg (jobs only)
 
     // System events (channel: "system")
     ShuttingDown { reason: String },
     DaemonReady {},
 }
+
+struct JobInfo {
+    id: String,
+    status: JobStatus,
+    pipeline: String,
+    exit_code: Option<i32>,
+    start_scope: Option<String>,
+    end_scope: Option<String>,
+    open_hint: JobOpenHint,
+    chain_id: Option<String>,
+    chain_index: Option<usize>,
+    chain_total: Option<usize>,
+}
+
+struct ChainInfo {
+    id: String,
+    pipeline: String,
+    total_jobs: usize,
+    jobs: Vec<ChainJobInfo>,
+}
+
+struct ChainJobInfo {
+    index: usize,
+    pipeline: String,
+    status: JobStatus,
+    job_id: Option<String>,
+    start_scope: Option<String>,
+    end_scope: Option<String>,
+    open_hint: Option<JobOpenHint>,
+}
+
+enum JobOpenHint {
+    Stream,
+    Fg,
+}
 ```
+
+Job scope fields are intentionally split:
+
+- `start_scope` is the scope snapshot used when the job was created.
+- `end_scope` is optional and becomes meaningful on terminal updates / snapshots.
+- For no-side-effect jobs, `end_scope` may equal `start_scope`.
+- `open_hint` is a server-computed display hint for running jobs: `Stream` means the preferred open action is `:out`; `Fg` means the preferred open action is `:fg`.
+- Clients should merge repeated `JobStateChanged` events by `job_id` and treat a later non-`None` `end_scope` as authoritative.
+- `chain_id` / `chain_index` / `chain_total` let clients correlate per-job events with a serial/parallel chain without waiting for a `:jobs` refresh.
+- `ChainCreated` and `ChainProgress` carry the authoritative leaf-by-leaf chain snapshot, including pending leaves that do not have job IDs yet and serial scope handoffs via `start_scope` / `end_scope`.
 
 ## 9. :fg Full-Duplex Proxy Mode
 

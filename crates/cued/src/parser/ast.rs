@@ -76,14 +76,16 @@ pub struct PipeSegment {
 pub enum CronScheduleAst {
     /// `every 5m`
     Every(Duration),
-    /// `at 09:00`
-    At(String),
+    /// `at 09:00 [on weekdays]` / `on weekdays at 09:00`
+    At { time: String, days: Option<String> },
     /// `in 30s`
     In(Duration),
     /// `cron "*/5 * * * *"`
     Crontab(String),
     /// `daily`, `hourly`, etc.
     Preset(String),
+    /// `<free-schedule> do <cmd...>`
+    FreeForm(String),
 }
 
 impl Pipeline {

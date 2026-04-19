@@ -1,10 +1,10 @@
-//! Main view component — the card-style REPL area.
+//! Main view component — the lower command log pane.
 //!
-//! Displays a vertical stack of "cards", each representing one command
-//! and its output.  Cards are colored by status (green=ok, red=error,
-//! yellow=pending/streaming).
+//! Displays a vertical stack of structured command records. Cards are colored
+//! by status (green=ok, red=error, yellow=pending/streaming).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use cue_core::Mode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -12,6 +12,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::Component;
+use crate::ansi;
 use crate::app::AppMsg;
 
 // ── Card types ──
@@ -39,6 +40,8 @@ impl CardStatus {
 /// A single REPL card: one command + its output.
 #[derive(Debug, Clone)]
 pub struct Card {
+    /// Which mode this card belongs to.
+    pub mode: Mode,
     /// What the user typed.
     pub input: String,
     /// Response / accumulated output.
@@ -50,8 +53,9 @@ pub struct Card {
 }
 
 impl Card {
-    pub fn new(input: String) -> Self {
+    pub fn new(input: String, mode: Mode) -> Self {
         Self {
+            mode,
             input,
             output: String::new(),
             status: CardStatus::Pending,
@@ -71,10 +75,14 @@ impl Card {
 
 /// Messages local to the main view.
 pub enum MainViewMsg {
+    /// Switch the active mode so empty-state guidance can mention the prompt mode.
+    SetMode(Mode),
     /// Append a new card for a submitted command.
     PushCard(Card),
     /// Update the latest card's output (streaming).
     AppendOutput { data: String },
+    /// Replace the latest card's output.
+    SetLatestOutput(String),
     /// Set the latest card's status.
     SetLatestStatus(CardStatus),
     /// Set the latest card's label.
@@ -84,6 +92,8 @@ pub enum MainViewMsg {
 // ── MainView ──
 
 pub struct MainView {
+    /// Active input mode.
+    pub mode: Mode,
     /// All cards, oldest first.
     pub cards: Vec<Card>,
     /// Scroll offset (0 = bottom, i.e. show newest).
@@ -93,9 +103,92 @@ pub struct MainView {
 impl MainView {
     pub fn new() -> Self {
         Self {
+            mode: Mode::default(),
             cards: Vec::new(),
             scroll_offset: 0,
         }
+    }
+
+    pub fn push_card(&mut self, input: String, mode: Mode) -> usize {
+        self.cards.push(Card::new(input, mode));
+        self.scroll_offset = 0;
+        self.cards.len() - 1
+    }
+
+    pub fn set_card_output(&mut self, index: usize, data: String) {
+        if let Some(card) = self.cards.get_mut(index) {
+            card.output = data;
+        }
+    }
+
+    pub fn append_card_output(&mut self, index: usize, data: &str) {
+        if let Some(card) = self.cards.get_mut(index) {
+            card.output.push_str(data);
+        }
+    }
+
+    pub fn set_card_status(&mut self, index: usize, status: CardStatus) {
+        if let Some(card) = self.cards.get_mut(index) {
+            card.status = status;
+        }
+    }
+
+    pub fn set_card_label(&mut self, index: usize, label: String) {
+        if let Some(card) = self.cards.get_mut(index) {
+            card.label = Some(label);
+        }
+    }
+
+    pub fn clear_all(&mut self) {
+        self.cards.clear();
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_card(&mut self, index: usize) {
+        if index < self.cards.len() {
+            self.scroll_offset = self.cards.len().saturating_sub(index + 1);
+        }
+    }
+
+    pub fn card_at_point(&self, area: Rect, point: Rect) -> Option<usize> {
+        if !crate::app::contains(area, point) {
+            return None;
+        }
+
+        let visible_indices = self.visible_indices();
+        if visible_indices.is_empty() {
+            return None;
+        }
+
+        let mut y = area.bottom();
+        let visible_len = visible_indices.len();
+        let start = visible_len.saturating_sub(self.scroll_offset);
+
+        for &idx in visible_indices[..start].iter().rev() {
+            let card = &self.cards[idx];
+            let h = card.height().min(y - area.y);
+            if h == 0 {
+                break;
+            }
+            y -= h;
+            let card_area = Rect::new(area.x, y, area.width, h);
+            if crate::app::contains(card_area, point) {
+                return Some(idx);
+            }
+            if y <= area.y {
+                break;
+            }
+        }
+
+        None
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        (0..self.cards.len()).collect()
+    }
+
+    fn latest_visible_card_mut(&mut self) -> Option<&mut Card> {
+        self.cards.iter_mut().last()
     }
 }
 
@@ -110,23 +203,29 @@ impl Component for MainView {
 
     fn update(&mut self, msg: MainViewMsg) {
         match msg {
+            MainViewMsg::SetMode(mode) => self.mode = mode,
             MainViewMsg::PushCard(card) => {
                 self.cards.push(card);
                 self.scroll_offset = 0; // auto-scroll to bottom
             }
             MainViewMsg::AppendOutput { data } => {
-                if let Some(card) = self.cards.last_mut() {
+                if let Some(card) = self.latest_visible_card_mut() {
                     card.output.push_str(&data);
                     card.status = CardStatus::Streaming;
                 }
             }
+            MainViewMsg::SetLatestOutput(data) => {
+                if let Some(card) = self.latest_visible_card_mut() {
+                    card.output = data;
+                }
+            }
             MainViewMsg::SetLatestStatus(status) => {
-                if let Some(card) = self.cards.last_mut() {
+                if let Some(card) = self.latest_visible_card_mut() {
                     card.status = status;
                 }
             }
             MainViewMsg::SetLatestLabel(label) => {
-                if let Some(card) = self.cards.last_mut() {
+                if let Some(card) = self.latest_visible_card_mut() {
                     card.label = Some(label);
                 }
             }
@@ -134,15 +233,24 @@ impl Component for MainView {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        if self.cards.is_empty() {
+        let visible_indices = self.visible_indices();
+        if visible_indices.is_empty() {
+            let prompt_mode = match self.mode {
+                Mode::Job => "JOB",
+                Mode::Agent => "AGENT",
+                Mode::Cron => "CRON",
+            };
             let welcome = Paragraph::new(vec![
                 Line::raw(""),
-                Line::raw("  Welcome to cue-shell"),
-                Line::raw("  Type a command and press Enter."),
+                Line::raw("  Command Log"),
+                Line::raw("  Structured command records appear here after responses arrive."),
+                Line::raw(
+                    "  Use the upper display tabs for `:out`, `:tail`, `:err`, and previews.",
+                ),
                 Line::raw(""),
-                Line::raw("  Shift+Tab to switch modes (Job / Agent / Cron)"),
-                Line::raw("  Ctrl+B to toggle sidebar"),
-                Line::raw("  Ctrl+C to quit"),
+                Line::raw(format!("  Current prompt mode: {prompt_mode}")),
+                Line::raw("  Shift+Tab: switch mode   Ctrl+B: toggle sidebar"),
+                Line::raw("  Tab: complete   Ctrl+C: running jobs   Ctrl+D: quit   Ctrl+L: clear"),
             ])
             .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(welcome, area);
@@ -151,13 +259,11 @@ impl Component for MainView {
 
         // Render cards bottom-up, filling available height.
         let mut y = area.bottom();
-        let start = if self.scroll_offset >= self.cards.len() {
-            0
-        } else {
-            self.cards.len() - self.scroll_offset
-        };
+        let visible_len = visible_indices.len();
+        let start = visible_len.saturating_sub(self.scroll_offset);
 
-        for card in self.cards[..start].iter().rev() {
+        for &idx in visible_indices[..start].iter().rev() {
+            let card = &self.cards[idx];
             let h = card.height().min(y - area.y);
             if h == 0 {
                 break;
@@ -178,14 +284,10 @@ impl Component for MainView {
         match key.code {
             KeyCode::PageUp => {
                 self.scroll_offset =
-                    (self.scroll_offset + 5).min(self.cards.len().saturating_sub(1));
+                    (self.scroll_offset + 5).min(self.visible_indices().len().saturating_sub(1));
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(5);
-            }
-            // Pass Ctrl combos up.
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(AppMsg::Quit);
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Some(AppMsg::ToggleSidebar);
@@ -199,7 +301,7 @@ impl Component for MainView {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_offset =
-                    (self.scroll_offset + 3).min(self.cards.len().saturating_sub(1));
+                    (self.scroll_offset + 3).min(self.visible_indices().len().saturating_sub(1));
             }
             MouseEventKind::ScrollDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(3);
@@ -213,10 +315,15 @@ impl Component for MainView {
 /// Render a single card into the given area.
 fn render_card(frame: &mut Frame, card: &Card, area: Rect) {
     let border_color = card.status.border_color();
+    let mode = match card.mode {
+        Mode::Job => "JOB",
+        Mode::Agent => "AGENT",
+        Mode::Cron => "CRON",
+    };
 
     let title = match &card.label {
-        Some(label) => format!(" > {} [{}] ", card.input, label),
-        None => format!(" > {} ", card.input),
+        Some(label) => format!(" {mode} > {} [{}] ", card.input, label),
+        None => format!(" {mode} > {} ", card.input),
     };
 
     let block = Block::new()
@@ -234,9 +341,26 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect) {
         card.output.clone()
     };
 
-    let paragraph = Paragraph::new(output)
+    let paragraph = Paragraph::new(ansi::to_text(&output))
         .block(block)
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_at_point_hits_latest_card() {
+        let mut view = MainView::new();
+        view.push_card("cargo test".into(), Mode::Job);
+        let second = view.push_card("cargo clippy".into(), Mode::Job);
+        view.set_card_output(second, "done".into());
+
+        let hit = view.card_at_point(Rect::new(0, 0, 40, 8), Rect::new(2, 6, 1, 1));
+
+        assert_eq!(hit, Some(second));
+    }
 }

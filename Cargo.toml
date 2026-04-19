@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/cue-cli",
+  "crates/cue-client",
   "crates/cue-core",
   "crates/cue-tui",
   "crates/cued",
@@ -15,14 +16,17 @@ repository = "https://github.com/zrr1999/cue-shell"
 license = "MIT"
 
 [workspace.dependencies]
+# Color
+ansi-to-tui = "8.0.1"
 # Error handling
 anyhow = "1"
+base64 = "0.22"
 # Hashing
 blake3 = "1"
 # CLI
 bpaf = { version = "0.9", features = ["dull-color"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "events"] }
-# Color
 owo-colors = "4"
 # TUI
 ratatui = "0.30"
@@ -34,6 +38,7 @@ serde_json = "1"
 thiserror = "2"
 # Async runtime
 tokio = { version = "1", features = [
+  "io-std",
   "io-util",
   "macros",
   "net",
@@ -43,9 +48,11 @@ tokio = { version = "1", features = [
   "sync",
   "time"
 ] }
+toml = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tui-term = "0.3.4"
 
 [profile.dev]
 opt-level = 0

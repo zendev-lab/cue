@@ -273,8 +273,8 @@ Which argument type each command expects:
 |---|---|---|
 | `:run` | Chain | ✓ (retry, timeout, scope) |
 | `:ask` | Text | ✓ (model, agent) |
-| `:cron` | CronExpr | ✓ (scope) |
-| `:spawn` | Text | ✓ (kind, role) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (scope) |
+| `:spawn` | Text | ✓ (agent, role) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |
@@ -288,8 +288,8 @@ Which argument type each command expects:
 | `:scope` | Text (subcommand) | ✓ (new/fork) |
 | `:help` | Empty or Text | ✗ |
 | `:confirm` | Text | ✗ |
-| `:escalate` | Empty | ✗ |
-| `:probe` | IdRef | ✗ |
+| `:escalate` | Text | ✗ |
+| `:probe` | Text | ✗ |
 | `:pause` | IdRef | ✗ |
 | `:resume` | IdRef | ✗ |
 | `:config` | Text | ✗ |

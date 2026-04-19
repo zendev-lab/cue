@@ -3,8 +3,12 @@
 //! This crate contains the parser, actor system, and process manager.
 
 pub mod actor;
+pub mod config;
 pub mod dirs;
+pub mod gateway_stdio;
 pub mod parser;
 pub mod pty;
 pub mod ring_buffer;
+pub mod runtime_env;
 pub mod storage;
+pub mod word_expansion;

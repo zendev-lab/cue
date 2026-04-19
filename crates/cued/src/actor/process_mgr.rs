@@ -5,11 +5,12 @@
 //! publishes output chunks + state-change events.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -18,8 +19,10 @@ use cue_core::ipc::{EventPayload, Stream as OutputStream};
 use cue_core::job::JobStatus;
 use cue_core::scope::EnvSnapshot;
 
-use super::{ActorSystem, EventBusMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg};
+use super::{ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg};
 use crate::ring_buffer::RingBuffer;
+use crate::runtime_env::effective_snapshot;
+use crate::word_expansion::expand_command_line;
 
 // ── Per-child bookkeeping ──
 
@@ -33,7 +36,16 @@ struct ProcessEntry {
     kill_tx: mpsc::Sender<()>,
     /// Shared ring buffer holding the latest output bytes (FIX 7).
     ring_buffer: Arc<Mutex<RingBuffer>>,
+    /// PTY master for job input.
+    input: Arc<AsyncFd<std::fs::File>>,
+    /// PTY master fd used for resize ioctls.
+    resize: Arc<std::fs::File>,
+    /// Which client, if any, owns the foreground stream.
+    fg_owner: Arc<Mutex<Option<u64>>>,
 }
+
+const DEFAULT_PTY_COLS: u16 = 80;
+const DEFAULT_PTY_ROWS: u16 = 24;
 
 // ── Actor entry point ──
 
@@ -96,30 +108,184 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         }
                     };
 
+                    let effective_snapshot = snapshot.as_ref().map(effective_snapshot);
+                    let expanded_command_line =
+                        expand_command_line(&command_line, effective_snapshot.as_ref());
+
                     // 2. Build the tokio Command.
-                    let Some(program) = command_line.first() else {
-                        error!(%job_id, "process_mgr: empty command_line");
+                    let Some(program) = expanded_command_line.first().filter(|program| !program.is_empty()) else {
+                        error!(
+                            %job_id,
+                            raw_cmd = ?command_line,
+                            expanded_cmd = ?expanded_command_line,
+                            "process_mgr: expanded command is empty"
+                        );
                         continue;
                     };
 
-                    let mut cmd = tokio::process::Command::new(program);
-                    if command_line.len() > 1 {
-                        cmd.args(&command_line[1..]);
+                    if let Some(ref snap) = effective_snapshot
+                        && !snap.cwd.is_dir()
+                    {
+                        error!(
+                            %job_id,
+                            cwd = %snap.cwd.display(),
+                            "process_mgr: invalid cwd for job spawn"
+                        );
+                        emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                            .await;
+                        let _ = sys
+                            .scheduler
+                            .send(SchedulerMsg::JobFinished {
+                                job_id,
+                                exit_code: -1,
+                            })
+                            .await;
+                        continue;
                     }
-                    cmd.stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .kill_on_drop(true);
 
-                    if let Some(ref snap) = snapshot {
+                    clear_output_log(job_id).await;
+
+                    let mut cmd = tokio::process::Command::new(program);
+                    if expanded_command_line.len() > 1 {
+                        cmd.args(&expanded_command_line[1..]);
+                    }
+                    if let Some(ref snap) = effective_snapshot {
                         apply_env(&mut cmd, snap);
                     }
+
+                    let pty_pair = match crate::pty::open_pty() {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            error!(%job_id, err = %error, "process_mgr: open pty failed");
+                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let master_file = std::fs::File::from(pty_pair.master);
+                    let slave = pty_pair.slave;
+                    if let Err(error) = set_nonblocking(master_file.as_raw_fd()) {
+                        error!(%job_id, err = %error, "process_mgr: set pty nonblocking failed");
+                        emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                            .await;
+                        let _ = sys
+                            .scheduler
+                            .send(SchedulerMsg::JobFinished {
+                                job_id,
+                                exit_code: -1,
+                            })
+                            .await;
+                        continue;
+                    }
+                    if let Err(error) =
+                        set_winsize(slave.as_raw_fd(), DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS)
+                    {
+                        warn!(%job_id, err = %error, "process_mgr: set initial pty size failed");
+                    }
+                    let reader_file = match master_file.try_clone() {
+                        Ok(file) => file,
+                        Err(error) => {
+                            error!(%job_id, err = %error, "process_mgr: clone pty reader failed");
+                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let input_file = match master_file.try_clone() {
+                        Ok(file) => file,
+                        Err(error) => {
+                            error!(%job_id, err = %error, "process_mgr: clone pty input failed");
+                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let resize_file = match master_file.try_clone() {
+                        Ok(file) => Arc::new(file),
+                        Err(error) => {
+                            error!(%job_id, err = %error, "process_mgr: clone pty resize failed");
+                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let slave_fd = slave.as_raw_fd();
+                    let master_fd = master_file.as_raw_fd();
+                    // SAFETY: the child process is single-threaded after fork here; the closure
+                    // only performs async-signal-safe libc calls on valid inherited fds.
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            if libc::setsid() == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                                if libc::dup2(slave_fd, target) == -1 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                            }
+                            if slave_fd > libc::STDERR_FILENO {
+                                libc::close(slave_fd);
+                            }
+                            if master_fd > libc::STDERR_FILENO {
+                                libc::close(master_fd);
+                            }
+                            Ok(())
+                        });
+                    }
+                    cmd.stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true);
 
                     // 3. Spawn the child process.
                     let mut child = match cmd.spawn() {
                         Ok(c) => c,
                         Err(e) => {
-                            error!(%job_id, err = %e, "process_mgr: spawn failed");
+                            error!(
+                                %job_id,
+                                program = %program,
+                                expanded_cmd = ?expanded_command_line,
+                                cwd = %snapshot
+                                    .as_ref()
+                                    .map(|snap| snap.cwd.display().to_string())
+                                    .unwrap_or_else(|| "<daemon cwd>".into()),
+                                path = ?snapshot
+                                    .as_ref()
+                                    .and_then(|snap| snap.env.get("PATH").cloned()),
+                                err = %e,
+                                "process_mgr: spawn failed"
+                            );
                             // Transition directly to Failed.
                             emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                             let _ = sys
@@ -132,6 +298,8 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             continue;
                         }
                     };
+                    drop(slave);
+                    drop(master_file);
 
                     let pid = child.id().unwrap_or(0);
                     info!(%job_id, pid, "process_mgr: child spawned");
@@ -141,21 +309,55 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     // 5. Open log file (FIX 5: offloaded to blocking thread).
                     let log_file = open_log_file(job_id).await;
-
-                    // 6. Take stdout/stderr handles.
-                    let stdout = child.stdout.take();
-                    let stderr = child.stderr.take();
+                    let input = match AsyncFd::new(input_file) {
+                        Ok(file) => Arc::new(file),
+                        Err(error) => {
+                            error!(%job_id, err = %error, "process_mgr: async pty input failed");
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let reader = match AsyncFd::new(reader_file) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            error!(%job_id, err = %error, "process_mgr: async pty reader failed");
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
 
                     // 7. Spawn reader/waiter background task.
                     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
                     // FIX 7: shared ring buffer accessible from ProcessEntry.
                     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
                     let ring_clone = ring_buffer.clone();
+                    let fg_owner = Arc::new(Mutex::new(None));
+                    let fg_owner_clone = fg_owner.clone();
                     let sys_clone = sys.clone();
                     let cleanup_tx_clone = cleanup_tx.clone();
                     let reader_handle = tokio::spawn(reader_task(
-                        job_id, child, stdout, stderr, log_file, kill_rx, sys_clone,
-                        ring_clone, cleanup_tx_clone,
+                        job_id, child, reader, log_file, kill_rx, sys_clone,
+                        ring_clone, fg_owner_clone, cleanup_tx_clone,
                     ));
 
                     children.insert(
@@ -166,6 +368,9 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             _reader_handle: reader_handle,
                             kill_tx,
                             ring_buffer,
+                            input,
+                            resize: resize_file,
+                            fg_owner,
                         },
                     );
                 }
@@ -189,6 +394,110 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         .get(&job_id.0)
                         .map(|entry| entry.ring_buffer.lock().unwrap().tail(tail_bytes));
                     let _ = reply.send(result);
+                }
+
+                ProcessMgrMsg::SendJobInput { job_id, data, reply } => {
+                    let input = children.get(&job_id.0).map(|entry| entry.input.clone());
+                    let handled = if let Some(input) = input {
+                        match write_pty(&input, &data).await {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(format!("failed to write job input: {error}")),
+                        }
+                    } else {
+                        Err(format!("job {job_id} does not accept stdin"))
+                    };
+                    let _ = reply.send(handled);
+                }
+
+                ProcessMgrMsg::AttachFg { client_id, job_id, reply } => {
+                    let (result, snapshot) = if let Some(entry) = children.get_mut(&job_id.0) {
+                        if entry.status != JobStatus::Running {
+                            (Err(format!("job {job_id} is not running")), None)
+                        } else if let Some(owner) = *entry.fg_owner.lock().unwrap()
+                            && owner != client_id
+                        {
+                            (Err(format!("job {job_id} is already foreground-attached")), None)
+                        } else {
+                            *entry.fg_owner.lock().unwrap() = Some(client_id);
+                            (
+                                Ok(()),
+                                Some(
+                                    entry
+                                        .ring_buffer
+                                        .lock()
+                                        .unwrap()
+                                        .tail(crate::ring_buffer::DEFAULT_CAPACITY),
+                                ),
+                            )
+                        }
+                    } else {
+                        (Err(format!("job {job_id} not found")), None)
+                    };
+                    let attached = result.is_ok();
+                    let _ = reply.send(result);
+                    if attached
+                        && let Some(snapshot) = snapshot
+                        && !snapshot.is_empty()
+                    {
+                        let _ = sys
+                            .gateway
+                            .send(GatewayMsg::SendEvent {
+                                client_id,
+                                payload: EventPayload::FgOutput { data: snapshot },
+                            })
+                            .await;
+                    }
+                }
+
+                ProcessMgrMsg::DetachFg { client_id, reason } => {
+                    let mut detached_jobs = Vec::new();
+                    for entry in children.values_mut() {
+                        if *entry.fg_owner.lock().unwrap() == Some(client_id) {
+                            *entry.fg_owner.lock().unwrap() = None;
+                            detached_jobs.push(entry.job_id.to_string());
+                        }
+                    }
+                    for job_id in detached_jobs {
+                        let _ = sys
+                            .gateway
+                            .send(GatewayMsg::SendEvent {
+                                client_id,
+                                payload: EventPayload::FgExited {
+                                    id: job_id,
+                                    reason: reason.clone(),
+                                },
+                            })
+                            .await;
+                    }
+                }
+
+                ProcessMgrMsg::FgInput { client_id, data, reply } => {
+                    let input = children
+                        .values()
+                        .find(|entry| *entry.fg_owner.lock().unwrap() == Some(client_id))
+                        .map(|entry| entry.input.clone());
+                    let handled = if let Some(input) = input {
+                        match write_pty(&input, &data).await {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(format!("failed to write fg input: {error}")),
+                        }
+                    } else {
+                        Err("no foreground session attached".to_string())
+                    };
+                    let _ = reply.send(handled);
+                }
+
+                ProcessMgrMsg::FgResize { client_id, cols, rows, reply } => {
+                    let resize = children
+                        .values()
+                        .find(|entry| *entry.fg_owner.lock().unwrap() == Some(client_id))
+                        .map(|entry| entry.resize.clone());
+                    let _ = reply.send(if let Some(resize) = resize {
+                        set_winsize(resize.as_raw_fd(), cols, rows)
+                            .map_err(|error| format!("failed to resize fg session: {error}"))
+                    } else {
+                        Err("no foreground session attached".into())
+                    });
                 }
 
                 ProcessMgrMsg::Shutdown => {
@@ -228,6 +537,64 @@ fn apply_env(cmd: &mut tokio::process::Command, snap: &EnvSnapshot) {
     cmd.current_dir(&snap.cwd);
 }
 
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl operates on a valid fd owned by this process.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl operates on a valid fd owned by this process.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn set_winsize(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> std::io::Result<()> {
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: ioctl operates on a valid tty/pty fd and a properly initialized winsize.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+async fn read_pty(fd: &AsyncFd<std::fs::File>, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        let mut guard = fd.readable().await?;
+        match guard.try_io(|inner| inner.get_ref().read(buf)) {
+            Ok(result) => return result,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+async fn write_pty(fd: &AsyncFd<std::fs::File>, data: &[u8]) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < data.len() {
+        let mut guard = fd.writable().await?;
+        match guard.try_io(|inner| inner.get_ref().write(&data[written..])) {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "pty write returned 0 bytes",
+                ));
+            }
+            Ok(Ok(n)) => written += n,
+            Ok(Err(error)) => return Err(error),
+            Err(_would_block) => continue,
+        }
+    }
+    Ok(())
+}
+
 /// Open (or create) the append-only log file for a job's output.
 ///
 /// FIX 5: runs on the blocking thread-pool so the tokio runtime thread is
@@ -256,31 +623,41 @@ async fn open_log_file(job_id: JobId) -> Option<std::fs::File> {
     .unwrap_or(None)
 }
 
-/// Background task that reads stdout/stderr, populates the ring buffer,
+async fn clear_output_log(job_id: JobId) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let path = crate::dirs::output_dir().join(format!("{job_id}.log"));
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                %job_id,
+                path = %path.display(),
+                err = %error,
+                "process_mgr: failed to remove stale output log"
+            );
+        }
+    })
+    .await;
+}
+
+/// Background task that reads PTY output, populates the ring buffer,
 /// writes to the log file, emits events, and waits for the child to exit.
 #[allow(clippy::too_many_arguments)]
 async fn reader_task(
     job_id: JobId,
     mut child: tokio::process::Child,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
+    reader: AsyncFd<std::fs::File>,
     log_file: Option<std::fs::File>,
     mut kill_rx: mpsc::Receiver<()>,
     sys: ActorSystem,
     ring: Arc<Mutex<RingBuffer>>,
+    fg_owner: Arc<Mutex<Option<u64>>>,
     cleanup_tx: mpsc::Sender<JobId>,
 ) {
     // FIX 5: wrap the log file so it can be shared with spawn_blocking.
     let log_file = Arc::new(Mutex::new(log_file));
-
-    // Wrap stdout/stderr in Option<BufReader>-like async readers.
-    let mut stdout = stdout;
-    let mut stderr = stderr;
-
-    let mut stdout_buf = vec![0u8; 8192];
-    let mut stderr_buf = vec![0u8; 8192];
-    let mut stdout_done = stdout.is_none();
-    let mut stderr_done = stderr.is_none();
+    let mut pty_buf = vec![0u8; 8192];
+    let mut pty_done = false;
 
     loop {
         tokio::select! {
@@ -304,59 +681,36 @@ async fn reader_task(
                 }
 
                 emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+                emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
                 // FIX 2: tell the main loop to remove our entry.
                 let _ = cleanup_tx.send(job_id).await;
                 return;
             }
 
-            // Read stdout.
-            result = async {
-                match stdout.as_mut() {
-                    Some(s) => s.read(&mut stdout_buf).await,
-                    None => std::future::pending().await,
-                }
-            }, if !stdout_done => {
+            result = read_pty(&reader, &mut pty_buf), if !pty_done => {
                 match result {
-                    Ok(0) => { stdout_done = true; }
+                    Ok(0) => { pty_done = true; }
                     Ok(n) => {
-                        let chunk = &stdout_buf[..n];
+                        let chunk = &pty_buf[..n];
                         ring.lock().unwrap().push(chunk);
                         write_log(&log_file, chunk).await;
                         emit_output(&sys, job_id, OutputStream::Stdout, chunk).await;
+                        emit_fg_output(&sys, &fg_owner, chunk).await;
                     }
                     Err(e) => {
-                        debug!(%job_id, err = %e, "process_mgr: stdout read error");
-                        stdout_done = true;
-                    }
-                }
-            }
-
-            // Read stderr.
-            result = async {
-                match stderr.as_mut() {
-                    Some(s) => s.read(&mut stderr_buf).await,
-                    None => std::future::pending().await,
-                }
-            }, if !stderr_done => {
-                match result {
-                    Ok(0) => { stderr_done = true; }
-                    Ok(n) => {
-                        let chunk = &stderr_buf[..n];
-                        ring.lock().unwrap().push(chunk);
-                        write_log(&log_file, chunk).await;
-                        emit_output(&sys, job_id, OutputStream::Stderr, chunk).await;
-                    }
-                    Err(e) => {
-                        debug!(%job_id, err = %e, "process_mgr: stderr read error");
-                        stderr_done = true;
+                        if e.raw_os_error() == Some(libc::EIO) {
+                            pty_done = true;
+                        } else {
+                            debug!(%job_id, err = %e, "process_mgr: pty read error");
+                            pty_done = true;
+                        }
                     }
                 }
             }
         }
 
-        // If both streams are closed, wait for the child to exit.
-        if stdout_done && stderr_done {
+        if pty_done {
             break;
         }
     }
@@ -399,6 +753,7 @@ async fn reader_task(
 
     if was_killed {
         emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
         let _ = sys
             .scheduler
             .send(SchedulerMsg::JobFinished {
@@ -415,6 +770,12 @@ async fn reader_task(
         };
 
         emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        let reason = if exit_code == 0 {
+            "done".to_string()
+        } else {
+            format!("exit {exit_code}")
+        };
+        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
 
         let _ = sys
             .scheduler
@@ -440,6 +801,9 @@ async fn emit_state_change(
                 job_id: job_id.to_string(),
                 old_state,
                 new_state,
+                end_scope: None,
+                chain_id: None,
+                chain_index: None,
             },
             channel: "jobs".into(),
         })
@@ -462,6 +826,42 @@ async fn emit_output(sys: &ActorSystem, job_id: JobId, stream: OutputStream, dat
         .await;
 }
 
+async fn emit_fg_output(sys: &ActorSystem, fg_owner: &Arc<Mutex<Option<u64>>>, data: &[u8]) {
+    let client_id = *fg_owner.lock().unwrap();
+    if let Some(client_id) = client_id {
+        let _ = sys
+            .gateway
+            .send(GatewayMsg::SendEvent {
+                client_id,
+                payload: EventPayload::FgOutput {
+                    data: data.to_vec(),
+                },
+            })
+            .await;
+    }
+}
+
+async fn emit_fg_exit(
+    sys: &ActorSystem,
+    fg_owner: &Arc<Mutex<Option<u64>>>,
+    job_id: JobId,
+    reason: &str,
+) {
+    let client_id = fg_owner.lock().unwrap().take();
+    if let Some(client_id) = client_id {
+        let _ = sys
+            .gateway
+            .send(GatewayMsg::SendEvent {
+                client_id,
+                payload: EventPayload::FgExited {
+                    id: job_id.to_string(),
+                    reason: reason.to_string(),
+                },
+            })
+            .await;
+    }
+}
+
 /// Write a chunk to the log file (best-effort).
 ///
 /// FIX 5: offloaded to the blocking thread-pool so the async reader task
@@ -477,4 +877,66 @@ async fn write_log(file: &Arc<Mutex<Option<std::fs::File>>>, data: &[u8]) {
         }
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn snapshot() -> EnvSnapshot {
+        EnvSnapshot {
+            env: BTreeMap::from([
+                ("HOME".into(), "/tmp/cue-home".into()),
+                ("USER".into(), "tester".into()),
+            ]),
+            cwd: PathBuf::from("/tmp/work"),
+        }
+    }
+
+    #[test]
+    fn expands_scope_words_for_jobs() {
+        let expanded = expand_command_line(
+            &[
+                "~/bin/tool".into(),
+                "~".into(),
+                "$HOME".into(),
+                "${USER}".into(),
+                "prefix-$USER-suffix".into(),
+            ],
+            Some(&snapshot()),
+        );
+
+        assert_eq!(
+            expanded,
+            vec![
+                "/tmp/cue-home/bin/tool",
+                "/tmp/cue-home",
+                "/tmp/cue-home",
+                "tester",
+                "prefix-tester-suffix",
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_unsupported_parameter_forms() {
+        let expanded = expand_command_line(
+            &[
+                "echo".into(),
+                "${USER:-guest}".into(),
+                "${BROKEN".into(),
+                "$1".into(),
+                "\\$USER".into(),
+            ],
+            Some(&snapshot()),
+        );
+
+        assert_eq!(
+            expanded,
+            vec!["echo", "${USER:-guest}", "${BROKEN", "$1", "$USER"]
+        );
+    }
 }

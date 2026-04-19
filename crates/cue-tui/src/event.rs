@@ -3,9 +3,8 @@
 //!
 //! The socket connection manager handles auto-reconnect: when the daemon
 //! disconnects, it retries every 3 seconds and sends `Reconnected` with a
-//! new [`WriterHandle`] on success.
+//! new [`crate::client::WriterHandle`] on success.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -13,7 +12,7 @@ use crossterm::event::{self, Event as CtEvent};
 use tokio::sync::mpsc;
 
 use crate::app::AppMsg;
-use crate::client::{ClientReader, CuedClient, spawn_writer_task};
+use crate::client::{ClientConnector, ClientReader, ConnectionEvent, spawn_connection_manager};
 use cue_core::ipc::Message;
 
 /// Spawn the event-producing tasks and return a receiver of [`AppMsg`].
@@ -24,7 +23,7 @@ use cue_core::ipc::Message;
 /// 3. **Tick timer** — periodic refresh for the status bar clock (async task)
 pub fn spawn_event_loop(
     socket_reader: Option<ClientReader>,
-    socket_path: PathBuf,
+    connector: ClientConnector,
 ) -> Result<mpsc::UnboundedReceiver<AppMsg>> {
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -40,6 +39,7 @@ pub fn spawn_event_loop(
                             let msg = match ev {
                                 CtEvent::Key(key) => AppMsg::KeyEvent(key),
                                 CtEvent::Mouse(mouse) => AppMsg::MouseEvent(mouse),
+                                CtEvent::Paste(data) => AppMsg::Paste(data),
                                 CtEvent::Resize(w, h) => AppMsg::Resize(w, h),
                                 _ => continue,
                             };
@@ -57,7 +57,23 @@ pub fn spawn_event_loop(
 
     // 2. Socket connection manager (read + auto-reconnect)
     let tx_sock = tx.clone();
-    tokio::spawn(socket_manager(socket_reader, socket_path, tx_sock));
+    let mut socket_events = spawn_connection_manager(socket_reader, connector);
+    tokio::spawn(async move {
+        while let Some(event) = socket_events.recv().await {
+            let msg = match event {
+                ConnectionEvent::Incoming(msg) => match msg {
+                    Message::Response { id, payload } => AppMsg::Response { id, payload },
+                    Message::Event { payload } => AppMsg::ServerEvent(payload),
+                    Message::Request { .. } => continue,
+                },
+                ConnectionEvent::Disconnected => AppMsg::Disconnected,
+                ConnectionEvent::Reconnected { writer } => AppMsg::Reconnected { writer },
+            };
+            if tx_sock.send(msg).is_err() {
+                break;
+            }
+        }
+    });
 
     // 3. Tick timer
     let tx_tick = tx;
@@ -72,75 +88,4 @@ pub fn spawn_event_loop(
     });
 
     Ok(rx)
-}
-
-/// Long-lived task that reads from the daemon socket and auto-reconnects.
-///
-/// Lifecycle: read → disconnect → wait 3s → reconnect → read → ...
-async fn socket_manager(
-    initial_reader: Option<ClientReader>,
-    socket_path: PathBuf,
-    tx: mpsc::UnboundedSender<AppMsg>,
-) {
-    let mut reader_opt = initial_reader;
-
-    loop {
-        // Phase 1: Read from current connection until EOF/error.
-        if let Some(mut reader) = reader_opt.take() {
-            if read_until_disconnect(&mut reader, &tx).await.is_err() {
-                return; // Channel closed — TUI is shutting down.
-            }
-            // Disconnected.
-            if tx.send(AppMsg::Disconnected).is_err() {
-                return;
-            }
-        }
-
-        // Phase 2: Reconnect loop with 3s interval.
-        loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-
-            match CuedClient::connect(&socket_path).await {
-                Ok(client) => {
-                    let (reader, writer) = client.into_split();
-                    let writer_handle = spawn_writer_task(writer);
-                    if tx
-                        .send(AppMsg::Reconnected {
-                            writer: writer_handle,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    reader_opt = Some(reader);
-                    break; // Back to read phase.
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-}
-
-/// Read messages from the daemon and forward as [`AppMsg`].
-///
-/// Returns `Ok(())` on disconnect, `Err(())` if the event channel is closed.
-async fn read_until_disconnect(
-    reader: &mut ClientReader,
-    tx: &mpsc::UnboundedSender<AppMsg>,
-) -> Result<(), ()> {
-    loop {
-        match reader.recv().await {
-            Ok(msg) => {
-                let app_msg = match msg {
-                    Message::Response { id, payload } => AppMsg::Response { id, payload },
-                    Message::Event { payload } => AppMsg::ServerEvent(payload),
-                    Message::Request { .. } => continue,
-                };
-                if tx.send(app_msg).is_err() {
-                    return Err(()); // TUI shut down.
-                }
-            }
-            Err(_) => return Ok(()), // Daemon disconnected.
-        }
-    }
 }

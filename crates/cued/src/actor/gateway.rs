@@ -47,6 +47,7 @@ pub async fn write_message(stream: &mut UnixStream, msg: &Message) -> Result<()>
 
 /// Type alias for the shared client map to avoid clippy::type_complexity.
 type ClientMap = Arc<tokio::sync::Mutex<HashMap<u64, mpsc::Sender<(u32, ResponsePayload)>>>>;
+type ClientEventMap = Arc<tokio::sync::Mutex<HashMap<u64, mpsc::Sender<EventPayload>>>>;
 
 /// Spawn the Gateway actor.
 ///
@@ -70,12 +71,14 @@ pub async fn spawn(
 
     // Shared state: client_id → response sender.
     let clients: ClientMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let event_clients: ClientEventMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let clients_for_dispatch = Arc::clone(&clients);
+    let event_clients_for_dispatch = Arc::clone(&event_clients);
 
     // Accept loop — runs in its own task.
     let sys_accept = sys.clone();
-    tokio::spawn(async move {
+    let accept_handle = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
@@ -83,7 +86,14 @@ pub async fn spawn(
                     info!(%client_id, "gateway: client connected");
                     let sys_clone = sys_accept.clone();
                     let clients_clone = Arc::clone(&clients_for_dispatch);
-                    tokio::spawn(handle_client(client_id, stream, sys_clone, clients_clone));
+                    let event_clients_clone = Arc::clone(&event_clients_for_dispatch);
+                    tokio::spawn(handle_client(
+                        client_id,
+                        stream,
+                        sys_clone,
+                        clients_clone,
+                        event_clients_clone,
+                    ));
                 }
                 Err(e) => {
                     error!("gateway: accept error: {e}");
@@ -94,6 +104,7 @@ pub async fn spawn(
 
     // Dispatch loop — routes responses/events back to clients.
     tokio::spawn(async move {
+        let mut accept_handle = Some(accept_handle);
         while let Some(msg) = rx.recv().await {
             match msg {
                 GatewayMsg::SendResponse {
@@ -111,6 +122,20 @@ pub async fn spawn(
                     }
                 }
 
+                GatewayMsg::SendEvent { client_id, payload } => {
+                    let sender = {
+                        let guard = event_clients.lock().await;
+                        guard.get(&client_id).cloned()
+                    };
+                    if let Some(sender) = sender {
+                        if sender.send(payload).await.is_err() {
+                            warn!(%client_id, "gateway: direct event channel closed");
+                        }
+                    } else {
+                        warn!(%client_id, "gateway: no such client for direct event");
+                    }
+                }
+
                 GatewayMsg::PushEvent { payload, channel } => {
                     // Delegate to event bus.
                     let _ = sys
@@ -121,12 +146,18 @@ pub async fn spawn(
 
                 GatewayMsg::Shutdown => {
                     info!("gateway: shutdown signal received");
-                    // We don't break here — the accept loop is in another task.
-                    // The main shutdown sequence will drop all senders, which
-                    // closes channels and causes tasks to exit.
+                    if let Some(handle) = accept_handle.take() {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
                     break;
                 }
             }
+        }
+
+        if let Some(handle) = accept_handle.take() {
+            handle.abort();
+            let _ = handle.await;
         }
 
         debug!("gateway: dispatch loop stopped");
@@ -141,6 +172,7 @@ async fn handle_client(
     mut stream: UnixStream,
     sys: ActorSystem,
     clients: ClientMap,
+    event_clients: ClientEventMap,
 ) {
     // Per-client response channel.
     let (resp_tx, mut resp_rx) = mpsc::channel::<(u32, ResponsePayload)>(64);
@@ -152,9 +184,13 @@ async fn handle_client(
         let mut guard = clients.lock().await;
         guard.insert(client_id, resp_tx);
     }
+    {
+        let mut guard = event_clients.lock().await;
+        guard.insert(client_id, evt_tx.clone());
+    }
 
     // Auto-subscribe to default channels.
-    for channel in ["jobs", "output:*"] {
+    for channel in ["jobs"] {
         let _ = sys
             .event_bus
             .send(EventBusMsg::Subscribe {
@@ -229,9 +265,20 @@ async fn handle_client(
         let mut guard = clients.lock().await;
         guard.remove(&client_id);
     }
+    {
+        let mut guard = event_clients.lock().await;
+        guard.remove(&client_id);
+    }
     let _ = sys
         .event_bus
         .send(EventBusMsg::UnsubscribeAll { client_id })
+        .await;
+    let _ = sys
+        .process_mgr
+        .send(super::ProcessMgrMsg::DetachFg {
+            client_id,
+            reason: "client disconnected".into(),
+        })
         .await;
 }
 
@@ -326,6 +373,105 @@ async fn route_request(
                 .await?;
         }
 
+        RequestPayload::FgAttach { id } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::Fg { id },
+                })
+                .await
+                .context("send fg attach to scheduler")?;
+        }
+
+        RequestPayload::FgDetach {} => {
+            sys.process_mgr
+                .send(super::ProcessMgrMsg::DetachFg {
+                    client_id,
+                    reason: "detached".into(),
+                })
+                .await
+                .context("send fg detach to process_mgr")?;
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload: ResponsePayload::ack(),
+                })
+                .await?;
+        }
+
+        RequestPayload::FgInput { data } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sys.process_mgr
+                .send(super::ProcessMgrMsg::FgInput {
+                    client_id,
+                    data,
+                    reply: tx,
+                })
+                .await
+                .context("send fg input to process_mgr")?;
+            let payload = match rx.await {
+                Ok(Ok(())) => ResponsePayload::ack(),
+                Ok(Err(message)) => ResponsePayload::err(error_code::INVALID_STATE, message),
+                Err(_) => ResponsePayload::err(error_code::INTERNAL, "process_mgr unreachable"),
+            };
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload,
+                })
+                .await?;
+        }
+
+        RequestPayload::FgResize { cols, rows } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sys.process_mgr
+                .send(super::ProcessMgrMsg::FgResize {
+                    client_id,
+                    cols,
+                    rows,
+                    reply: tx,
+                })
+                .await
+                .context("send fg resize to process_mgr")?;
+            let payload = match rx.await {
+                Ok(Ok(())) => ResponsePayload::ack(),
+                Ok(Err(message)) => ResponsePayload::err(error_code::INVALID_STATE, message),
+                Err(_) => ResponsePayload::err(error_code::INTERNAL, "process_mgr unreachable"),
+            };
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload,
+                })
+                .await?;
+        }
+
+        RequestPayload::AgentPrompt { id, prompt } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::Send { id, data: prompt },
+                })
+                .await
+                .context("send agent prompt to scheduler")?;
+        }
+
+        RequestPayload::AgentCancel { id } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::Cancel { id },
+                })
+                .await
+                .context("send agent cancel to scheduler")?;
+        }
+
         RequestPayload::Ping {} => {
             sys.gateway
                 .send(GatewayMsg::SendResponse {
@@ -345,8 +491,10 @@ async fn route_request(
                     payload: ResponsePayload::ack(),
                 })
                 .await?;
-            // Trigger full shutdown.
-            sys.gateway.send(GatewayMsg::Shutdown).await?;
+            // Signal the main process so async_main performs a full coordinated shutdown.
+            unsafe {
+                libc::kill(std::process::id() as i32, libc::SIGTERM);
+            }
         }
 
         // Stubs for unimplemented request types.

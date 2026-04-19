@@ -8,6 +8,7 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentStatus;
+use crate::cron::CronStatus;
 use crate::job::JobStatus;
 use crate::mode::Mode;
 
@@ -55,6 +56,13 @@ pub enum RequestPayload {
         cols: u16,
         rows: u16,
     },
+    AgentPrompt {
+        id: String,
+        prompt: String,
+    },
+    AgentCancel {
+        id: String,
+    },
 
     // Editor services
     Complete {
@@ -84,10 +92,16 @@ pub enum OkPayload {
     Ack {},
     JobCreated {
         job_id: String,
+        start_scope: Option<String>,
+        open_hint: JobOpenHint,
+        chain_id: Option<String>,
+        chain_index: Option<usize>,
+        chain_total: Option<usize>,
     },
     ChainCreated {
         chain_id: String,
         job_ids: Vec<String>,
+        chain: ChainInfo,
     },
     AgentSpawned {
         agent_id: String,
@@ -98,10 +112,12 @@ pub enum OkPayload {
     ScopeCreated {
         hash: String,
         label: Option<String>,
+        summary: String,
     },
 
     JobInfo(JobInfo),
     JobList(Vec<JobInfo>),
+    AgentInfo(AgentInfo),
     AgentList(Vec<AgentInfo>),
     CronList(Vec<CronInfo>),
     ScopeInfo(ScopeInfo),
@@ -113,6 +129,9 @@ pub enum OkPayload {
 
     EvalText {
         text: String,
+    },
+    ConfirmRequest {
+        prompt: String,
     },
 
     CompletionList {
@@ -137,10 +156,21 @@ pub enum EventPayload {
         job_id: String,
         old_state: JobStatus,
         new_state: JobStatus,
+        end_scope: Option<String>,
+        chain_id: Option<String>,
+        chain_index: Option<usize>,
     },
     JobCreated {
         job_id: String,
         pipeline: String,
+        start_scope: Option<String>,
+        open_hint: JobOpenHint,
+        chain_id: Option<String>,
+        chain_index: Option<usize>,
+        chain_total: Option<usize>,
+    },
+    ChainProgress {
+        chain: ChainInfo,
     },
     JobRemoved {
         job_id: String,
@@ -217,6 +247,13 @@ pub enum Stream {
     Stderr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobOpenHint {
+    Stream,
+    Fg,
+}
+
 // ── Info structs (shared by Response and queries) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,14 +262,24 @@ pub struct JobInfo {
     pub status: JobStatus,
     pub pipeline: String,
     pub exit_code: Option<i32>,
+    pub start_scope: Option<String>,
+    pub end_scope: Option<String>,
+    pub open_hint: JobOpenHint,
+    pub chain_id: Option<String>,
+    pub chain_index: Option<usize>,
+    pub chain_total: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
     pub status: AgentStatus,
-    pub kind: String,
+    pub backend: String,
     pub role: String,
+    #[serde(default)]
+    pub transcript: String,
+    #[serde(default)]
+    pub last_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,7 +287,7 @@ pub struct CronInfo {
     pub id: String,
     pub schedule: String,
     pub command: String,
-    pub enabled: bool,
+    pub status: CronStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +296,25 @@ pub struct ScopeInfo {
     pub parent: Option<String>,
     pub cwd: String,
     pub env_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainInfo {
+    pub id: String,
+    pub pipeline: String,
+    pub total_jobs: usize,
+    pub jobs: Vec<ChainJobInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainJobInfo {
+    pub index: usize,
+    pub pipeline: String,
+    pub status: JobStatus,
+    pub job_id: Option<String>,
+    pub start_scope: Option<String>,
+    pub end_scope: Option<String>,
+    pub open_hint: Option<JobOpenHint>,
 }
 
 // ── Editor services ──

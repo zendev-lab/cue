@@ -3,6 +3,7 @@
 //! Maintains an in-memory cache backed by SQLite.  The "HEAD" pointer
 //! tracks the current active scope (analogous to git HEAD).
 
+use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
@@ -23,26 +24,20 @@ use cue_core::ipc::EventPayload;
 /// Initialises a root scope from the current process environment.
 pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: ActorSystem) {
     tokio::spawn(async move {
-        let mut cache: HashMap<ScopeHash, Scope> = HashMap::new();
+        let (mut cache, mut current_head, restored) = match load_initial_scope(&conn) {
+            Ok(initial) => initial,
+            Err(e) => {
+                error!("scope_store: failed to load initial scope: {e}");
+                let (cache, head, _) = create_and_persist_root_scope(&conn);
+                (cache, head, false)
+            }
+        };
 
-        // Build root scope from the real environment.
-        let env: BTreeMap<String, String> = std::env::vars().collect();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        let snapshot = EnvSnapshot { env, cwd };
-        let root = Scope::root(snapshot);
-        let head = root.hash;
-
-        // Persist root.
-        if let Err(e) = storage::insert_scope(&conn, &root) {
-            error!("scope_store: failed to persist root scope: {e}");
+        if restored {
+            info!(%current_head, "scope_store: restored persisted head scope");
+        } else {
+            info!(%current_head, "scope_store: started with root scope");
         }
-        if let Err(e) = storage::set_head(&conn, &head) {
-            error!("scope_store: failed to set initial head: {e}");
-        }
-        cache.insert(root.hash, root);
-        let mut current_head = head;
-
-        info!(%current_head, "scope_store: started with root scope");
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -143,6 +138,43 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                     let _ = reply.send(Ok(child_hash));
                 }
 
+                ScopeStoreMsg::Derive { base, delta, reply } => {
+                    let parent_scope = if let Some(scope) = cache.get(&base) {
+                        Some(scope.clone())
+                    } else {
+                        match storage::get_scope(&conn, &base) {
+                            Ok(Some(scope)) => {
+                                cache.insert(scope.hash, scope.clone());
+                                Some(scope)
+                            }
+                            Ok(None) => None,
+                            Err(e) => {
+                                error!("scope_store: db error: {e}");
+                                None
+                            }
+                        }
+                    };
+                    let Some(parent) = parent_scope else {
+                        let _ = reply.send(Err(anyhow::anyhow!("scope {} not found", base)));
+                        continue;
+                    };
+                    let Some(ref parent_snap) = parent.snapshot else {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "scope {} has no snapshot",
+                            parent.hash
+                        )));
+                        continue;
+                    };
+
+                    let child = Scope::fork(parent.hash, parent_snap, delta);
+                    let child_hash = child.hash;
+                    if let Err(e) = storage::insert_scope(&conn, &child) {
+                        error!("scope_store: persist derived scope failed: {e}");
+                    }
+                    cache.insert(child_hash, child);
+                    let _ = reply.send(Ok(child_hash));
+                }
+
                 ScopeStoreMsg::Shutdown => {
                     debug!("scope_store: shutting down");
                     break;
@@ -152,4 +184,71 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
 
         debug!("scope_store: stopped");
     });
+}
+
+fn load_initial_scope(conn: &Connection) -> Result<(HashMap<ScopeHash, Scope>, ScopeHash, bool)> {
+    if let Some(head) = storage::get_head(conn)? {
+        if let Some(scope) = storage::get_scope(conn, &head)? {
+            let mut cache = HashMap::new();
+            cache.insert(scope.hash, scope);
+            return Ok((cache, head, true));
+        }
+        error!(%head, "scope_store: persisted head is missing; recreating root");
+    }
+
+    let (cache, head, restored) = create_and_persist_root_scope(conn);
+    Ok((cache, head, restored))
+}
+
+fn create_and_persist_root_scope(
+    conn: &Connection,
+) -> (HashMap<ScopeHash, Scope>, ScopeHash, bool) {
+    let mut cache = HashMap::new();
+
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let snapshot = EnvSnapshot { env, cwd };
+    let root = Scope::root(snapshot);
+    let head = root.hash;
+
+    if let Err(e) = storage::insert_scope(conn, &root) {
+        error!("scope_store: failed to persist root scope: {e}");
+    }
+    if let Err(e) = storage::set_head(conn, &head) {
+        error!("scope_store: failed to set initial head: {e}");
+    }
+    cache.insert(root.hash, root);
+
+    (cache, head, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cue_core::scope::EnvSnapshot;
+    use std::path::Path;
+
+    fn in_memory_db() -> Connection {
+        storage::open_db(Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    #[test]
+    fn load_initial_scope_restores_persisted_head() {
+        let conn = in_memory_db();
+        let snapshot = EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/persisted"),
+        };
+        let scope = Scope::root(snapshot);
+        storage::insert_scope(&conn, &scope).unwrap();
+        storage::set_head(&conn, &scope.hash).unwrap();
+
+        let (cache, head, restored) = load_initial_scope(&conn).unwrap();
+
+        assert!(restored);
+        assert_eq!(head, scope.hash);
+        let restored_scope = cache.get(&head).expect("restored scope in cache");
+        assert_eq!(restored_scope.hash, scope.hash);
+        assert_eq!(restored_scope.snapshot, scope.snapshot);
+    }
 }

@@ -41,6 +41,11 @@ pub enum GatewayMsg {
         request_id: u32,
         payload: ResponsePayload,
     },
+    /// Deliver an event directly to a specific client.
+    SendEvent {
+        client_id: u64,
+        payload: EventPayload,
+    },
     /// Push an event to all subscribers of `channel`.
     PushEvent {
         payload: EventPayload,
@@ -63,6 +68,22 @@ pub enum SchedulerMsg {
         job_id: cue_core::JobId,
         exit_code: i32,
     },
+    /// An agent emitted a streamed text chunk.
+    AgentMessage {
+        agent_id: cue_core::AgentId,
+        role: String,
+        content: String,
+    },
+    /// An agent changed lifecycle state.
+    AgentStateChanged {
+        agent_id: cue_core::AgentId,
+        status: cue_core::agent::AgentStatus,
+    },
+    /// An agent has been bound to a concrete ACP session ID.
+    AgentSessionBound {
+        agent_id: cue_core::AgentId,
+        session_id: String,
+    },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -82,6 +103,33 @@ pub enum ProcessMgrMsg {
         job_id: cue_core::JobId,
         tail_bytes: usize,
         reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    },
+    /// Send raw input bytes to a specific running job.
+    SendJobInput {
+        job_id: cue_core::JobId,
+        data: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Attach a client to a job's live foreground stream.
+    AttachFg {
+        client_id: u64,
+        job_id: cue_core::JobId,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Detach a client from any foreground-attached job.
+    DetachFg { client_id: u64, reason: String },
+    /// Send raw input bytes to the currently foreground-attached job.
+    FgInput {
+        client_id: u64,
+        data: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Resize the foreground session.
+    FgResize {
+        client_id: u64,
+        cols: u16,
+        rows: u16,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Graceful shutdown.
     Shutdown,
@@ -109,6 +157,12 @@ pub enum ScopeStoreMsg {
     },
     /// Fork a child scope from the current HEAD.
     Fork {
+        delta: EnvDelta,
+        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
+    },
+    /// Derive a child scope from a specific base without moving HEAD.
+    Derive {
+        base: ScopeHash,
         delta: EnvDelta,
         reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
@@ -164,7 +218,8 @@ impl ActorSystem {
 /// Spawn all five actors, returning the [`ActorSystem`] handle bundle.
 pub async fn spawn_all(
     socket_path: std::path::PathBuf,
-    db: rusqlite::Connection,
+    scope_db: rusqlite::Connection,
+    scheduler_db: rusqlite::Connection,
 ) -> Result<ActorSystem> {
     // Create channels.
     let (gw_tx, gw_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
@@ -183,9 +238,9 @@ pub async fn spawn_all(
 
     // Spawn actors.
     event_bus::spawn(eb_rx);
-    scope_store::spawn(ss_rx, db, sys.clone());
+    scope_store::spawn(ss_rx, scope_db, sys.clone());
     process_mgr::spawn(pm_rx, sys.clone());
-    scheduler::spawn(sched_rx, sys.clone());
+    scheduler::spawn(sched_rx, scheduler_db, sys.clone());
     gateway::spawn(gw_rx, socket_path, sys.clone()).await?;
 
     // Publish DaemonReady event.

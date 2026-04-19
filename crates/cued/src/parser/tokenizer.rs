@@ -15,6 +15,8 @@ pub struct Tokenizer<'a> {
     pos: usize,
     /// The last significant (non-whitespace) token kind, for `()` disambiguation.
     last_significant: Option<TokenClass>,
+    /// Whether we are currently tokenizing `:cmd(...)` mode params.
+    in_mode_params: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,6 +40,7 @@ impl<'a> Tokenizer<'a> {
             bytes: input.as_bytes(),
             pos: 0,
             last_significant: None,
+            in_mode_params: false,
         }
     }
 
@@ -126,6 +129,7 @@ impl<'a> Tokenizer<'a> {
             b'(' => {
                 self.pos += 1;
                 if self.last_significant == Some(TokenClass::Command) {
+                    self.in_mode_params = true;
                     self.last_significant = Some(TokenClass::Other);
                     let tok = Token::ModeParenOpen;
                     // Read mode params until `)`
@@ -137,6 +141,9 @@ impl<'a> Tokenizer<'a> {
 
             b')' => {
                 self.pos += 1;
+                if self.in_mode_params {
+                    self.in_mode_params = false;
+                }
                 self.last_significant = Some(TokenClass::Other);
                 Token::GroupClose
             }
@@ -277,12 +284,12 @@ impl<'a> Tokenizer<'a> {
         }
 
         // Mode params interior tokens
-        if self.bytes[self.pos] == b'=' {
+        if self.in_mode_params && self.bytes[self.pos] == b'=' {
             self.pos += 1;
             self.last_significant = Some(TokenClass::Other);
             return Ok(Token::ParamEq);
         }
-        if self.bytes[self.pos] == b',' {
+        if self.in_mode_params && self.bytes[self.pos] == b',' {
             self.pos += 1;
             self.last_significant = Some(TokenClass::Other);
             return Ok(Token::Comma);
@@ -294,7 +301,10 @@ impl<'a> Tokenizer<'a> {
         }
 
         // Regular word: gobble until delimiter
-        while self.pos < self.bytes.len() && !is_delimiter(self.bytes[self.pos]) {
+        while self.pos < self.bytes.len()
+            && !is_delimiter(self.bytes[self.pos])
+            && !(self.in_mode_params && self.bytes[self.pos] == b'=')
+        {
             self.pos += 1;
         }
 
@@ -310,8 +320,9 @@ impl<'a> Tokenizer<'a> {
         let text = self.slice(start, self.pos).to_string();
         self.last_significant = Some(TokenClass::Other);
 
-        // Try to parse as param value (in mode params context)
-        if let Some(v) = try_parse_value(&text) {
+        if self.in_mode_params
+            && let Some(v) = try_parse_value(&text)
+        {
             return Ok(Token::ParamValue(v));
         }
 
@@ -372,7 +383,7 @@ fn is_ident_char(b: u8) -> bool {
 fn is_delimiter(b: u8) -> bool {
     matches!(
         b,
-        b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b':' | b'=' | b',' | b'"'
+        b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b':' | b',' | b'"'
     )
     // Note: `-` and `~` are NOT delimiters here.
     // The main tokenize loop handles `->` and `~>` as operators before
@@ -490,6 +501,20 @@ mod tests {
     }
 
     #[test]
+    fn env_assignment_is_single_word_outside_mode_params() {
+        let toks = tokens(":env set FOO=bar");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Command("env".into()),
+                Token::Word("set".into()),
+                Token::Word("FOO=bar".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn pipe_operators() {
         let toks = tokens("a |> b |&> c |!> d");
         assert_eq!(
@@ -558,6 +583,29 @@ mod tests {
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
                 Token::Word("--release".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_numeric_words_stay_words() {
+        let toks = tokens("sleep 4");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("sleep".into()),
+                Token::Word("4".into()),
+                Token::Eof,
+            ]
+        );
+
+        let toks = tokens("sleep 4s");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("sleep".into()),
+                Token::Word("4s".into()),
                 Token::Eof,
             ]
         );

@@ -1,0 +1,15 @@
+[package]
+name = "cue-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared client connection stack for cue-shell frontends"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cue-core = { path = "../cue-core" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

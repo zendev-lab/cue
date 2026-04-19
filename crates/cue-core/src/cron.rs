@@ -2,6 +2,16 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Lifecycle state for a persisted cron entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronStatus {
+    Scheduled,
+    Paused,
+    Completed,
+    Expired,
+}
+
 /// Cron schedule expression.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CronSchedule {
@@ -54,5 +64,15 @@ impl CronSchedule {
     /// Whether this is a one-shot schedule (should be removed after trigger).
     pub fn is_oneshot(&self) -> bool {
         matches!(self, Self::Delay(_))
+    }
+}
+
+impl CronStatus {
+    pub fn is_runnable(self) -> bool {
+        matches!(self, Self::Scheduled)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Expired)
     }
 }

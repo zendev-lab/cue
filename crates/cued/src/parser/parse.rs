@@ -18,7 +18,7 @@
 
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
-use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, PipeSegment, Pipeline};
+use super::ast::{Argument, Ast, ChainNode, PipeSegment, Pipeline};
 use super::token::{Span, Spanned, Token, Value};
 use super::tokenizer::Tokenizer;
 
@@ -268,8 +268,7 @@ impl Parser {
             }
 
             // IdRef argument
-            "kill" | "retry" | "out" | "err" | "fg" | "wait" | "send" | "cancel" | "pause"
-            | "resume" | "probe" => {
+            "kill" | "retry" | "out" | "err" | "fg" | "wait" | "cancel" | "pause" | "resume" => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
@@ -284,12 +283,20 @@ impl Parser {
             }
 
             // Text argument
-            "ask" | "confirm" | "escalate" | "spawn" => {
+            "ask" | "confirm" | "escalate" | "spawn" | "send" | "probe" => {
                 let text = self.consume_remaining_text();
-                if text.is_empty() && name == "ask" {
+                if text.is_empty() {
                     return Err(ParseError {
                         span: self.peek_span(),
-                        message: "`:ask` requires a prompt".into(),
+                        message: match name {
+                            "ask" => "`:ask` requires a prompt".into(),
+                            "send" => "`:send` requires a target and input".into(),
+                            "probe" => "`:probe` requires a query".into(),
+                            "confirm" => "`:confirm` requires a prompt".into(),
+                            "escalate" => "`:escalate` requires a message".into(),
+                            "spawn" => "`:spawn` requires a prompt".into(),
+                            _ => format!(":{name} requires an argument"),
+                        },
                         kind: ParseErrorKind::MissingArgument,
                         suggestions: vec![],
                     });
@@ -297,8 +304,19 @@ impl Parser {
                 Ok(Argument::Text(text))
             }
 
-            // Cron expression
-            "cron" => self.parse_cron_argument(),
+            // Cron expression is parsed later by the resolver so richer schedule
+            // forms can share the same splitting logic as bare CRON mode.
+            "cron" => {
+                if self.at_end() {
+                    return Err(ParseError {
+                        span: self.peek_span(),
+                        message: "`:cron` requires a schedule expression".into(),
+                        kind: ParseErrorKind::MissingArgument,
+                        suggestions: vec![":cron every 5m cargo test".into()],
+                    });
+                }
+                Ok(Argument::Chain(self.parse_chain()?))
+            }
 
             // Log: optional IdRef
             "log" => {
@@ -311,7 +329,9 @@ impl Parser {
             }
 
             // Empty or text subcommands
-            "jobs" | "agents" | "crons" | "scopes" | "clear" | "quit" => Ok(Argument::Empty),
+            "jobs" | "agents" | "crons" | "scopes" | "clear" | "quit" | "exit" => {
+                Ok(Argument::Empty)
+            }
 
             "help" | "config" | "env" | "scope" | "cd" => {
                 let text = self.consume_remaining_text();
@@ -327,119 +347,6 @@ impl Parser {
                 message: format!("unknown command `:{name}`"),
                 kind: ParseErrorKind::UnknownCommand,
                 suggestions: suggest_command(name),
-            }),
-        }
-    }
-
-    fn parse_cron_argument(&mut self) -> Result<Argument, ParseError> {
-        // Try to parse schedule keyword
-        let schedule = match self.peek().clone() {
-            Token::Word(w) => match w.as_str() {
-                "every" => {
-                    self.advance();
-                    let dur = self.expect_duration()?;
-                    CronScheduleAst::Every(dur)
-                }
-                "at" => {
-                    self.advance();
-                    let time_str = self.expect_word()?;
-                    CronScheduleAst::At(time_str)
-                }
-                "in" => {
-                    self.advance();
-                    let dur = self.expect_duration()?;
-                    CronScheduleAst::In(dur)
-                }
-                "cron" => {
-                    self.advance();
-                    let expr = self.expect_word()?;
-                    CronScheduleAst::Crontab(expr)
-                }
-                "daily" | "hourly" | "weekly" | "monthly" => {
-                    let preset = w.clone();
-                    self.advance();
-                    CronScheduleAst::Preset(preset)
-                }
-                _ => {
-                    return Err(ParseError {
-                        span: self.peek_span(),
-                        message: "expected schedule keyword (every, at, in, cron, daily, ...)"
-                            .into(),
-                        kind: ParseErrorKind::InvalidCronSchedule,
-                        suggestions: vec!["every 5m".into(), "at 9:00".into(), "in 30s".into()],
-                    });
-                }
-            },
-            _ => {
-                return Err(ParseError {
-                    span: self.peek_span(),
-                    message: "`:cron` requires a schedule expression".into(),
-                    kind: ParseErrorKind::MissingArgument,
-                    suggestions: vec![":cron every 5m cargo test".into()],
-                });
-            }
-        };
-
-        // Optional "do" keyword before body
-        if let Token::Word(w) = self.peek()
-            && w == "do"
-        {
-            self.advance();
-        }
-
-        if self.at_end() {
-            return Err(ParseError {
-                span: self.peek_span(),
-                message: "`:cron` requires a command body after schedule".into(),
-                kind: ParseErrorKind::MissingArgument,
-                suggestions: vec![],
-            });
-        }
-
-        let body = self.parse_chain()?;
-        Ok(Argument::CronExpr { schedule, body })
-    }
-
-    fn expect_duration(&mut self) -> Result<std::time::Duration, ParseError> {
-        match self.peek().clone() {
-            Token::ParamValue(Value::Duration(d)) => {
-                self.advance();
-                Ok(d)
-            }
-            Token::Word(w) => {
-                // Try parsing word as duration
-                if let Some(d) = parse_duration_str(&w) {
-                    self.advance();
-                    Ok(d)
-                } else {
-                    Err(ParseError {
-                        span: self.peek_span(),
-                        message: format!("expected duration (e.g. 5m, 30s), found `{w}`"),
-                        kind: ParseErrorKind::InvalidCronSchedule,
-                        suggestions: vec![],
-                    })
-                }
-            }
-            _ => Err(ParseError {
-                span: self.peek_span(),
-                message: "expected duration".into(),
-                kind: ParseErrorKind::InvalidCronSchedule,
-                suggestions: vec![],
-            }),
-        }
-    }
-
-    fn expect_word(&mut self) -> Result<String, ParseError> {
-        match self.peek().clone() {
-            Token::Word(w) => {
-                self.advance();
-                Ok(w)
-            }
-            _ => Err(ParseError {
-                span: self.peek_span(),
-                message: format!("expected word, found {}", self.peek()),
-                kind: ParseErrorKind::UnexpectedToken,
-                suggestions: vec![],
             }),
         }
     }
@@ -574,7 +481,7 @@ impl Parser {
     }
 }
 
-fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
+pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
     if s.ends_with("ms") {
         let n: u64 = s.strip_suffix("ms")?.parse().ok()?;
         return Some(std::time::Duration::from_millis(n));
@@ -591,8 +498,8 @@ fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 fn suggest_command(name: &str) -> Vec<String> {
     let commands = [
         "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
-        "agents", "crons", "scopes", "ask", "spawn", "confirm", "escalate", "probe", "cron",
-        "env", "cd", "scope", "help", "config", "log", "pause", "resume", "clear", "quit",
+        "agents", "crons", "scopes", "ask", "spawn", "confirm", "escalate", "probe", "cron", "env",
+        "cd", "scope", "help", "config", "log", "pause", "resume", "clear", "quit", "exit",
     ];
     commands
         .iter()
@@ -652,6 +559,20 @@ mod tests {
             Ast::BareInput { argument, .. } => match argument {
                 Argument::Chain(ChainNode::Leaf(p)) => {
                     assert_eq!(p.segments[0].command, vec!["cargo", "test", "--release"]);
+                }
+                _ => panic!("expected Chain"),
+            },
+            _ => panic!("expected BareInput"),
+        }
+    }
+
+    #[test]
+    fn parse_bare_input_with_numeric_arg() {
+        let ast = Parser::parse("sleep 4").unwrap();
+        match ast {
+            Ast::BareInput { argument, .. } => match argument {
+                Argument::Chain(ChainNode::Leaf(p)) => {
+                    assert_eq!(p.segments[0].command, vec!["sleep", "4"]);
                 }
                 _ => panic!("expected Chain"),
             },
@@ -735,18 +656,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_send_text() {
+        let ast = Parser::parse(":send A1 continue with the fix").unwrap();
+        match ast {
+            Ast::Command { name, argument, .. } => {
+                assert_eq!(name, "send");
+                assert_eq!(argument, Argument::Text("A1 continue with the fix".into()));
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
     fn parse_cron() {
         let ast = Parser::parse(":cron every 5m cargo test").unwrap();
         match ast {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "cron");
-                match argument {
-                    Argument::CronExpr { schedule, body } => {
-                        assert!(matches!(schedule, CronScheduleAst::Every(_)));
-                        assert!(matches!(body, ChainNode::Leaf(_)));
-                    }
-                    _ => panic!("expected CronExpr"),
-                }
+                assert!(matches!(argument, Argument::Chain(ChainNode::Leaf(_))));
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn parse_probe_query() {
+        let ast = Parser::parse(":probe status J1").unwrap();
+        match ast {
+            Ast::Command { name, argument, .. } => {
+                assert_eq!(name, "probe");
+                assert_eq!(argument, Argument::Text("status J1".into()));
             }
             _ => panic!("expected Command"),
         }
