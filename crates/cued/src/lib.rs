@@ -10,5 +10,7 @@ pub mod parser;
 pub mod pty;
 pub mod ring_buffer;
 pub mod runtime_env;
+pub mod service;
 pub mod storage;
+pub mod upgrade;
 pub mod word_expansion;

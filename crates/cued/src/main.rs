@@ -1,10 +1,13 @@
 //! cued — background daemon entry point.
 //!
 //! Subcommands:
-//!   `cued start [--fg] [--socket PATH]` — start the daemon
-//!   `cued stop`                         — send Shutdown to a running daemon
-//!   `cued status`                       — check if daemon is running
-//!   `cued gateway --stdio`              — relay IPC over stdin/stdout
+//!   `cued start [--fg] [-F] [--socket PATH]` — start the daemon
+//!   `cued stop`                              — send Shutdown to a running daemon
+//!   `cued status`                            — check if daemon is running
+//!   `cued gateway --stdio`                   — relay IPC over stdin/stdout
+//!   `cued install`                           — install systemd/launchd service
+//!   `cued uninstall`                         — remove service registration
+//!   `cued upgrade`                           — self-update from GitHub Releases
 
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -40,6 +43,9 @@ enum Cli {
         stdio: bool,
         socket: Option<PathBuf>,
     },
+    Install,
+    Uninstall,
+    Upgrade,
 }
 
 fn socket_arg() -> impl bpaf::Parser<Option<PathBuf>> {
@@ -92,8 +98,37 @@ fn gateway_cmd() -> impl bpaf::Parser<Cli> {
         .help("Run a stateless IPC bridge")
 }
 
+fn install_cmd() -> impl bpaf::Parser<Cli> {
+    bpaf::pure(Cli::Install)
+        .to_options()
+        .command("install")
+        .help("Install cued as a system service (launchd on macOS, systemd on Linux)")
+}
+
+fn uninstall_cmd() -> impl bpaf::Parser<Cli> {
+    bpaf::pure(Cli::Uninstall)
+        .to_options()
+        .command("uninstall")
+        .help("Remove the installed cued service")
+}
+
+fn upgrade_cmd() -> impl bpaf::Parser<Cli> {
+    bpaf::pure(Cli::Upgrade)
+        .to_options()
+        .command("upgrade")
+        .help("Self-update cued from the latest GitHub Release")
+}
+
 fn cli() -> bpaf::OptionParser<Cli> {
-    let parser = bpaf::construct!([start_cmd(), stop_cmd(), status_cmd(), gateway_cmd()]);
+    let parser = bpaf::construct!([
+        start_cmd(),
+        stop_cmd(),
+        status_cmd(),
+        gateway_cmd(),
+        install_cmd(),
+        uninstall_cmd(),
+        upgrade_cmd(),
+    ]);
     parser
         .to_options()
         .version(env!("CARGO_PKG_VERSION"))
@@ -116,6 +151,9 @@ fn main() {
         Cli::Stop { socket } => run_stop(socket),
         Cli::Status { socket } => run_status(socket),
         Cli::Gateway { stdio, socket } => run_gateway(stdio, socket),
+        Cli::Install => run_install(),
+        Cli::Uninstall => run_uninstall(),
+        Cli::Upgrade => run_upgrade(),
     };
     if let Err(e) = result {
         eprintln!("cued: {e:#}");
@@ -127,6 +165,14 @@ fn main() {
 
 fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<()> {
     if force {
+        // When the service manager owns cued, delegate restart to it rather than
+        // sending a raw SIGTERM (which would fight launchd/systemd's KeepAlive).
+        if cued::service::is_installed() && socket_override.is_none() {
+            println!("cued: daemon is managed by the service manager — restarting via service");
+            cued::service::restart()?;
+            println!("cued: daemon restarted");
+            return Ok(());
+        }
         force_stop_if_running()?;
     } else {
         ensure_not_running()?;
@@ -339,6 +385,21 @@ fn run_gateway(stdio: bool, socket_override: Option<PathBuf>) -> Result<()> {
     rt.block_on(cued::gateway_stdio::run(socket_path))
 }
 
+// ── Install / Uninstall / Upgrade ──
+
+fn run_install() -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+    cued::service::install(&exe)
+}
+
+fn run_uninstall() -> Result<()> {
+    cued::service::uninstall()
+}
+
+fn run_upgrade() -> Result<()> {
+    cued::upgrade::run_upgrade()
+}
+
 // ── Helpers ──
 
 /// Check if a process is alive using `kill(pid, 0)`.
@@ -374,9 +435,10 @@ fn should_insert_start(args: &[OsString]) -> bool {
     }
 
     match args[0].to_str() {
-        Some("start" | "stop" | "status" | "gateway" | "-h" | "--help" | "-V" | "--version") => {
-            false
-        }
+        Some(
+            "start" | "stop" | "status" | "gateway" | "install" | "uninstall" | "upgrade" | "-h"
+            | "--help" | "-V" | "--version",
+        ) => false,
         _ => implicit_start_args_only(args),
     }
 }
