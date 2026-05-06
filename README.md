@@ -3,8 +3,7 @@
 Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules.
 
 > ⚠️ **Prototype stage** — core JOB / CRON flows are implemented, including
-> real `:fg` PTY attach. cue-shell no longer exposes agent commands or an
-> AGENT mode; agent runtime concerns live in weft.
+> real `:fg` PTY attach. Agent runtime concerns live in weft.
 
 ## Overview
 
@@ -58,6 +57,12 @@ cued -f
 
 # Start TUI (auto-connect / auto-reconnect)
 cargo run -p cue-cli -- tui
+
+# Restart the daemon directly
+cargo run -p cued -- restart
+
+# Restart from inside the TUI
+:restart
 
 # Run checks
 just check

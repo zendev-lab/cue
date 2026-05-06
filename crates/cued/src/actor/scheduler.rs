@@ -79,10 +79,21 @@ struct ChainState {
 struct FlatLeaf {
     /// Index in the DFS-order leaf list.
     index: usize,
-    /// Command words for the first segment (used to spawn the job).
-    command: Vec<String>,
+    /// Full pipeline (may be multi-segment with pipe operators).
+    pipeline: cue_core::pipeline::Pipeline,
     /// Human-readable pipeline text.
     pipeline_text: String,
+}
+
+impl FlatLeaf {
+    /// First segment's command words (for scope-transform detection and open hint).
+    fn command(&self) -> &[String] {
+        self.pipeline
+            .segments
+            .first()
+            .map(|s| s.command.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 // ── Job tracking ────────────────────────────────────────────────────────────
@@ -527,6 +538,19 @@ fn persist_cron_record(db: &storage::SharedConnection, cron: &storage::StoredCro
     });
 }
 
+fn remove_cron_from_db(db: &storage::SharedConnection, cid: CronId) {
+    let cron_id = cid.to_string();
+    let db = Arc::clone(db);
+    tokio::spawn(async move {
+        let cid_for_db = cron_id.clone();
+        if let Err(error) =
+            storage::with_connection(&db, move |conn| storage::delete_cron(conn, &cid_for_db)).await
+        {
+            warn!(cron = %cron_id, "scheduler: failed to remove cron from db: {error}");
+        }
+    });
+}
+
 async fn get_head_snapshot(
     sys: &ActorSystem,
 ) -> Result<cue_core::scope::EnvSnapshot, ResponsePayload> {
@@ -571,15 +595,10 @@ fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
     match node {
         ChainNode::Leaf(pipeline) => {
             let idx = out.len();
-            let command = pipeline
-                .segments
-                .first()
-                .map(|s| s.command.clone())
-                .unwrap_or_default();
             let pipeline_text = pipeline_to_text(pipeline);
             out.push(FlatLeaf {
                 index: idx,
-                command,
+                pipeline: pipeline.clone(),
                 pipeline_text,
             });
         }
@@ -1434,7 +1453,12 @@ fn scope_transform_from_command(words: &[String]) -> Result<Option<ScopeTransfor
     match command {
         "cd" => {
             if words.len() != 2 {
-                return Err("`cd` inside `:run` expects exactly one path argument".into());
+                return Err(
+                    "`cd` inside `:run` only accepts a single path (e.g. `cd /some/dir`).\n\
+                     To combine `cd` with other commands, use a chain: `cd /some/dir -> cargo build`.\n\
+                     Or pass cwd via mode param: `:run(cwd=/some/dir) cargo build`."
+                        .into(),
+                );
             }
             Ok(Some(ScopeTransform::Cd {
                 path: words[1].clone(),
@@ -1443,7 +1467,9 @@ fn scope_transform_from_command(words: &[String]) -> Result<Option<ScopeTransfor
         "env" if words.get(1).map(String::as_str) == Some("set") => {
             if words.len() < 3 {
                 return Err(
-                    "`env set` inside `:run` expects at least one KEY=VALUE assignment".into(),
+                    "`env set` inside `:run` needs at least one KEY=VALUE pair.\n\
+                     Example: `env set RUST_BACKTRACE=1 -> cargo test`."
+                        .into(),
                 );
             }
             Ok(Some(ScopeTransform::EnvSet {
@@ -1897,7 +1923,7 @@ async fn spawn_chain(
     if leaves.len() == 1 {
         let leaf = &leaves[0];
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(&leaf.command);
+        let open_hint = classify_job_open_hint(leaf.command());
 
         state.jobs.insert(
             jid,
@@ -1918,10 +1944,10 @@ async fn spawn_chain(
 
         publish_job_created(sys, state, jid, &leaf.pipeline_text, scope_hash, open_hint).await;
 
-        match scope_transform_from_command(&leaf.command) {
+        match scope_transform_from_command(leaf.command()) {
             Ok(Some(_)) => {
                 info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: applying single scope-transform job");
-                match apply_scope_transform(sys, scope_hash, &leaf.command).await {
+                match apply_scope_transform(sys, scope_hash, leaf.command()).await {
                     Ok(end_scope) => {
                         let _ = set_job_terminal_state(
                             jid,
@@ -1961,7 +1987,7 @@ async fn spawn_chain(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        command_line: leaf.command.clone(),
+                        pipeline: leaf.pipeline.clone(),
                         scope_hash,
                         cwd_override: cwd_override.clone(),
                     })
@@ -2116,7 +2142,7 @@ async fn process_chain_advance(
 
     while let Some((idx, start_scope)) = queue.pop_front() {
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(&leaves[idx].command);
+        let open_hint = classify_job_open_hint(leaves[idx].command());
         if captured.len() < capture_first {
             captured.push(jid);
         }
@@ -2157,9 +2183,9 @@ async fn process_chain_advance(
         )
         .await;
 
-        match scope_transform_from_command(&leaves[idx].command) {
+        match scope_transform_from_command(leaves[idx].command()) {
             Ok(Some(_)) => {
-                match apply_scope_transform(sys, start_scope, &leaves[idx].command).await {
+                match apply_scope_transform(sys, start_scope, leaves[idx].command()).await {
                     Ok(end_scope) => {
                         if let Some((_, ready_queue, more_cancel)) = set_job_terminal_state(
                             jid,
@@ -2206,7 +2232,7 @@ async fn process_chain_advance(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        command_line: leaves[idx].command.clone(),
+                        pipeline: leaves[idx].pipeline.clone(),
                         scope_hash: start_scope,
                         cwd_override: cwd_override.clone(),
                     })
@@ -2448,6 +2474,14 @@ async fn handle_command(
                     None => {
                         ResponsePayload::err(error_code::NOT_FOUND, format!("job {id} not found"))
                     }
+                }
+            } else if let Some(cid) = parse_cron_id(&id) {
+                if state.crons.remove(&cid).is_some() {
+                    remove_cron_from_db(db, cid);
+                    info!(%cid, "scheduler: cron removed");
+                    ResponsePayload::ack()
+                } else {
+                    ResponsePayload::err(error_code::NOT_FOUND, format!("cron {id} not found"))
                 }
             } else {
                 warn!(%id, "scheduler: kill target not found");

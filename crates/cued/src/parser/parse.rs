@@ -710,4 +710,22 @@ mod tests {
             _ => panic!("expected Command"),
         }
     }
+
+    #[test]
+    fn single_quoted_args_with_colon() {
+        // Regression: single quotes should be treated as literal string
+        // delimiters, not as regular characters.  The `:` inside `'[:upper:]'`
+        // must NOT be parsed as a command prefix.
+        let ast = Parser::parse(":run tr '[:upper:]' '[:lower:]'").unwrap();
+        match ast {
+            Ast::Command { argument, .. } => match argument {
+                Argument::Chain(ChainNode::Leaf(p)) => {
+                    assert_eq!(p.segments.len(), 1);
+                    assert_eq!(p.segments[0].command, vec!["tr", "[:upper:]", "[:lower:]"]);
+                }
+                _ => panic!("expected single-segment pipeline"),
+            },
+            _ => panic!("expected Command"),
+        }
+    }
 }

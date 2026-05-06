@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //!   `cued start [--fg] [-F] [--socket PATH]` — start the daemon
+//!   `cued restart [--socket PATH]`           — restart the daemon
 //!   `cued stop`                              — send Shutdown to a running daemon
 //!   `cued status`                            — check if daemon is running
 //!   `cued gateway --stdio`                   — relay IPC over stdin/stdout
@@ -34,6 +35,9 @@ enum Cli {
         socket: Option<PathBuf>,
     },
     Stop {
+        socket: Option<PathBuf>,
+    },
+    Restart {
         socket: Option<PathBuf>,
     },
     Status {
@@ -77,6 +81,14 @@ fn stop_cmd() -> impl bpaf::Parser<Cli> {
         .to_options()
         .command("stop")
         .help("Stop a running daemon")
+}
+
+fn restart_cmd() -> impl bpaf::Parser<Cli> {
+    let socket = socket_arg();
+    bpaf::construct!(Cli::Restart { socket })
+        .to_options()
+        .command("restart")
+        .help("Restart the daemon")
 }
 
 fn status_cmd() -> impl bpaf::Parser<Cli> {
@@ -123,6 +135,7 @@ fn cli() -> bpaf::OptionParser<Cli> {
     let parser = bpaf::construct!([
         start_cmd(),
         stop_cmd(),
+        restart_cmd(),
         status_cmd(),
         gateway_cmd(),
         install_cmd(),
@@ -149,6 +162,7 @@ fn main() {
     let result = match cmd {
         Cli::Start { fg, force, socket } => run_start(fg, force, socket),
         Cli::Stop { socket } => run_stop(socket),
+        Cli::Restart { socket } => run_restart(socket),
         Cli::Status { socket } => run_status(socket),
         Cli::Gateway { stdio, socket } => run_gateway(stdio, socket),
         Cli::Install => run_install(),
@@ -183,6 +197,10 @@ fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<
     }
 
     run_start_background(socket_override)
+}
+
+fn run_restart(socket_override: Option<PathBuf>) -> Result<()> {
+    run_start(false, true, socket_override)
 }
 
 fn run_start_background(socket_override: Option<PathBuf>) -> Result<()> {
@@ -440,7 +458,7 @@ fn should_insert_start(args: &[OsString]) -> bool {
     match args[0].to_str() {
         Some(
             "start" | "stop" | "status" | "gateway" | "install" | "uninstall" | "upgrade" | "-h"
-            | "--help" | "-V" | "--version",
+            | "restart" | "--help" | "-V" | "--version",
         ) => false,
         _ => implicit_start_args_only(args),
     }
@@ -579,6 +597,7 @@ mod tests {
     #[test]
     fn preserves_real_subcommands_and_help() {
         assert_eq!(normalize(&["start", "--fg"]), vec!["start", "--fg"]);
+        assert_eq!(normalize(&["restart"]), vec!["restart"]);
         assert_eq!(normalize(&["status"]), vec!["status"]);
         assert_eq!(
             normalize(&["gateway", "--stdio"]),
@@ -599,6 +618,16 @@ mod tests {
             Cli::Gateway {
                 stdio: true,
                 socket: Some(PathBuf::from("bridge.sock")),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_restart_subcommand() {
+        assert_eq!(
+            parse(&["restart", "--socket", "daemon.sock"]),
+            Cli::Restart {
+                socket: Some(PathBuf::from("daemon.sock")),
             }
         );
     }

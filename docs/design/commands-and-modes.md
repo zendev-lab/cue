@@ -1,10 +1,7 @@
 # Cue Shell — 基础命令与模式最终设计方案 v2
 
 > 已完成三轮评审、竞品调研和命名调研后的最终设计。
-> **Update:** current cue-shell ships only **JOB** and **CRON** modes. Earlier
-> AGENT-mode / compatibility-bridge sections in this document are historical
-> design context; the live command surface no longer includes `:ask`,
-> `:spawn`, `:agents`, `:confirm`, `:escalate`, or `:probe`.
+> **Update:** current cue-shell ships only **JOB** and **CRON** modes.
 
 ---
 

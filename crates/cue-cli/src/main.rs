@@ -6,6 +6,7 @@
 
 mod config;
 
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -15,7 +16,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use cue_client::{ClientConnector, CuedClient};
+use cue_client::{ClientConnector, CuedClient, RestartHandle, default_socket_path};
 use cue_core::ipc::{Message, OkPayload, ResponsePayload};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as TokioCommand};
@@ -23,6 +24,11 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::config::ResolvedTransport;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliAction {
+    Tui,
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -38,14 +44,17 @@ fn main() -> Result<()> {
         .build()
         .context("build tokio runtime")?;
 
-    rt.block_on(async_main())
+    let action = parse_cli_action(std::env::args_os())?;
+    rt.block_on(async_main(action))
 }
 
-async fn async_main() -> Result<()> {
+async fn async_main(_action: CliAction) -> Result<()> {
     let client_config = config::Config::load()?;
     let transport =
         client_config.resolve_transport(std::env::var_os("CUE_SOCKET").map(PathBuf::from))?;
     validate_transport(&transport)?;
+    let restart_handle = Some(restart_handle_for_transport(&transport));
+
     let connector = transport_connector(&transport);
     let session_profile_name = Some(match &transport {
         ResolvedTransport::Unix { profile_name, .. }
@@ -56,12 +65,32 @@ async fn async_main() -> Result<()> {
         ResolvedTransport::Unix { socket_path, .. } => {
             // Connect (auto-starting daemon if needed). The client is reused by TUI.
             let client = ensure_daemon_running(&socket_path).await;
-            cue_tui::run(connector, client, session_profile_name).await
+            cue_tui::run(connector, client, session_profile_name, restart_handle).await
         }
         ssh_transport @ ResolvedTransport::Ssh { .. } => {
             let client = connect_ssh_transport(&ssh_transport).await?;
-            cue_tui::run(connector, Some(client), session_profile_name).await
+            cue_tui::run(
+                connector,
+                Some(client),
+                session_profile_name,
+                restart_handle,
+            )
+            .await
         }
+    }
+}
+
+fn parse_cli_action(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
+    let mut args = args.into_iter();
+    let _program = args.next();
+    match args.next().as_deref().and_then(|arg| arg.to_str()) {
+        None | Some("tui") => {
+            if args.next().is_some() {
+                bail!("`cue tui` does not accept extra arguments");
+            }
+            Ok(CliAction::Tui)
+        }
+        Some(other) => bail!("unknown cue subcommand `{other}`; supported: tui"),
     }
 }
 
@@ -403,6 +432,99 @@ fn daemon_bin_candidates() -> Vec<String> {
     )
 }
 
+fn restart_handle_for_transport(transport: &ResolvedTransport) -> RestartHandle {
+    let transport = transport.clone();
+    RestartHandle::new(move || restart_transport(&transport))
+}
+
+fn restart_transport(transport: &ResolvedTransport) -> Result<()> {
+    match transport {
+        ResolvedTransport::Unix { socket_path, .. } => restart_local_daemon(socket_path),
+        ResolvedTransport::Ssh {
+            destination,
+            start_command,
+            ..
+        } => restart_remote_daemon(destination, start_command),
+    }
+}
+
+fn restart_local_daemon(socket_path: &Path) -> Result<()> {
+    let socket_override = socket_path != default_socket_path().as_path();
+    let mut last_failure = None;
+
+    for cued_bin in daemon_bin_candidates() {
+        let mut command = StdCommand::new(&cued_bin);
+        command.arg("restart");
+        if socket_override {
+            command.arg("--socket").arg(socket_path);
+        }
+
+        match command.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_failure = Some(format!(
+                    "`{cued_bin}` exited with status {status} while restarting {}",
+                    socket_path.display()
+                ));
+            }
+            Err(error) => {
+                last_failure = Some(format!(
+                    "failed to run `{cued_bin}` while restarting {}: {error}",
+                    socket_path.display()
+                ));
+            }
+        }
+    }
+
+    bail!(
+        "{}",
+        last_failure.unwrap_or_else(|| {
+            format!(
+                "no cued executable was able to restart {}",
+                socket_path.display()
+            )
+        })
+    )
+}
+
+fn remote_restart_command(start_command: &str) -> String {
+    let mut parts = start_command.split_whitespace();
+    if matches!(parts.next(), Some("cued")) && matches!(parts.next(), Some("start")) {
+        let rest: Vec<&str> = parts
+            .filter(|part| *part != "-F" && *part != "--force")
+            .collect();
+        if rest.is_empty() {
+            "cued restart".into()
+        } else {
+            format!("cued restart {}", rest.join(" "))
+        }
+    } else if start_command
+        .split_whitespace()
+        .any(|part| part == "-F" || part == "--force")
+    {
+        start_command.to_string()
+    } else {
+        format!("{start_command} -F")
+    }
+}
+
+fn restart_remote_daemon(destination: &str, start_command: &str) -> Result<()> {
+    let remote_command = remote_restart_command(start_command);
+    let status = StdCommand::new("ssh")
+        .arg(destination)
+        .arg(&remote_command)
+        .status()
+        .with_context(|| format!("run `{}`", ssh_invocation(destination, &remote_command)))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "`{}` exited with status {status} while restarting the remote daemon",
+            ssh_invocation(destination, &remote_command)
+        )
+    }
+}
+
 /// Try to connect to the daemon, auto-starting it if needed.
 ///
 /// Returns the connected client for the TUI to reuse (no double-connect).
@@ -614,6 +736,52 @@ mod tests {
         assert_eq!(
             daemon_bin_candidates_from_sources(None, None, None),
             vec!["cued".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_cli_action_defaults_to_tui() {
+        assert_eq!(
+            parse_cli_action([OsString::from("cue")]).expect("parse action"),
+            CliAction::Tui
+        );
+    }
+
+    #[test]
+    fn parse_cli_action_accepts_tui_alias() {
+        assert_eq!(
+            parse_cli_action([OsString::from("cue"), OsString::from("tui")]).expect("parse action"),
+            CliAction::Tui
+        );
+    }
+
+    #[test]
+    fn parse_cli_action_rejects_unknown_subcommand() {
+        let error = parse_cli_action([OsString::from("cue"), OsString::from("bogus")])
+            .expect_err("unknown action should fail");
+        assert!(format!("{error:#}").contains("unknown cue subcommand `bogus`"));
+    }
+
+    #[test]
+    fn parse_cli_action_rejects_restart_subcommand() {
+        let error = parse_cli_action([OsString::from("cue"), OsString::from("restart")])
+            .expect_err("restart should fail");
+        assert!(format!("{error:#}").contains("unknown cue subcommand `restart`"));
+    }
+
+    #[test]
+    fn remote_restart_command_prefers_cued_restart() {
+        assert_eq!(
+            remote_restart_command("cued start --socket /tmp/cued.sock"),
+            "cued restart --socket /tmp/cued.sock"
+        );
+        assert_eq!(
+            remote_restart_command("cued start -F --socket /tmp/cued.sock"),
+            "cued restart --socket /tmp/cued.sock"
+        );
+        assert_eq!(
+            remote_restart_command("custom-wrapper"),
+            "custom-wrapper -F"
         );
     }
 

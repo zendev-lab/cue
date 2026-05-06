@@ -23,7 +23,6 @@ use tui_term::widget::PseudoTerminal;
 use crate::ansi;
 use crate::app::{AppState, FocusArea};
 use crate::component::Component;
-use cue_core::job::JobStatus;
 
 /// Render the entire TUI into the current frame.
 pub fn draw(frame: &mut Frame, state: &AppState) {
@@ -189,14 +188,20 @@ fn render_job_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Running Jobs ")
-        .title_bottom(Line::from(" Enter kill   Esc close ").alignment(Alignment::Center));
+        .title(format!(" {} ", state.job_picker_title()))
+        .title_bottom(
+            Line::from(format!(
+                " Enter {}   Esc close ",
+                state.job_picker_submit_label()
+            ))
+            .alignment(Alignment::Center),
+        );
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("No running jobs.")
+            Paragraph::new(state.job_picker_empty_text())
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::DarkGray)),
             inner,
@@ -207,19 +212,13 @@ fn render_job_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     let rows: Vec<ListItem> = items
         .into_iter()
         .enumerate()
-        .map(|(index, (id, label, status))| {
+        .map(|(index, (id, label, icon))| {
             let style = if selected == Some(index) {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else {
                 Style::default().fg(Color::White)
             };
-            ListItem::new(Line::from(format!(
-                "{} {} {}",
-                job_status_icon(&status),
-                id,
-                label
-            )))
-            .style(style)
+            ListItem::new(Line::from(format!("{icon} {id} {label}"))).style(style)
         })
         .collect();
     frame.render_widget(List::new(rows), inner);
@@ -247,17 +246,6 @@ fn render_target_settings_modal(frame: &mut Frame, state: &AppState, area: Rect)
             .style(Style::default().fg(Color::White)),
         inner,
     );
-}
-
-fn job_status_icon(status: &JobStatus) -> &'static str {
-    match status {
-        JobStatus::Pending => "⏳",
-        JobStatus::Running => "🔄",
-        JobStatus::Done => "✅",
-        JobStatus::Failed => "❌",
-        JobStatus::Killed => "🛑",
-        JobStatus::Cancelled(_) => "⏹",
-    }
 }
 
 fn centered_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {

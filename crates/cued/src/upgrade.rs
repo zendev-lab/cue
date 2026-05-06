@@ -103,7 +103,7 @@ pub fn run_upgrade() -> Result<()> {
         crate::service::restart().context("restart service after upgrade")?;
         println!("cued upgrade: service restarted");
     } else {
-        println!("cued upgrade: run `cued start -F` to apply the new binary");
+        println!("cued upgrade: run `cued restart` to apply the new binary");
     }
 
     Ok(())

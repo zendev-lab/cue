@@ -181,15 +181,17 @@ every 30m between 9am-5pm on mon-fri do ./check.sh  # 复杂自由格式
 
 ## Part 3: 模式设计演进（v1 → v2）
 
+> 本文只保留最终留下来的语法 / 模式演进结论；已经整体迁出到 weft
+> 的 AGENT bridge 试验不再作为 cue-shell 当前文档的一部分。
+
 ### 3.1 v1 设计（已弃用）
 
-v1 使用 **4 个模式** + **`cmd:` 分隔符语法**：
+v1 使用 **3 个模式** + **`cmd:` 分隔符语法**：
 
 | 模式 | 含义 |
 |------|------|
 | CMD | 仅执行内建命令 |
 | JOB | 自动包装为 `run` |
-| AGENT | Agent 模式 |
 | SCHED | 定时调度 |
 
 内建命令使用后缀冒号：`kill: J1`, `run: cargo build`, `env: set FOO=bar`。
@@ -207,12 +209,11 @@ v1 使用 **4 个模式** + **`cmd:` 分隔符语法**：
 
 ### 3.2 v2 设计（当前）
 
-v2 改为 **3 个模式** + **`:` 前缀语法**：
+v2 改为 **2 个模式** + **`:` 前缀语法**：
 
 | 模式 | 默认包装 |
 |------|---------|
 | JOB ⚡ | → `:run <input>` |
-| AGENT 🤖 | → `:ask <input>` |
 | CRON ⏰ | → `:cron <input>` |
 
 内建命令使用前缀冒号：`:kill J1`, `:run cargo build`, `:env set FOO=bar`。
@@ -228,7 +229,6 @@ v2 改为 **3 个模式** + **`:` 前缀语法**：
 | `cmd:` → `:cmd` | TUI 文化一致（Vim）；首字符判断 vs 扫描冒号位置更简单；消除 `foo:bar` 误判 |
 | 去掉 CMD 模式 | `:` 前缀在任何模式下都能触发内建命令，CMD 模式冗余 |
 | SCHED → CRON | 与 `:cron` 命令命名一致 |
-| 新增 `:probe`/`:confirm`/`:escalate` | 当时用于完善旧的 planner/executor 通信协议（现已转为兼容历史） |
 
 ### 3.4 解析器对比
 

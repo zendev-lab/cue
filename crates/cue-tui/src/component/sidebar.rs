@@ -221,6 +221,9 @@ impl Component for Sidebar {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 return Some(AppMsg::OpenJobPicker);
             }
+            (_, KeyCode::Backspace | KeyCode::Delete) => {
+                return Some(AppMsg::KillSelection);
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('b')) => return Some(AppMsg::ToggleSidebar),
             _ => {}
         }

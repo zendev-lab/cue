@@ -263,7 +263,7 @@ impl Component for MainView {
                 Line::raw(""),
                 Line::raw(format!("  Current mode: {prompt_mode}")),
                 Line::raw("  Shift+Tab: switch job/cron mode   Ctrl+B: toggle sidebar"),
-                Line::raw("  Tab: complete   Ctrl+C: running jobs   Ctrl+D: quit   Ctrl+L: clear"),
+                Line::raw("  Tab: complete   Ctrl+C: kill/remove   Ctrl+D: quit   Ctrl+L: clear"),
             ])
             .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(welcome, area);

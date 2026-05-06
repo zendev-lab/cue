@@ -24,7 +24,7 @@ use cue_core::job::JobStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
 use tui_term::vt100;
 
-use crate::client::{ReconnectCmd, WriterHandle};
+use crate::client::{ReconnectCmd, RestartHandle, WriterHandle};
 use crate::component::Component;
 use crate::component::input_line::{InputLine, InputMsg};
 use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg, chain_step_label};
@@ -91,6 +91,7 @@ pub enum AppMsg {
     ClearDisplay,
     OpenTargetSettings,
     OpenJobPicker,
+    KillSelection,
 
     // Socket lifecycle
     Connected,
@@ -318,6 +319,7 @@ pub struct AppState {
     pub connected: bool,
     /// Sender for live reconnect / target-switch commands.
     reconnect_tx: Option<tokio::sync::mpsc::Sender<ReconnectCmd>>,
+    restart_handle: Option<RestartHandle>,
     /// Profile name we are reconnecting to; set when the user triggers a live
     /// reconnect, cleared and applied to `session_profile_name` on success.
     pending_reconnect_profile_name: Option<String>,
@@ -326,6 +328,7 @@ pub struct AppState {
     jobs: Vec<JobRow>,
     crons: Vec<CronRow>,
     job_cards: HashMap<String, usize>,
+    cron_job_cards: HashMap<String, (String, usize)>,
     /// Maps chain_id → card_index for chain cards.
     chain_cards: HashMap<String, usize>,
     fg_session: Option<FgSession>,
@@ -359,10 +362,12 @@ impl AppState {
             writer: None,
             connected: false,
             reconnect_tx: None,
+            restart_handle: None,
             pending_reconnect_profile_name: None,
             jobs: Vec::new(),
             crons: Vec::new(),
             job_cards: HashMap::new(),
+            cron_job_cards: HashMap::new(),
             chain_cards: HashMap::new(),
             fg_session: None,
             display_tabs: Vec::new(),
@@ -398,6 +403,10 @@ impl AppState {
     /// trigger live target switches.
     pub fn set_reconnect_tx(&mut self, tx: tokio::sync::mpsc::Sender<ReconnectCmd>) {
         self.reconnect_tx = Some(tx);
+    }
+
+    pub fn set_restart_handle(&mut self, restart_handle: Option<RestartHandle>) {
+        self.restart_handle = restart_handle;
     }
 
     /// Whether the sidebar should be visible for the current terminal width.
@@ -449,7 +458,10 @@ impl AppState {
 
     pub fn footer_text(&self) -> String {
         if self.job_picker_open() {
-            return "Kill picker: Enter kill  •  Esc close".to_string();
+            return match self.mode {
+                Mode::Job => "Kill picker: Enter kill  •  Esc close".to_string(),
+                Mode::Cron => "Remove picker: Enter remove  •  Esc close".to_string(),
+            };
         }
 
         if self.target_settings_open() {
@@ -486,7 +498,7 @@ impl AppState {
                 }
             },
             FocusArea::Sidebar => {
-                "Sidebar: Click row to open  •  Session rows enter fg  •  Up/Down move  •  Enter open  •  Shift+Tab mode  •  Ctrl+B toggle".to_string()
+                "Sidebar: Click row to open  •  Del/Backspace kill or remove  •  Up/Down move  •  Enter open  •  Shift+Tab mode  •  Ctrl+B toggle".to_string()
             }
             FocusArea::MainView => {
                 if self.display_pane_has_target() {
@@ -566,12 +578,53 @@ impl AppState {
         self.job_picker.as_ref().and_then(|picker| picker.selected)
     }
 
-    pub fn job_picker_items(&self) -> Vec<(String, String, JobStatus)> {
-        self.jobs
-            .iter()
-            .filter(|job| matches!(job.status, JobStatus::Running))
-            .map(|job| (job.id.clone(), job.label.clone(), job.status.clone()))
-            .collect()
+    pub fn job_picker_title(&self) -> &'static str {
+        match self.mode {
+            Mode::Job => "Running Jobs",
+            Mode::Cron => "Crons",
+        }
+    }
+
+    pub fn job_picker_empty_text(&self) -> &'static str {
+        match self.mode {
+            Mode::Job => "No running jobs.",
+            Mode::Cron => "No crons.",
+        }
+    }
+
+    pub fn job_picker_submit_label(&self) -> &'static str {
+        match self.mode {
+            Mode::Job => "kill",
+            Mode::Cron => "remove",
+        }
+    }
+
+    pub fn job_picker_items(&self) -> Vec<(String, String, &'static str)> {
+        match self.mode {
+            Mode::Job => self
+                .jobs
+                .iter()
+                .filter(|job| matches!(job.status, JobStatus::Running))
+                .map(|job| {
+                    (
+                        job.id.clone(),
+                        job.label.clone(),
+                        job_status_icon(&job.status),
+                    )
+                })
+                .collect(),
+            Mode::Cron => self
+                .crons
+                .iter()
+                .map(|cron| {
+                    (
+                        cron.id.clone(),
+                        cron.label.clone(),
+                        cron_status_icon(cron.status),
+                    )
+                })
+                .collect(),
+        }
     }
 
     pub fn target_settings_content(&self) -> Option<String> {
@@ -1200,6 +1253,38 @@ impl AppState {
         }
     }
 
+    fn restart_daemon(&mut self) {
+        let card_index = self.main_view.push_card(":restart".into(), self.mode);
+        match &self.restart_handle {
+            Some(handle) => match handle.restart() {
+                Ok(()) => {
+                    self.main_view.set_card_output(
+                        card_index,
+                        "daemon restart requested; waiting for reconnect".into(),
+                    );
+                    self.main_view
+                        .set_card_status(card_index, CardStatus::Pending);
+                }
+                Err(error) => {
+                    self.main_view.set_card_output(
+                        card_index,
+                        format!("Error [restart]: failed to restart daemon: {error:#}"),
+                    );
+                    self.main_view
+                        .set_card_status(card_index, CardStatus::Error);
+                }
+            },
+            None => {
+                self.main_view.set_card_output(
+                    card_index,
+                    "Error [restart]: restart is unavailable for this session".into(),
+                );
+                self.main_view
+                    .set_card_status(card_index, CardStatus::Error);
+            }
+        }
+    }
+
     fn close_job_picker(&mut self) {
         self.job_picker = None;
     }
@@ -1225,12 +1310,12 @@ impl AppState {
             return;
         };
         let items = self.job_picker_items();
-        let Some((job_id, _, _)) = items.get(selected).cloned() else {
+        let Some((target_id, _, _)) = items.get(selected).cloned() else {
             self.close_job_picker();
             return;
         };
         self.close_job_picker();
-        self.update(AppMsg::Submit(format!(":kill {job_id}")));
+        self.update(AppMsg::Submit(format!(":kill {target_id}")));
     }
 
     fn enqueue_silent_request(&mut self, payload: RequestPayload, description: &str) -> bool {
@@ -1270,6 +1355,16 @@ impl AppState {
                 break;
             }
         }
+    }
+
+    fn request_cron_snapshot(&mut self) {
+        let _ = self.enqueue_silent_request(
+            RequestPayload::Eval {
+                input: ":crons".to_string(),
+                mode: Mode::Cron,
+            },
+            ":crons",
+        );
     }
 
     fn track_pending_submission(&mut self, request_id: u32, pending: PendingSubmission) {
@@ -1423,6 +1518,7 @@ impl AppState {
                 let job = self.jobs[index].clone();
                 self.refresh_job_card(card_index, &job);
             }
+            self.refresh_cron_trigger_card(id);
         } else {
             self.jobs.push(JobRow {
                 id: id.to_string(),
@@ -1432,6 +1528,7 @@ impl AppState {
                 end_scope,
                 open_hint: JobOpenHint::Stream,
             });
+            self.refresh_cron_trigger_card(id);
         }
     }
 
@@ -1464,25 +1561,24 @@ impl AppState {
                 job.end_scope.as_deref(),
             ),
         );
-        let status = match job.status {
-            JobStatus::Pending => CardStatus::Pending,
-            JobStatus::Running => CardStatus::Streaming,
-            JobStatus::Done => CardStatus::Success,
-            JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_) => CardStatus::Error,
-        };
-        self.main_view.set_card_status(card_index, status);
+        self.main_view
+            .set_card_status(card_index, card_status_for_job(&job.status));
     }
 
     fn upsert_cron(&mut self, id: String, label: String, status: CronStatus) {
         if let Some(cron) = self.crons.iter_mut().find(|cron| cron.id == id) {
+            let cron_id = cron.id.clone();
             if !label.is_empty() {
                 cron.label = label;
             }
             cron.status = status;
+            self.refresh_cron_cards_for_cron(&cron_id);
             return;
         }
 
+        let cron_id = id.clone();
         self.crons.push(CronRow { id, label, status });
+        self.refresh_cron_cards_for_cron(&cron_id);
     }
 
     fn replace_jobs(&mut self, list: Vec<JobInfo>) {
@@ -1508,6 +1604,77 @@ impl AppState {
                 status: cron.status,
             })
             .collect();
+        self.refresh_all_cron_trigger_cards();
+    }
+
+    fn ensure_cron_trigger_card(&mut self, cron_id: &str, job_id: &str) -> usize {
+        if let Some((existing_cron_id, card_index)) = self.cron_job_cards.get(job_id).cloned()
+            && existing_cron_id == cron_id
+            && self
+                .main_view
+                .cards
+                .get(card_index)
+                .is_some_and(|card| card.mode == Mode::Cron)
+        {
+            return card_index;
+        }
+
+        let card_index = self
+            .main_view
+            .push_card(format!("cron trigger {cron_id}"), Mode::Cron);
+        self.main_view
+            .set_card_label(card_index, cron_id.to_string());
+        self.cron_job_cards
+            .insert(job_id.to_string(), (cron_id.to_string(), card_index));
+        card_index
+    }
+
+    fn refresh_cron_trigger_card(&mut self, job_id: &str) {
+        let Some((cron_id, card_index)) = self.cron_job_cards.get(job_id).cloned() else {
+            return;
+        };
+
+        let cron = self.crons.iter().find(|cron| cron.id == cron_id).cloned();
+        let cron_label = cron
+            .as_ref()
+            .map(|cron| cron.label.clone())
+            .unwrap_or_else(|| cron_id.clone());
+        let cron_status = cron
+            .as_ref()
+            .map(|cron| cron.status)
+            .unwrap_or(CronStatus::Scheduled);
+        let job = self.jobs.iter().find(|job| job.id == job_id).cloned();
+
+        self.main_view.set_card_output(
+            card_index,
+            format_cron_trigger_record(&cron_id, &cron_label, cron_status, job.as_ref()),
+        );
+        self.main_view.set_card_status(
+            card_index,
+            job.as_ref()
+                .map(|job| card_status_for_job(&job.status))
+                .unwrap_or(CardStatus::Pending),
+        );
+    }
+
+    fn refresh_cron_cards_for_cron(&mut self, cron_id: &str) {
+        let job_ids: Vec<String> = self
+            .cron_job_cards
+            .iter()
+            .filter_map(|(job_id, (mapped_cron_id, _))| {
+                (mapped_cron_id == cron_id).then_some(job_id.clone())
+            })
+            .collect();
+        for job_id in job_ids {
+            self.refresh_cron_trigger_card(&job_id);
+        }
+    }
+
+    fn refresh_all_cron_trigger_cards(&mut self) {
+        let job_ids: Vec<String> = self.cron_job_cards.keys().cloned().collect();
+        for job_id in job_ids {
+            self.refresh_cron_trigger_card(&job_id);
+        }
     }
 
     fn open_cron_row(&mut self, row: usize) {
@@ -1519,7 +1686,6 @@ impl AppState {
             format!("cron {}", cron.id),
             format_cron_preview(&cron),
         );
-        self.set_focus(FocusArea::MainView);
     }
 
     /// Convert a sidebar display row (newest-first) to the underlying vec index (oldest-first).
@@ -1551,6 +1717,22 @@ impl AppState {
                 if let Some(idx) = self.sidebar_row_to_index(row, self.crons.len()) {
                     self.open_cron_row(idx);
                 }
+            }
+        }
+    }
+
+    fn selected_sidebar_kill_command(&self) -> Option<String> {
+        let row = self.sidebar.selected?;
+        match self.mode {
+            Mode::Job => {
+                let idx = self.sidebar_row_to_index(row, self.jobs.len())?;
+                let job = self.jobs.get(idx)?;
+                matches!(job.status, JobStatus::Running).then(|| format!(":kill {}", job.id))
+            }
+            Mode::Cron => {
+                let idx = self.sidebar_row_to_index(row, self.crons.len())?;
+                let cron = self.crons.get(idx)?;
+                Some(format!(":kill {}", cron.id))
             }
         }
     }
@@ -1691,6 +1873,12 @@ impl AppState {
                 self.open_job_picker();
             }
 
+            AppMsg::KillSelection => {
+                if let Some(command) = self.selected_sidebar_kill_command() {
+                    self.update(AppMsg::Submit(command));
+                }
+            }
+
             AppMsg::OpenTargetSettings => {
                 self.open_target_settings();
             }
@@ -1713,6 +1901,7 @@ impl AppState {
                     match local {
                         LocalCommand::Clear => self.update(AppMsg::ClearDisplay),
                         LocalCommand::Quit => self.update(AppMsg::Quit),
+                        LocalCommand::Restart => self.restart_daemon(),
                     }
                     return;
                 }
@@ -2059,6 +2248,7 @@ impl AppState {
                             label: chain_step_label(&cid, idx, total),
                         });
                     }
+                    self.refresh_cron_trigger_card(&job_id);
                     self.sync_sidebar_items();
                 }
                 EventPayload::JobStateChanged {
@@ -2074,6 +2264,7 @@ impl AppState {
                 EventPayload::JobRemoved { job_id } => {
                     self.jobs.retain(|job| job.id != job_id);
                     self.job_cards.remove(&job_id);
+                    self.cron_job_cards.remove(&job_id);
                     self.sync_sidebar_items();
                 }
                 EventPayload::ChainStarted { chain } => {
@@ -2130,8 +2321,14 @@ impl AppState {
                 EventPayload::FgExited { id, reason } => {
                     self.finish_fg_session(&id, &reason);
                 }
+                EventPayload::CronTriggered { cron_id, job_id } => {
+                    self.ensure_cron_trigger_card(&cron_id, &job_id);
+                    self.refresh_cron_trigger_card(&job_id);
+                    self.request_cron_snapshot();
+                }
                 EventPayload::CronRemoved { cron_id } => {
                     self.crons.retain(|cron| cron.id != cron_id);
+                    self.refresh_cron_cards_for_cron(&cron_id);
                     self.sync_sidebar_items();
                 }
                 EventPayload::ShuttingDown { reason } => {
@@ -2278,6 +2475,15 @@ impl AppState {
                         }
                         _ => {}
                     }
+                }
+
+                if self.focus != FocusArea::Input
+                    && self.sidebar_visible()
+                    && self.sidebar.selected.is_some()
+                    && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+                {
+                    self.update(AppMsg::KillSelection);
+                    return;
                 }
 
                 let child_msg = match self.focus {
@@ -2462,6 +2668,7 @@ fn normalize_command_label(input: &str) -> String {
 enum LocalCommand {
     Clear,
     Quit,
+    Restart,
 }
 
 fn parse_local_command(input: &str) -> Option<LocalCommand> {
@@ -2469,6 +2676,7 @@ fn parse_local_command(input: &str) -> Option<LocalCommand> {
     match trimmed {
         ":clear" => Some(LocalCommand::Clear),
         ":quit" | ":exit" => Some(LocalCommand::Quit),
+        ":restart" => Some(LocalCommand::Restart),
         _ => None,
     }
 }
@@ -2734,6 +2942,37 @@ fn format_cron_preview(cron: &CronRow) -> String {
     )
 }
 
+fn format_cron_trigger_record(
+    cron_id: &str,
+    cron_label: &str,
+    cron_status: CronStatus,
+    job: Option<&JobRow>,
+) -> String {
+    let mut lines = vec![
+        format!("cron: {cron_id}"),
+        format!("cron status: {}", format_cron_status(cron_status)),
+        format!("definition: {cron_label}"),
+    ];
+
+    match job {
+        Some(job) => {
+            lines.push(String::new());
+            lines.push(format_job_record(
+                &job.id,
+                &job.status,
+                job.start_scope.as_deref(),
+                job.end_scope.as_deref(),
+            ));
+        }
+        None => {
+            lines.push(String::new());
+            lines.push("job: awaiting snapshot".to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn format_target_settings_view(
     state: &TargetSettingsState,
     session_profile_name: Option<&str>,
@@ -2887,11 +3126,20 @@ fn format_job_status(status: &JobStatus) -> String {
     }
 }
 
+fn card_status_for_job(status: &JobStatus) -> CardStatus {
+    match status {
+        JobStatus::Pending => CardStatus::Pending,
+        JobStatus::Running => CardStatus::Streaming,
+        JobStatus::Done => CardStatus::Success,
+        JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_) => CardStatus::Error,
+    }
+}
+
 fn builtin_command_candidates(word: &str) -> Vec<String> {
     const COMMANDS: &[&str] = &[
         "run", "cron", "kill", "retry", "out", "err", "fg", "wait", "send", "cancel", "pause",
         "resume", "log", "jobs", "crons", "scopes", "env", "cd", "scope", "help", "config",
-        "clear", "quit", "exit",
+        "clear", "quit", "exit", "restart",
     ];
     let prefix = word.strip_prefix(':').unwrap_or(word);
     COMMANDS
@@ -3125,14 +3373,27 @@ fn job_sidebar_item(job: &JobRow) -> SidebarItem {
     SidebarItem {
         id: job.id.clone(),
         label: job.label.clone(),
-        status_icon: match job.status {
-            JobStatus::Pending => "⏳",
-            JobStatus::Running => "🔄",
-            JobStatus::Done => "✅",
-            JobStatus::Failed => "❌",
-            JobStatus::Killed => "🛑",
-            JobStatus::Cancelled(_) => "⏹",
-        },
+        status_icon: job_status_icon(&job.status),
+    }
+}
+
+fn job_status_icon(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Pending => "⏳",
+        JobStatus::Running => "🔄",
+        JobStatus::Done => "✅",
+        JobStatus::Failed => "❌",
+        JobStatus::Killed => "🛑",
+        JobStatus::Cancelled(_) => "⏹",
+    }
+}
+
+fn cron_status_icon(status: CronStatus) -> &'static str {
+    match status {
+        CronStatus::Scheduled => "⏰",
+        CronStatus::Paused => "⏸",
+        CronStatus::Completed => "✅",
+        CronStatus::Expired => "⌛",
     }
 }
 
@@ -3140,12 +3401,7 @@ fn cron_sidebar_item(cron: &CronRow) -> SidebarItem {
     SidebarItem {
         id: cron.id.clone(),
         label: cron.label.clone(),
-        status_icon: match cron.status {
-            CronStatus::Scheduled => "⏰",
-            CronStatus::Paused => "⏸",
-            CronStatus::Completed => "✅",
-            CronStatus::Expired => "⌛",
-        },
+        status_icon: cron_status_icon(cron.status),
     }
 }
 
@@ -3513,6 +3769,29 @@ mod tests {
         assert!(state.job_picker_open());
         assert_eq!(state.job_picker_selected(), Some(0));
         assert_eq!(state.job_picker_items().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_c_in_cron_mode_opens_remove_picker() {
+        let mut state = AppState::new();
+        state.mode = Mode::Cron;
+        state.sync_mode_views();
+        state.crons = vec![CronRow {
+            id: "C1".into(),
+            label: "every 5m cargo test".into(),
+            status: CronStatus::Scheduled,
+        }];
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+
+        assert!(state.job_picker_open());
+        assert_eq!(state.job_picker_selected(), Some(0));
+        assert_eq!(state.job_picker_title(), "Crons");
+        assert_eq!(state.job_picker_submit_label(), "remove");
+        assert_eq!(state.job_picker_items()[0].0, "C1");
     }
 
     #[test]
@@ -4090,6 +4369,133 @@ destination = "devbox"
     }
 
     #[test]
+    fn sidebar_delete_removes_selected_cron() {
+        let mut state = AppState::new();
+        state.mode = Mode::Cron;
+        state.sync_mode_views();
+        state.crons.push(CronRow {
+            id: "C1".into(),
+            label: "every 5m cargo test".into(),
+            status: CronStatus::Scheduled,
+        });
+        state.sync_sidebar_items();
+        state.set_focus(FocusArea::Sidebar);
+        state.sidebar.selected = Some(0);
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+
+        let card = state.main_view.cards.last().expect("kill card");
+        assert_eq!(card.input, ":kill C1");
+        assert_eq!(card.mode, Mode::Cron);
+    }
+
+    #[test]
+    fn opening_cron_from_sidebar_keeps_sidebar_focus() {
+        let mut state = AppState::new();
+        state.mode = Mode::Cron;
+        state.sync_mode_views();
+        state.crons.push(CronRow {
+            id: "C1".into(),
+            label: "every 5m cargo test".into(),
+            status: CronStatus::Scheduled,
+        });
+        state.set_focus(FocusArea::Sidebar);
+
+        state.activate_sidebar_row(0);
+
+        assert_eq!(state.focus, FocusArea::Sidebar);
+        assert_eq!(state.display_tab_labels(), vec![" cron C1  × ".to_string()]);
+    }
+
+    #[test]
+    fn delete_from_main_view_removes_selected_cron() {
+        let mut state = AppState::new();
+        state.mode = Mode::Cron;
+        state.sync_mode_views();
+        state.show_sidebar = Some(true);
+        state.crons.push(CronRow {
+            id: "C1".into(),
+            label: "every 5m cargo test".into(),
+            status: CronStatus::Scheduled,
+        });
+        state.sync_sidebar_items();
+        state.sidebar.selected = Some(0);
+        state.focus = FocusArea::MainView;
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )));
+
+        let card = state.main_view.cards.last().expect("kill card");
+        assert_eq!(card.input, ":kill C1");
+        assert_eq!(card.mode, Mode::Cron);
+    }
+
+    #[test]
+    fn cron_trigger_event_creates_cron_record() {
+        let mut state = AppState::new();
+        state.crons.push(CronRow {
+            id: "C1".into(),
+            label: "every 5m cargo test".into(),
+            status: CronStatus::Scheduled,
+        });
+
+        state.update(AppMsg::ServerEvent(EventPayload::CronTriggered {
+            cron_id: "C1".into(),
+            job_id: "J42".into(),
+        }));
+
+        let card = state.main_view.cards.last().expect("cron trigger card");
+        assert_eq!(card.mode, Mode::Cron);
+        assert_eq!(card.label.as_deref(), Some("C1"));
+        assert!(card.output.contains("definition: every 5m cargo test"));
+        assert!(card.output.contains("job: awaiting snapshot"));
+    }
+
+    #[test]
+    fn cron_trigger_card_tracks_job_status_updates() {
+        let mut state = AppState::new();
+        state.crons.push(CronRow {
+            id: "C1".into(),
+            label: "every 5m cargo test".into(),
+            status: CronStatus::Scheduled,
+        });
+        state.update(AppMsg::ServerEvent(EventPayload::CronTriggered {
+            cron_id: "C1".into(),
+            job_id: "J42".into(),
+        }));
+
+        state.update(AppMsg::ServerEvent(EventPayload::JobCreated {
+            job_id: "J42".into(),
+            pipeline: "cargo test".into(),
+            start_scope: Some("S@abc".into()),
+            open_hint: JobOpenHint::Stream,
+            chain_id: None,
+            chain_index: None,
+            chain_total: None,
+        }));
+        state.update(AppMsg::ServerEvent(EventPayload::JobStateChanged {
+            job_id: "J42".into(),
+            old_state: JobStatus::Running,
+            new_state: JobStatus::Done,
+            end_scope: Some("S@def".into()),
+            chain_id: None,
+            chain_index: None,
+        }));
+
+        let card = state.main_view.cards.last().expect("cron trigger card");
+        assert_eq!(card.status, CardStatus::Success);
+        assert!(card.output.contains("J42"));
+        assert!(card.output.contains("status: done"));
+        assert!(card.output.contains("start scope: S@abc"));
+        assert!(card.output.contains("end scope: S@def"));
+    }
+
+    #[test]
     fn card_inspection_opens_preview_tab() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card("cargo test".into(), Mode::Job);
@@ -4238,6 +4644,28 @@ destination = "devbox"
         let card = state.main_view.cards.last().unwrap();
         assert_eq!(card.status, CardStatus::Error);
         assert!(card.output.contains("offline"));
+    }
+
+    #[test]
+    fn restart_local_command_uses_restart_handle() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut state = AppState::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&calls);
+        state.set_restart_handle(Some(RestartHandle::new(move || {
+            shared.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        state.update(AppMsg::Submit(":restart".into()));
+
+        let card = state.main_view.cards.last().expect("restart card");
+        assert_eq!(card.input, ":restart");
+        assert_eq!(card.status, CardStatus::Pending);
+        assert!(card.output.contains("waiting for reconnect"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

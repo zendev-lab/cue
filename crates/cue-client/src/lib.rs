@@ -3,6 +3,7 @@
 mod client;
 mod config_paths;
 mod reconnect;
+mod restart;
 mod ssh_config;
 
 pub use client::{
@@ -19,4 +20,5 @@ pub use reconnect::{
     spawn_connection_manager_controllable_with_delay, spawn_connection_manager_with_delay,
     spawn_socket_manager, spawn_socket_manager_with_delay,
 };
+pub use restart::RestartHandle;
 pub use ssh_config::detected_ssh_hosts;

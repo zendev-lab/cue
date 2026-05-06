@@ -32,6 +32,7 @@ pub async fn run(
     client_connector: client::ClientConnector,
     client: Option<CuedClient>,
     session_profile_name: Option<String>,
+    restart_handle: Option<client::RestartHandle>,
 ) -> Result<()> {
     // Split client into reader/writer handle if connected.
     let (socket_reader, writer_handle, connected) = match client {
@@ -68,6 +69,7 @@ pub async fn run(
     // Build app state.
     let mut state = AppState::new();
     state.set_session_profile_name(session_profile_name);
+    state.set_restart_handle(restart_handle);
     if let Err(error) = history::load_history().map(|items| state.input.replace_history(items)) {
         tracing::warn!(%error, "failed to load prompt history");
     }

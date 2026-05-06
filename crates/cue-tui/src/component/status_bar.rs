@@ -88,7 +88,7 @@ impl StatusBar {
                 AppMsg::OpenTargetSettings,
             ),
             (
-                "[jobs ^C]",
+                "[kill ^C]",
                 Style::default().fg(Color::Gray),
                 AppMsg::OpenJobPicker,
             ),

@@ -295,9 +295,13 @@ impl<'a> Tokenizer<'a> {
             return Ok(Token::Comma);
         }
 
-        // Quoted string
+        // Quoted string (double quotes — escape sequences supported)
         if self.bytes[self.pos] == b'"' {
             return self.tokenize_quoted_string();
+        }
+        // Single-quoted string (literal — no escape sequences)
+        if self.bytes[self.pos] == b'\'' {
+            return self.tokenize_single_quoted_string();
         }
 
         // Regular word: gobble until delimiter
@@ -367,6 +371,31 @@ impl<'a> Tokenizer<'a> {
                         });
                     }
                 },
+                Some(c) => s.push(c as char),
+            }
+        }
+        self.last_significant = Some(TokenClass::Other);
+        Ok(Token::Word(s))
+    }
+
+    /// Tokenize a single-quoted string literal.
+    ///
+    /// Single quotes capture everything literally until the closing `'`.
+    /// Unlike double-quoted strings, there are no escape sequences.
+    /// Unmatched quotes produce a `TokenizeError`.
+    fn tokenize_single_quoted_string(&mut self) -> Result<Token, TokenizeError> {
+        let start = self.pos;
+        self.pos += 1; // skip opening quote
+        let mut s = String::new();
+        loop {
+            match self.advance() {
+                None => {
+                    return Err(TokenizeError {
+                        pos: start,
+                        message: "unterminated single-quoted string".into(),
+                    });
+                }
+                Some(b'\'') => break,
                 Some(c) => s.push(c as char),
             }
         }

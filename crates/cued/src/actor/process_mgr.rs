@@ -54,6 +54,50 @@ const DEFAULT_PTY_ROWS: u16 = 24;
 
 // ── Actor entry point ──
 
+/// Convert a multi-segment pipeline into a single `(program, args)` tuple
+/// suitable for `tokio::process::Command`.  Single-segment pipelines are
+/// returned as-is (first segment command).  Multi-segment pipelines are
+/// wrapped in `sh -c "…"` with shell pipes.
+fn pipeline_to_command(pipeline: &cue_core::pipeline::Pipeline) -> (String, Vec<String>) {
+    if pipeline.segments.is_empty() {
+        return (String::new(), vec![]);
+    }
+    if pipeline.segments.len() == 1 {
+        return (
+            pipeline.segments[0]
+                .command
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            pipeline.segments[0]
+                .command
+                .get(1..)
+                .unwrap_or(&[])
+                .to_vec(),
+        );
+    }
+    // Multi-segment: convert |> → shell |
+    let shell_cmd = pipeline
+        .segments
+        .iter()
+        .map(|s| {
+            let cmd = s.command.join(" ");
+            match s.pipe_to_next {
+                Some(cue_core::pipeline::PipeOp::Stdout) => format!("{cmd} |"),
+                Some(cue_core::pipeline::PipeOp::StdoutStderr) => {
+                    format!("{{ {cmd} 2>&1; }} |")
+                }
+                Some(cue_core::pipeline::PipeOp::StderrOnly) => {
+                    format!("{{ {cmd} 2>&1 1>&2; }} |")
+                }
+                None => cmd,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    ("sh".to_string(), vec!["-c".to_string(), shell_cmd])
+}
+
 /// Spawn the ProcessManager actor task.
 pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
     tokio::spawn(async move {
@@ -71,11 +115,11 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     match msg {
                 ProcessMgrMsg::SpawnJob {
                     job_id,
-                    command_line,
+                    pipeline,
                     scope_hash,
                     cwd_override,
                 } => {
-                    info!(%job_id, cmd = ?command_line, %scope_hash, "process_mgr: spawn");
+                    info!(%job_id, segments = pipeline.segments.len(), %scope_hash, "process_mgr: spawn");
 
                     // 1. Query ScopeStore for the environment snapshot.
                     let snapshot = {
@@ -115,16 +159,28 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     };
 
                     let effective_snapshot = snapshot.as_ref().map(effective_snapshot);
-                    let expanded_command_line =
-                        expand_command_line(&command_line, effective_snapshot.as_ref());
 
                     // 2. Build the tokio Command.
-                    let Some(program) = expanded_command_line.first().filter(|program| !program.is_empty()) else {
+                    let (program, args) = if pipeline.segments.len() > 1 {
+                        pipeline_to_command(&pipeline)
+                    } else {
+                        let command_line = pipeline
+                            .segments
+                            .first()
+                            .map(|s| s.command.clone())
+                            .unwrap_or_default();
+                        let expanded =
+                            expand_command_line(&command_line, effective_snapshot.as_ref());
+                        let prog = expanded.first().cloned().unwrap_or_default();
+                        let rest: Vec<String> =
+                            expanded.get(1..).unwrap_or(&[]).to_vec();
+                        (prog, rest)
+                    };
+                    let Some(program) = (!program.is_empty()).then_some(program) else {
                         error!(
                             %job_id,
-                            raw_cmd = ?command_line,
-                            expanded_cmd = ?expanded_command_line,
-                            "process_mgr: expanded command is empty"
+                            pipeline = ?pipeline.segments.first().map(|s| &s.command),
+                            "process_mgr: command is empty"
                         );
                         continue;
                     };
@@ -155,9 +211,9 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     clear_output_log(job_id).await;
 
-                    let mut cmd = tokio::process::Command::new(program);
-                    if expanded_command_line.len() > 1 {
-                        cmd.args(&expanded_command_line[1..]);
+                    let mut cmd = tokio::process::Command::new(&program);
+                    if !args.is_empty() {
+                        cmd.args(&args);
                     }
                     if let Some(ref snap) = effective_snapshot {
                         apply_env(&mut cmd, snap);
@@ -293,7 +349,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             error!(
                                 %job_id,
                                 program = %program,
-                                expanded_cmd = ?expanded_command_line,
+                                args = ?args,
                                 cwd = %snapshot
                                     .as_ref()
                                     .map(|snap| snap.cwd.display().to_string())
