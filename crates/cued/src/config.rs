@@ -15,6 +15,8 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub aliases: AliasConfig,
+    #[serde(default)]
+    pub wrapper: WrapperConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +189,113 @@ fn default_backends() -> BTreeMap<String, AgentBackendConfig> {
     )])
 }
 
+/// ── Wrapper config ──
+///
+/// Applies an external binary prefix to single-segment command spawns.
+/// The wrapper is **idempotent**: if the program already matches
+/// `binary`, or is in the denylist, or the spawn is a foreground attach,
+/// the wrapper is skipped.
+///
+/// Example:
+///
+/// ```toml
+/// [wrapper]
+/// enabled = true
+/// binary = "rtk"
+///
+/// [wrapper.denylist]
+/// commands = ["vim", "ssh"]
+/// interactive = true
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct WrapperConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_wrapper_binary")]
+    pub binary: String,
+    #[serde(default)]
+    pub denylist: WrapperDenylist,
+}
+
+impl Default for WrapperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary: default_wrapper_binary(),
+            denylist: WrapperDenylist::default(),
+        }
+    }
+}
+
+impl WrapperConfig {
+    /// Determine whether the wrapper should be applied for a given program.
+    ///
+    /// Returns `true` when:
+    /// - wrapper is enabled (or explicitly overridden),
+    /// - `program` is NOT the wrapper binary itself (idempotency),
+    /// - `program` is NOT in the denylist,
+    /// - the spawn is NOT a foreground attach (when `denylist.interactive`).
+    pub fn should_wrap(
+        &self,
+        program: &str,
+        is_foreground: bool,
+        override_enabled: Option<bool>,
+    ) -> bool {
+        let enabled = override_enabled.unwrap_or(self.enabled);
+        if !enabled {
+            return false;
+        }
+        let base = std::path::Path::new(program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(program);
+        // Idempotency guard: already the wrapper binary.
+        if base == self.binary_base() {
+            return false;
+        }
+        // Interactive guard.
+        if is_foreground && self.denylist.interactive {
+            return false;
+        }
+        // Denylist guard.
+        !self.denylist.matches(program)
+    }
+
+    /// Extract the file-name portion of the wrapper binary for comparison.
+    fn binary_base(&self) -> &str {
+        std::path::Path::new(&self.binary)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&self.binary)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WrapperDenylist {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default = "default_true")]
+    pub interactive: bool,
+}
+
+impl WrapperDenylist {
+    pub fn matches(&self, program: &str) -> bool {
+        let base = std::path::Path::new(program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(program);
+        self.commands.iter().any(|c| c == base)
+    }
+}
+
+fn default_wrapper_binary() -> String {
+    String::new()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn read_source(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -336,5 +445,162 @@ pip = "uv pip"
             config.aliases.apply("pip install foo"),
             "uv pip install foo"
         );
+    }
+
+    // ── WrapperConfig ──
+
+    #[test]
+    fn wrapper_default_disabled() {
+        let cfg = WrapperConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.should_wrap("git", false, None));
+    }
+
+    #[test]
+    fn wrapper_enabled_wraps_command() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            ..Default::default()
+        };
+        assert!(cfg.should_wrap("git", false, None));
+    }
+
+    #[test]
+    fn wrapper_override_disabled() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            ..Default::default()
+        };
+        assert!(!cfg.should_wrap("git", false, Some(false)));
+    }
+
+    #[test]
+    fn wrapper_override_enabled() {
+        let cfg = WrapperConfig {
+            enabled: false,
+            binary: "rtk".into(),
+            ..Default::default()
+        };
+        assert!(cfg.should_wrap("git", false, Some(true)));
+    }
+
+    #[test]
+    fn wrapper_idempotent_already_wrapped() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            ..Default::default()
+        };
+        assert!(!cfg.should_wrap("rtk", false, None));
+    }
+
+    #[test]
+    fn wrapper_idempotent_with_full_path() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "/usr/local/bin/rtk".into(),
+            ..Default::default()
+        };
+        // rtk is the binary base name → skip
+        assert!(!cfg.should_wrap("rtk", false, None));
+        // git is not → wrap
+        assert!(cfg.should_wrap("git", false, None));
+    }
+
+    #[test]
+    fn wrapper_denylist_commands() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            denylist: WrapperDenylist {
+                commands: vec!["vim".into(), "nvim".into()],
+                interactive: true,
+            },
+        };
+        assert!(!cfg.should_wrap("vim", false, None));
+        assert!(!cfg.should_wrap("nvim", false, None));
+        assert!(cfg.should_wrap("git", false, None));
+    }
+
+    #[test]
+    fn wrapper_denylist_interactive() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            ..Default::default()
+        };
+        assert!(!cfg.should_wrap("git", true, None));
+        assert!(cfg.should_wrap("git", false, None));
+    }
+
+    #[test]
+    fn wrapper_denylist_interactive_disabled() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            denylist: WrapperDenylist {
+                commands: vec![],
+                interactive: false,
+            },
+        };
+        // Should still wrap in foreground when interactive: false
+        assert!(cfg.should_wrap("git", true, None));
+    }
+
+    #[test]
+    fn wrapper_parsed_from_server_toml() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("server.toml"),
+                r#"
+[wrapper]
+enabled = true
+binary = "rtk"
+
+[wrapper.denylist]
+commands = ["vim", "ssh"]
+interactive = false
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+        assert!(config.wrapper.enabled);
+        assert_eq!(config.wrapper.binary, "rtk");
+        assert_eq!(config.wrapper.denylist.commands, vec!["vim", "ssh"]);
+        assert!(!config.wrapper.denylist.interactive);
+    }
+
+    #[test]
+    fn wrapper_absent_config_is_default() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("server.toml"),
+                r#"
+[aliases]
+pip = "uv pip"
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+        assert!(!config.wrapper.enabled);
+    }
+
+    #[test]
+    fn wrapper_guard_order_binary_first() {
+        // Even if rtk is in the denylist, the idempotency guard fires first.
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            denylist: WrapperDenylist {
+                commands: vec!["rtk".into()],
+                interactive: true,
+            },
+        };
+        // rtk matches binary_base first → skip (idempotency)
+        assert!(!cfg.should_wrap("rtk", false, None));
     }
 }

@@ -333,7 +333,7 @@ impl Parser {
                 Ok(Argument::Empty)
             }
 
-            "help" | "config" | "env" | "scope" | "cd" => {
+            "help" | "config" | "env" | "scope" | "cd" | "wrap" => {
                 let text = self.consume_remaining_text();
                 if text.is_empty() {
                     Ok(Argument::Empty)
@@ -499,7 +499,7 @@ fn suggest_command(name: &str) -> Vec<String> {
     let commands = [
         "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
         "agents", "crons", "scopes", "ask", "spawn", "confirm", "escalate", "probe", "cron", "env",
-        "cd", "scope", "help", "config", "log", "pause", "resume", "clear", "quit", "exit",
+        "cd", "scope", "help", "config", "log", "pause", "resume", "clear", "quit", "exit", "wrap",
     ];
     commands
         .iter()
