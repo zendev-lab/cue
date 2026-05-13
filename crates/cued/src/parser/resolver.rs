@@ -73,6 +73,8 @@ pub enum ResolvedCommand {
     Clear,
     /// Quit.
     Quit,
+    /// Wrapper control: on / off / status.
+    Wrap { subcommand: Option<String> },
 }
 
 /// Resolve an AST into a command ready for execution.
@@ -223,6 +225,9 @@ impl Resolver {
             },
             "clear" => ResolvedCommand::Clear,
             "quit" | "exit" => ResolvedCommand::Quit,
+            "wrap" => ResolvedCommand::Wrap {
+                subcommand: extract_optional_text(argument),
+            },
             _ => unreachable!("parser rejects unknown commands"),
         })
     }

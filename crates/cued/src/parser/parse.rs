@@ -326,7 +326,7 @@ impl Parser {
             // Empty or text subcommands
             "jobs" | "crons" | "scopes" | "clear" | "quit" | "exit" => Ok(Argument::Empty),
 
-            "help" | "config" | "env" | "scope" | "cd" => {
+            "help" | "config" | "env" | "scope" | "cd" | "wrap" => {
                 let text = self.consume_remaining_text();
                 if text.is_empty() {
                     Ok(Argument::Empty)
@@ -491,7 +491,7 @@ pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 fn suggest_command(name: &str) -> Vec<String> {
     let commands = [
         "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
-        "crons", "scopes", "cron", "env", "cd", "scope", "help", "config", "log", "pause",
+        "crons", "scopes", "cron", "env", "cd", "scope", "help", "config", "log", "pause", "wrap",
         "resume", "clear", "quit", "exit",
     ];
     commands
