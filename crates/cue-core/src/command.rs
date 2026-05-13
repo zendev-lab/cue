@@ -60,4 +60,13 @@ impl ModeParams {
             _ => None,
         }
     }
+
+    /// Get runtime wrapper override, if specified.
+    /// `None` means use the global config default.
+    pub fn wrapper_enabled(&self) -> Option<bool> {
+        match self.get("wrapper") {
+            Some(ParamValue::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
 }

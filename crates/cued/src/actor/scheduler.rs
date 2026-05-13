@@ -2648,6 +2648,11 @@ async fn handle_command(
 
         ResolvedCommand::Quit => ResponsePayload::ack(),
 
+        ResolvedCommand::Wrap { subcommand: _ } => ResponsePayload::err(
+            error_code::NOT_SUPPORTED,
+            "wrapper runtime not yet implemented",
+        ),
+
         ResolvedCommand::Cd { path } => {
             let snapshot = match get_head_snapshot(sys).await {
                 Ok(snapshot) => snapshot,
