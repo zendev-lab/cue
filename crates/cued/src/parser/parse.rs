@@ -109,6 +109,7 @@ impl<'a> Parser<'a> {
                 tokens: chunk.tokens,
                 pos: 0,
                 input_len: input.len(),
+                input,
             };
             items.push(ScriptItemAst {
                 source: chunk.source,

@@ -883,7 +883,10 @@ mod tests {
                 Token::Word("b".into()),
                 Token::Eof,
             ]
+        );
+    }
 
+    #[test]
     fn emoji_in_words() {
         let tokens = Tokenizer::tokenize("echo 🎉").unwrap();
         let filtered: Vec<_> = tokens
