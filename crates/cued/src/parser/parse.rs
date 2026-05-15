@@ -45,17 +45,19 @@ pub enum ParseErrorKind {
 }
 
 /// Recursive descent parser.
-pub struct Parser {
+pub struct Parser<'a> {
     tokens: Vec<Spanned>,
     /// Current position (index into tokens, skipping whitespace).
     pos: usize,
     /// Input length for EOF spans.
     input_len: usize,
+    /// Original input string for raw-text extraction.
+    input: &'a str,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// Parse a raw input string into an AST.
-    pub fn parse(input: &str) -> Result<Ast, ParseError> {
+    pub fn parse(input: &'a str) -> Result<Ast, ParseError> {
         let all_tokens = Tokenizer::tokenize(input).map_err(|e| ParseError {
             span: Span::new(e.pos, e.pos + 1),
             message: e.message,
@@ -73,6 +75,7 @@ impl Parser {
             tokens,
             pos: 0,
             input_len: input.len(),
+            input,
         };
         parser.parse_input()
     }
@@ -282,9 +285,9 @@ impl Parser {
                 }
             }
 
-            // Text argument
+            // Text argument (use raw text to preserve operator chars like ->)
             "send" => {
-                let text = self.consume_remaining_text();
+                let text = self.consume_remaining_raw_text();
                 if text.is_empty() {
                     return Err(ParseError {
                         span: self.peek_span(),
@@ -351,6 +354,27 @@ impl Parser {
             parts.push(self.advance().token.to_string());
         }
         parts.join(" ")
+    }
+
+    /// Consume remaining input as raw text (preserving original characters).
+    ///
+    /// Uses token spans to extract from the original input, so operator
+    /// characters like `->` inside raw-text arguments are preserved as-is.
+    fn consume_remaining_raw_text(&mut self) -> String {
+        if self.at_end() {
+            return String::new();
+        }
+        let start = self.tokens[self.pos].span.start;
+        // Skip all remaining tokens to advance position.
+        let end_pos = self
+            .tokens
+            .last()
+            .map(|s| s.span.end)
+            .unwrap_or(self.input_len);
+        while !self.at_end() {
+            self.advance();
+        }
+        self.input[start..end_pos].to_string()
     }
 
     // ── Chain grammar (recursive descent) ──
@@ -643,6 +667,19 @@ mod tests {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "send");
                 assert_eq!(argument, Argument::Text("J1 continue with the fix".into()));
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_raw_preserves_operators() {
+        // `:send` should preserve `->` as literal text, not as chain operator.
+        let ast = Parser::parse(":send J1 replace a->b with c->d").unwrap();
+        match ast {
+            Ast::Command { name, argument, .. } => {
+                assert_eq!(name, "send");
+                assert_eq!(argument, Argument::Text("J1 replace a->b with c->d".into()));
             }
             _ => panic!("expected Command"),
         }
