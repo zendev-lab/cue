@@ -9,8 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::Component;
-use crate::app::{AppMsg, MouseMode};
 use crate::component::sidebar::OverviewCounts;
+use crate::message::AppMsg;
+use crate::mouse_mode::MouseMode;
 
 // ── Component messages ──
 

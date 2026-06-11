@@ -1,113 +1,64 @@
 //! App state and TEA update loop.
 //!
 //! Central state machine: all mutations flow through [`AppState::update`]
-//! which pattern-matches on [`AppMsg`] and delegates to components.
+//! which pattern-matches on app-level messages and delegates to components.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write as _;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+#[cfg(test)]
+use crossterm::event::{KeyEvent, MouseEvent};
 
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
-    ChainInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload,
-    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource,
-    ScriptSubmitError, Stream,
+    CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
+    ScriptItemResult, ScriptRunStatus, Stream,
 };
 use cue_core::job::JobStatus;
-use cue_core::{EventChannel, JobId, Mode};
-use ratatui::layout::{Constraint, Layout, Rect};
+use cue_core::{EventChannel, Mode};
+use ratatui::layout::Rect;
 use tui_term::vt100;
 
 use crate::client::{ConnectionController, RestartHandle, WriterHandle};
-use crate::completion::{bare_completion_candidates, builtin_command_candidates};
+use crate::clipboard;
+use crate::completion::{self, CompletionScope};
 use crate::component::Component;
 use crate::component::input_line::{InputLine, InputMsg};
-use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg, chain_step_label};
-use crate::component::sidebar::{OverviewCounts, Sidebar, SidebarItem, SidebarMsg};
+use crate::component::main_view::{CardStatus, MainView, MainViewMsg, chain_step_label};
+use crate::component::sidebar::{
+    CronSidebarRecord, JobSidebarRecord, OverviewCounts, Sidebar, SidebarMsg, overview_counts,
+};
 use crate::component::status_bar::{StatusBar, StatusBarMsg};
+use crate::display::{
+    DisplayPane, DisplayStream, DisplayTabHit, display_stream_from_ipc, output_channel_for_job_id,
+    plan_display_subscriptions,
+};
+use crate::focus::{FocusArea, is_mode_switch_key};
+use crate::footer::{self, FooterContext};
+use crate::foreground;
+use crate::geometry::{UiRegions, contains};
+use crate::job_picker::{
+    CronPickerRecord, JobPickerItem, JobPickerRecord, JobPickerState, job_picker_content_rect,
+    job_picker_popup_rect,
+};
+use crate::message::AppMsg;
+use crate::mouse_mode::MouseMode;
+use crate::record_format::{self, JobRecord};
+use crate::script_summary;
+use crate::sidebar_action;
+use crate::status_view;
+use crate::submission::{self, LocalCommand, PendingSubmission};
 #[cfg(test)]
 use crate::target_config::{TargetProfileKind, TargetProfileSource, TargetSettingsSnapshot};
 use crate::target_config::{connector_for_profile, load_target_settings, save_default_profile};
 use crate::target_settings::{
-    TargetSettingsState, TargetSettingsView, format_target_settings_view,
-    saved_target_profile_feedback, target_profile_can_be_saved,
-    target_profile_supports_live_reconnect,
+    TargetProfileSaveAction, TargetSettingsState, TargetSettingsView, format_target_settings_view,
+    saved_target_profile_feedback, target_profile_supports_live_reconnect,
+    target_settings_content_rect, target_settings_popup_rect, target_settings_profile_hit,
 };
-
-// ── Focus ──
-
-/// Which panel currently owns keyboard focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FocusArea {
-    Input,
-    MainView,
-    Sidebar,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MouseMode {
-    TextSelect,
-    UiCapture,
-}
-
-impl MouseMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::TextSelect => "text",
-            Self::UiCapture => "ui",
-        }
-    }
-
-    pub(crate) fn capture_enabled(self) -> bool {
-        matches!(self, Self::UiCapture)
-    }
-
-    fn toggle(self) -> Self {
-        match self {
-            Self::TextSelect => Self::UiCapture,
-            Self::UiCapture => Self::TextSelect,
-        }
-    }
-}
-
-// ── App-level message ──
-
-/// All events that can mutate [`AppState`].
-pub(crate) enum AppMsg {
-    // Raw terminal events
-    KeyEvent(KeyEvent),
-    MouseEvent(MouseEvent),
-    Paste(String),
-    Resize(u16, u16),
-
-    // User actions
-    Submit(String),
-    ModeSwitch,
-    ToggleSidebar,
-    ToggleMouseMode,
-    CopyFocus,
-    ClearDisplay,
-    OpenTargetSettings,
-    OpenJobPicker,
-    KillSelection,
-
-    // Socket lifecycle
-    Connected,
-    Disconnected,
-    ReconnectFailed { message: String },
-    Reconnected { writer: WriterHandle },
-    Response { id: u32, payload: ResponsePayload },
-    ServerEvent(EventPayload),
-
-    // System
-    FatalError { message: String },
-    Tick,
-    Quit,
-}
+#[cfg(test)]
+use cue_core::ipc::{ChainInfo, ScriptSource};
 
 #[derive(Debug, Clone)]
 struct JobRow {
@@ -128,23 +79,6 @@ struct CronRow {
     status: CronStatus,
 }
 
-#[derive(Debug, Clone)]
-struct PendingSubmission {
-    card_index: Option<usize>,
-    input: String,
-    mode: Mode,
-    warnings: Vec<String>,
-    kind: PendingSubmissionKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingSubmissionKind {
-    User,
-    Silent { description: String },
-    DisplaySubscribe { id: String },
-    DisplayUnsubscribe { id: String },
-}
-
 enum FgSessionKind {
     Job {
         card_index: Option<usize>,
@@ -157,114 +91,10 @@ struct FgSession {
     kind: FgSessionKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisplayStream {
-    Stdout,
-    Stderr,
-}
-
-impl DisplayStream {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Stdout => "stdout",
-            Self::Stderr => "stderr",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DisplayTab {
-    target: DisplayTarget,
-    content: String,
-    follow: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyTarget {
     label: String,
     content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DisplayTarget {
-    Output { id: String, stream: DisplayStream },
-    Preview { key: String, title: String },
-}
-
-#[derive(Debug, Clone)]
-struct JobPickerState {
-    selected: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisplayTabHit {
-    Activate(usize),
-    Close(usize),
-}
-
-impl PendingSubmission {
-    fn user(card_index: Option<usize>, input: String, mode: Mode, warnings: Vec<String>) -> Self {
-        Self {
-            card_index,
-            input,
-            mode,
-            warnings,
-            kind: PendingSubmissionKind::User,
-        }
-    }
-
-    #[cfg(test)]
-    fn silent() -> Self {
-        Self::silent_request("silent request")
-    }
-
-    fn silent_request(description: impl Into<String>) -> Self {
-        Self {
-            card_index: None,
-            input: String::new(),
-            mode: Mode::default(),
-            warnings: Vec::new(),
-            kind: PendingSubmissionKind::Silent {
-                description: description.into(),
-            },
-        }
-    }
-
-    fn display_subscribe(id: String) -> Self {
-        Self {
-            card_index: None,
-            input: String::new(),
-            mode: Mode::default(),
-            warnings: Vec::new(),
-            kind: PendingSubmissionKind::DisplaySubscribe { id },
-        }
-    }
-
-    fn display_unsubscribe(id: String) -> Self {
-        Self {
-            card_index: None,
-            input: String::new(),
-            mode: Mode::default(),
-            warnings: Vec::new(),
-            kind: PendingSubmissionKind::DisplayUnsubscribe { id },
-        }
-    }
-
-    fn is_user_visible(&self) -> bool {
-        matches!(self.kind, PendingSubmissionKind::User)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct UiRegions {
-    header: Rect,
-    input: Rect,
-    main: Rect,
-    display: Rect,
-    results: Rect,
-    results_inner: Rect,
-    sidebar: Option<Rect>,
-    sidebar_list: Option<Rect>,
 }
 
 // ── App state ──
@@ -298,8 +128,7 @@ pub(crate) struct AppState {
     script_cards: HashMap<String, usize>,
     pending_script_finishes: HashMap<String, (ScriptRunStatus, i32, Option<usize>)>,
     fg_session: Option<FgSession>,
-    display_tabs: Vec<DisplayTab>,
-    active_display_tab: Option<usize>,
+    display: DisplayPane,
     /// Output job IDs confirmed subscribed on the current connection.
     display_subscriptions: Vec<String>,
     job_picker: Option<JobPickerState>,
@@ -339,8 +168,7 @@ impl AppState {
             script_cards: HashMap::new(),
             pending_script_finishes: HashMap::new(),
             fg_session: None,
-            display_tabs: Vec::new(),
-            active_display_tab: None,
+            display: DisplayPane::default(),
             display_subscriptions: Vec::new(),
             job_picker: None,
             target_settings: None,
@@ -405,16 +233,11 @@ impl AppState {
     }
 
     pub(crate) fn display_pane_content(&self) -> &str {
-        self.active_display_tab
-            .and_then(|index| self.display_tabs.get(index))
-            .map(|tab| tab.content.as_str())
-            .unwrap_or(
-                "Use `:out J1` for a stdout snapshot, `:tail J1` to follow live stdout, or `:err J1` for stderr.",
-            )
+        self.display.content()
     }
 
     pub(crate) fn display_pane_has_target(&self) -> bool {
-        self.active_display_tab.is_some()
+        self.display.has_target()
     }
 
     pub(crate) fn target_settings_open(&self) -> bool {
@@ -424,86 +247,41 @@ impl AppState {
     pub(crate) fn target_settings_can_save(&self) -> bool {
         self.target_settings
             .as_ref()
-            .and_then(|state| {
-                let selected = state.selected_profile_name()?;
-                state
-                    .snapshot
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.name == selected)
-            })
-            .is_some_and(target_profile_can_be_saved)
+            .is_some_and(TargetSettingsState::selected_profile_can_be_saved)
     }
 
     pub(crate) fn footer_text(&self) -> String {
+        footer::footer_text(self.footer_context())
+    }
+
+    fn footer_context(&self) -> FooterContext {
         if self.job_picker_open() {
-            return match self.mode {
-                Mode::Job => "Kill picker: Enter kill  •  Esc close".to_string(),
-                Mode::Cron => "Remove picker: Enter remove  •  Esc close".to_string(),
-            };
+            return FooterContext::JobPicker { mode: self.mode };
         }
 
         if self.target_settings_open() {
-            let reconnect_hint = if self
-                .target_settings
-                .as_ref()
-                .and_then(|s| s.pending_reconnect_profile.as_ref())
-                .is_some()
-            {
-                "  •  R reconnect now"
-            } else {
-                ""
+            return FooterContext::TargetSettings {
+                can_save: self.target_settings_can_save(),
+                has_pending_reconnect: self
+                    .target_settings
+                    .as_ref()
+                    .is_some_and(TargetSettingsState::has_pending_reconnect),
             };
-            let primary_action = if self.target_settings_can_save() {
-                "Enter save default  •  "
-            } else {
-                ""
-            };
-            return format!(
-                "Targets: Up/Down/Home/End select  •  {primary_action}Ctrl+R reload  •  \
-                 Esc/Ctrl+T close  •  Ctrl+Y copy  •  Shift+Tab mode{reconnect_hint}"
-            );
         }
 
-        match self.focus {
-            FocusArea::Input => match self.mode {
-                Mode::Job => {
-                    "JOB: Enter submit  •  Shift+Enter newline  •  Tab complete  •  Shift+Tab mode"
-                        .to_string()
-                }
-                Mode::Cron => {
-                    "CRON: Enter schedule + command  •  Shift+Enter newline  •  Tab complete  •  Shift+Tab mode"
-                        .to_string()
-                }
-            },
-            FocusArea::Sidebar => {
-                "Sidebar: Click row to open  •  Del/Backspace kill or remove  •  Up/Down move  •  Enter open  •  Shift+Tab mode  •  Ctrl+B toggle".to_string()
-            }
-            FocusArea::MainView => {
-                if self.display_pane_has_target() {
-                    "Display: Click tab to switch  •  × closes tab  •  Ctrl+Y copy active tab  •  Shift+Tab mode  •  Ctrl+L clears when idle".to_string()
-                } else {
-                    "Command log: Click cards to inspect  •  Ctrl+Y copy latest record  •  Shift+Tab mode  •  :out/:err snapshot  •  :tail follows live output".to_string()
-                }
-            }
+        FooterContext::Main {
+            focus: self.focus,
+            mode: self.mode,
+            display_has_target: self.display_pane_has_target(),
         }
     }
 
     pub(crate) fn display_tab_labels(&self) -> Vec<String> {
-        self.display_tabs
-            .iter()
-            .map(|tab| match &tab.target {
-                DisplayTarget::Output { id, stream } => {
-                    let prefix = if tab.follow { " follow" } else { "" };
-                    format!("{prefix} {} {}  × ", stream.label(), id)
-                }
-                DisplayTarget::Preview { title, .. } => format!(" {title}  × "),
-            })
-            .collect()
+        self.display.labels()
     }
 
     pub(crate) fn active_display_tab(&self) -> Option<usize> {
-        self.active_display_tab
+        self.display.active()
     }
 
     fn copy_target(&self) -> Option<CopyTarget> {
@@ -525,17 +303,10 @@ impl AppState {
             });
         }
 
-        if let Some(tab) = self
-            .active_display_tab
-            .and_then(|index| self.display_tabs.get(index))
-        {
-            let label = match &tab.target {
-                DisplayTarget::Output { id, stream } => format!("{} {id}", stream.label()),
-                DisplayTarget::Preview { title, .. } => title.clone(),
-            };
+        if let Some(target) = self.display.copy_target() {
             return Some(CopyTarget {
-                label,
-                content: tab.content.clone(),
+                label: target.label,
+                content: target.content,
             });
         }
 
@@ -544,7 +315,7 @@ impl AppState {
                 .label
                 .clone()
                 .unwrap_or_else(|| "command-record".to_string()),
-            content: format_card_preview(card),
+            content: record_format::format_card_preview(card),
         })
     }
 
@@ -553,54 +324,32 @@ impl AppState {
     }
 
     pub(crate) fn job_picker_selected(&self) -> Option<usize> {
-        self.job_picker.as_ref().and_then(|picker| picker.selected)
+        self.job_picker.as_ref().and_then(JobPickerState::selected)
     }
 
     pub(crate) fn job_picker_title(&self) -> &'static str {
-        match self.mode {
-            Mode::Job => "Running Jobs",
-            Mode::Cron => "Crons",
-        }
+        crate::job_picker::title(self.mode)
     }
 
     pub(crate) fn job_picker_empty_text(&self) -> &'static str {
-        match self.mode {
-            Mode::Job => "No running jobs.",
-            Mode::Cron => "No crons.",
-        }
+        crate::job_picker::empty_text(self.mode)
     }
 
     pub(crate) fn job_picker_submit_label(&self) -> &'static str {
-        match self.mode {
-            Mode::Job => "kill",
-            Mode::Cron => "remove",
-        }
+        crate::job_picker::submit_label(self.mode)
     }
 
-    pub(crate) fn job_picker_items(&self) -> Vec<(String, String, &'static str)> {
+    pub(crate) fn job_picker_items(&self) -> Vec<JobPickerItem> {
         match self.mode {
             Mode::Job => self
                 .jobs
                 .iter()
-                .filter(|job| matches!(job.status, JobStatus::Running))
-                .map(|job| {
-                    (
-                        job.id.clone(),
-                        job.label.clone(),
-                        job_status_icon(&job.status),
-                    )
-                })
+                .filter_map(|job| crate::job_picker::job_picker_item(job_picker_record(job)))
                 .collect(),
             Mode::Cron => self
                 .crons
                 .iter()
-                .map(|cron| {
-                    (
-                        cron.id.clone(),
-                        cron.label.clone(),
-                        cron_status_icon(cron.status),
-                    )
-                })
+                .map(|cron| crate::job_picker::cron_picker_item(cron_picker_record(cron)))
                 .collect(),
         }
     }
@@ -643,83 +392,38 @@ impl AppState {
     }
 
     fn layout_regions(&self) -> UiRegions {
-        let area = Rect::new(0, 0, self.terminal_width, self.terminal_height);
-        let input_height = self
-            .input
-            .desired_height()
-            .min(self.terminal_height.saturating_sub(5).max(1));
-        let vertical = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-        let header = vertical[0];
-        let body = vertical[1];
-        let input = vertical[2];
-
-        if self.sidebar_visible() {
-            let sidebar_width = (self.terminal_width / 4)
-                .clamp(20, 40)
-                .min(self.terminal_width.saturating_sub(30));
-            let horizontal =
-                Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(30)])
-                    .split(body);
-            let sidebar = horizontal[0];
-            let main = horizontal[1];
-            let panes =
-                Layout::vertical([Constraint::Percentage(60), Constraint::Min(6)]).split(main);
-            let sidebar_inner = inner_rect(sidebar);
-            let results_inner = inner_rect(panes[1]);
-            UiRegions {
-                header,
-                input,
-                main,
-                display: panes[0],
-                results: panes[1],
-                results_inner,
-                sidebar: Some(sidebar),
-                sidebar_list: Some(sidebar_inner),
-            }
-        } else {
-            let panes =
-                Layout::vertical([Constraint::Percentage(60), Constraint::Min(6)]).split(body);
-            let results_inner = inner_rect(panes[1]);
-            UiRegions {
-                header,
-                input,
-                main: body,
-                display: panes[0],
-                results: panes[1],
-                results_inner,
-                sidebar: None,
-                sidebar_list: None,
-            }
-        }
+        crate::geometry::layout_regions(
+            self.terminal_width,
+            self.terminal_height,
+            self.input.desired_height(),
+            self.sidebar_visible(),
+        )
     }
 
     fn sync_sidebar_items(&mut self) {
         let items = match self.mode {
-            Mode::Job => self.jobs.iter().rev().map(job_sidebar_item).collect(),
-            Mode::Cron => self.crons.iter().rev().map(cron_sidebar_item).collect(),
+            Mode::Job => self
+                .jobs
+                .iter()
+                .rev()
+                .map(|job| crate::component::sidebar::job_sidebar_item(job_sidebar_record(job)))
+                .collect(),
+            Mode::Cron => self
+                .crons
+                .iter()
+                .rev()
+                .map(|cron| crate::component::sidebar::cron_sidebar_item(cron_sidebar_record(cron)))
+                .collect(),
         };
         self.sidebar.update(SidebarMsg::Items(items));
         self.refresh_overview();
     }
 
     fn refresh_overview(&mut self) {
-        let counts = OverviewCounts {
-            jobs: self.jobs.len() as u32,
-            jobs_running: self
-                .jobs
-                .iter()
-                .filter(|job| matches!(job.status, JobStatus::Running))
-                .count() as u32,
-            crons: self.crons.len() as u32,
-        };
-        self.set_overview(counts);
+        self.set_overview(overview_counts(
+            self.jobs.iter().map(|job| &job.status),
+            self.crons.len(),
+        ));
     }
 
     fn refresh_clear_action(&mut self) {
@@ -729,9 +433,7 @@ impl AppState {
     }
 
     fn fg_terminal_size(&self) -> (u16, u16) {
-        let cols = self.terminal_width.saturating_sub(2).max(1);
-        let rows = self.terminal_height.saturating_sub(3).max(1);
-        (cols, rows)
+        foreground::terminal_size(self.terminal_width, self.terminal_height)
     }
 
     fn show_submission_result(
@@ -750,7 +452,7 @@ impl AppState {
         }
         self.main_view.set_card_output(
             card_index,
-            decorate_submission_output(&pending.warnings, body),
+            submission::decorate_output(&pending.warnings, body),
         );
         self.main_view.set_card_status(card_index, status);
         card_index
@@ -783,7 +485,7 @@ impl AppState {
         };
         self.main_view.append_card_output(
             card_index,
-            &format_script_finished(status, exit_code, failed_item_index),
+            &script_summary::format_finished(status, exit_code, failed_item_index),
         );
         self.main_view.set_card_status(
             card_index,
@@ -803,13 +505,7 @@ impl AppState {
     }
 
     fn desired_display_subscriptions(&self) -> BTreeSet<String> {
-        self.display_tabs
-            .iter()
-            .filter_map(|tab| match (&tab.target, tab.follow) {
-                (DisplayTarget::Output { id, .. }, true) => Some(id.clone()),
-                _ => None,
-            })
-            .collect()
+        self.display.desired_subscriptions()
     }
 
     fn current_display_subscriptions(&self) -> BTreeSet<String> {
@@ -817,20 +513,7 @@ impl AppState {
     }
 
     fn pending_display_subscription_requests(&self) -> (BTreeSet<String>, BTreeSet<String>) {
-        let mut subscribes = BTreeSet::new();
-        let mut unsubscribes = BTreeSet::new();
-        for pending in self.pending_submissions.values() {
-            match &pending.kind {
-                PendingSubmissionKind::DisplaySubscribe { id } => {
-                    subscribes.insert(id.clone());
-                }
-                PendingSubmissionKind::DisplayUnsubscribe { id } => {
-                    unsubscribes.insert(id.clone());
-                }
-                PendingSubmissionKind::User | PendingSubmissionKind::Silent { .. } => {}
-            }
-        }
-        (subscribes, unsubscribes)
+        submission::pending_display_subscription_requests(self.pending_submissions.values())
     }
 
     fn set_display_subscriptions(&mut self, subscriptions: BTreeSet<String>) {
@@ -850,68 +533,47 @@ impl AppState {
     }
 
     fn handle_pending_ack(&mut self, pending: &PendingSubmission) {
-        match &pending.kind {
-            PendingSubmissionKind::DisplaySubscribe { id } => {
-                self.confirm_display_subscribe(id);
-                self.sync_display_subscriptions();
-            }
-            PendingSubmissionKind::DisplayUnsubscribe { id } => {
-                self.confirm_display_unsubscribe(id);
-                self.sync_display_subscriptions();
-            }
-            PendingSubmissionKind::User | PendingSubmissionKind::Silent { .. } => {}
+        if let Some(id) = pending.display_subscribe_id() {
+            self.confirm_display_subscribe(id);
+            self.sync_display_subscriptions();
+        }
+        if let Some(id) = pending.display_unsubscribe_id() {
+            self.confirm_display_unsubscribe(id);
+            self.sync_display_subscriptions();
         }
     }
 
     fn disable_display_follow(&mut self, id: &str) {
-        let mut changed = false;
-        for tab in &mut self.display_tabs {
-            if tab.follow
-                && matches!(
-                    &tab.target,
-                    DisplayTarget::Output {
-                        id: existing_id,
-                        ..
-                    } if existing_id == id
-                )
-            {
-                tab.follow = false;
-                changed = true;
-            }
-        }
-        if changed {
+        if self.display.disable_follow(id) {
             self.sync_display_subscriptions();
         }
     }
 
     fn handle_pending_error(&mut self, pending: &PendingSubmission, code: &str, message: &str) {
-        match &pending.kind {
-            PendingSubmissionKind::Silent { description } => {
-                tracing::warn!(
-                    request = %description,
-                    code = %code,
-                    message = %message,
-                    "silent request failed"
-                );
-            }
-            PendingSubmissionKind::DisplaySubscribe { id } => {
-                tracing::warn!(
-                    job_id = %id,
-                    code = %code,
-                    message = %message,
-                    "output subscription failed"
-                );
-                self.disable_display_follow(id);
-            }
-            PendingSubmissionKind::DisplayUnsubscribe { id } => {
-                tracing::warn!(
-                    job_id = %id,
-                    code = %code,
-                    message = %message,
-                    "output unsubscription failed"
-                );
-            }
-            PendingSubmissionKind::User => {}
+        if let Some(description) = pending.silent_description() {
+            tracing::warn!(
+                request = %description,
+                code = %code,
+                message = %message,
+                "silent request failed"
+            );
+        }
+        if let Some(id) = pending.display_subscribe_id() {
+            tracing::warn!(
+                job_id = %id,
+                code = %code,
+                message = %message,
+                "output subscription failed"
+            );
+            self.disable_display_follow(id);
+        }
+        if let Some(id) = pending.display_unsubscribe_id() {
+            tracing::warn!(
+                job_id = %id,
+                code = %code,
+                message = %message,
+                "output unsubscription failed"
+            );
         }
     }
 
@@ -920,11 +582,14 @@ impl AppState {
         let current = self.current_display_subscriptions();
         let (pending_subscribes, pending_unsubscribes) =
             self.pending_display_subscription_requests();
+        let plan = plan_display_subscriptions(
+            desired,
+            current,
+            &pending_subscribes,
+            &pending_unsubscribes,
+        );
 
-        for id in desired.difference(&current).cloned().collect::<Vec<_>>() {
-            if pending_subscribes.contains(&id) {
-                continue;
-            }
+        for id in plan.subscribe {
             let Some(channel) = output_channel_for_job_id(&id) else {
                 self.disable_display_follow(&id);
                 continue;
@@ -937,10 +602,7 @@ impl AppState {
                 tracing::debug!(job_id = %id, "queued output subscription");
             }
         }
-        for id in current.difference(&desired).cloned().collect::<Vec<_>>() {
-            if pending_unsubscribes.contains(&id) {
-                continue;
-            }
+        for id in plan.unsubscribe {
             let Some(channel) = output_channel_for_job_id(&id) else {
                 continue;
             };
@@ -955,24 +617,7 @@ impl AppState {
     }
 
     fn open_preview_display(&mut self, key: String, title: String, content: String) {
-        if let Some(index) = self.display_tabs.iter().position(|tab| {
-            tab.target
-                == DisplayTarget::Preview {
-                    key: key.clone(),
-                    title: title.clone(),
-                }
-        }) {
-            self.display_tabs[index].content = content;
-            self.active_display_tab = Some(index);
-            return;
-        }
-
-        self.display_tabs.push(DisplayTab {
-            target: DisplayTarget::Preview { key, title },
-            content,
-            follow: false,
-        });
-        self.active_display_tab = Some(self.display_tabs.len() - 1);
+        self.display.open_preview(key, title, content);
     }
 
     fn show_output_display(
@@ -983,131 +628,33 @@ impl AppState {
         truncated: bool,
         follow: bool,
     ) {
-        let content = if truncated {
-            format!("{data}\n--- (truncated) ---")
-        } else {
-            data
-        };
-        if let Some(index) = self.display_tabs.iter().position(|tab| {
-            matches!(
-                &tab.target,
-                DisplayTarget::Output {
-                    id: existing_id,
-                    stream: existing_stream,
-                } if *existing_id == id && *existing_stream == stream
-            )
-        }) {
-            self.display_tabs[index].content = content;
-            self.display_tabs[index].follow = follow;
-            self.active_display_tab = Some(index);
-        } else {
-            self.display_tabs.push(DisplayTab {
-                target: DisplayTarget::Output {
-                    id: id.clone(),
-                    stream,
-                },
-                content,
-                follow,
-            });
-            self.active_display_tab = Some(self.display_tabs.len() - 1);
-        }
+        self.display
+            .show_output(id, stream, data, truncated, follow);
         self.sync_display_subscriptions();
     }
 
     fn append_display_output(&mut self, id: &str, stream: Stream, data: &str) {
-        for tab in &mut self.display_tabs {
-            if tab.follow
-                && matches!(
-                    (&tab.target, stream),
-                    (
-                        DisplayTarget::Output {
-                            id: existing_id,
-                            stream: DisplayStream::Stdout,
-                        },
-                        Stream::Stdout
-                    ) if existing_id == id
-                )
-            {
-                tab.content.push_str(data);
-            }
-            if tab.follow
-                && matches!(
-                    (&tab.target, stream),
-                    (
-                        DisplayTarget::Output {
-                            id: existing_id,
-                            stream: DisplayStream::Stderr,
-                        },
-                        Stream::Stderr
-                    ) if existing_id == id
-                )
-            {
-                tab.content.push_str(data);
-            }
-        }
+        self.display.append_output(id, stream, data);
     }
 
     fn clear_display_pane(&mut self) {
-        self.display_tabs.clear();
-        self.active_display_tab = None;
+        self.display.clear();
         self.sync_display_subscriptions();
         self.close_target_settings();
     }
 
     fn activate_display_tab(&mut self, index: usize) {
-        if index < self.display_tabs.len() {
-            self.active_display_tab = Some(index);
-        }
+        self.display.activate(index);
     }
 
     fn close_display_tab(&mut self, index: usize) {
-        if self.display_tabs.get(index).is_none() {
-            return;
+        if self.display.close(index) {
+            self.sync_display_subscriptions();
         }
-        self.display_tabs.remove(index);
-        self.sync_display_subscriptions();
-
-        self.active_display_tab = match self.display_tabs.is_empty() {
-            true => None,
-            false if index >= self.display_tabs.len() => Some(self.display_tabs.len() - 1),
-            false => Some(index),
-        };
-    }
-
-    fn display_tab_bar_rect(&self, display_area: Rect) -> Option<Rect> {
-        if self.display_tabs.is_empty() || display_area.width <= 2 || display_area.height <= 2 {
-            return None;
-        }
-        Some(Rect::new(
-            display_area.x + 1,
-            display_area.y + 1,
-            display_area.width.saturating_sub(2),
-            1,
-        ))
     }
 
     fn display_tab_hit(&self, display_area: Rect, point: Rect) -> Option<DisplayTabHit> {
-        let tab_bar = self.display_tab_bar_rect(display_area)?;
-        if !contains(tab_bar, point) {
-            return None;
-        }
-
-        let mut x = tab_bar.x;
-        for (index, label) in self.display_tab_labels().into_iter().enumerate() {
-            let width = label.chars().count() as u16;
-            let start = x;
-            let close_x = start + width.saturating_sub(3);
-            let end = start + width;
-            if point.x >= start && point.x < end {
-                return if point.x >= close_x {
-                    Some(DisplayTabHit::Close(index))
-                } else {
-                    Some(DisplayTabHit::Activate(index))
-                };
-            }
-            x = end;
-        }
-        None
+        self.display.hit(display_area, point)
     }
 
     fn inspect_card(&mut self, index: usize) {
@@ -1146,15 +693,17 @@ impl AppState {
             .clone()
             .map(|label| format!("record {label}"))
             .unwrap_or_else(|| "record".to_string());
-        self.open_preview_display(format!("card:{index}"), title, format_card_preview(&card));
+        self.open_preview_display(
+            format!("card:{index}"),
+            title,
+            record_format::format_card_preview(&card),
+        );
     }
 
     fn open_job_picker(&mut self) {
         self.close_target_settings();
         let items = self.job_picker_items();
-        self.job_picker = Some(JobPickerState {
-            selected: items.len().checked_sub(1),
-        });
+        self.job_picker = Some(JobPickerState::open(items.len()));
     }
 
     fn open_target_settings(&mut self) {
@@ -1211,24 +760,12 @@ impl AppState {
     }
 
     fn target_settings_popup_rect(&self) -> Rect {
-        centered_rect(
-            Rect::new(0, 0, self.terminal_width, self.terminal_height),
-            82,
-            78,
-        )
+        target_settings_popup_rect(Rect::new(0, 0, self.terminal_width, self.terminal_height))
     }
 
     fn target_settings_content_rect(&self) -> Option<Rect> {
-        if !self.target_settings_open() {
-            return None;
-        }
-        let popup = self.target_settings_popup_rect();
-        Some(Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(2),
-        ))
+        self.target_settings_open()
+            .then(|| target_settings_content_rect(self.target_settings_popup_rect()))
     }
 
     fn move_target_selection(&mut self, delta: isize) {
@@ -1263,45 +800,31 @@ impl AppState {
 
     fn target_settings_profile_hit(&self, point: Rect) -> Option<usize> {
         let content_area = self.target_settings_content_rect()?;
-        if !contains(content_area, point) {
-            return None;
-        }
-        let relative_y = point.y.saturating_sub(content_area.y) as usize;
         let view = self.render_target_settings_view()?;
-        view.profile_line_rows
-            .iter()
-            .position(|line| *line == relative_y)
+        target_settings_profile_hit(&view, content_area, point)
     }
 
     fn save_selected_target_profile(&mut self) {
-        let Some((snapshot, selected_profile)) = self.target_settings.as_ref().and_then(|state| {
-            state
-                .selected_profile()
-                .map(|profile| (state.snapshot.clone(), profile.clone()))
-        }) else {
+        let Some(action) = self
+            .target_settings
+            .as_ref()
+            .and_then(TargetSettingsState::selected_profile_save_action)
+        else {
             return;
         };
-        let profile_name = selected_profile.name.clone();
 
-        if !target_profile_can_be_saved(&selected_profile) {
-            if let Some(state) = self.target_settings.as_mut() {
-                state.notice = Some(format!(
-                    "`{profile_name}` is not a usable target profile; fix the config and reload"
-                ));
-                state.pending_reconnect_profile = None;
+        let (snapshot, profile_name) = match action {
+            TargetProfileSaveAction::Save {
+                snapshot,
+                profile_name,
+            } => (snapshot, profile_name),
+            TargetProfileSaveAction::Notice(notice) => {
+                if let Some(state) = self.target_settings.as_mut() {
+                    state.set_notice_without_pending_reconnect(notice);
+                }
+                return;
             }
-            return;
-        }
-
-        if snapshot.default_profile == profile_name {
-            if let Some(state) = self.target_settings.as_mut() {
-                state.notice = Some(format!(
-                    "`{profile_name}` is already the default target for the next launch"
-                ));
-                state.pending_reconnect_profile = None;
-            }
-            return;
-        }
+        };
 
         match save_default_profile(&profile_name, &snapshot) {
             Ok(snapshot) => {
@@ -1314,17 +837,16 @@ impl AppState {
                     self.session_profile_name.as_deref(),
                     can_live_reconnect,
                 );
-                let mut next_state = TargetSettingsState::with_notice(snapshot, feedback.notice);
-                if feedback.pending_reconnect {
-                    next_state.pending_reconnect_profile = Some(profile_name.clone());
-                }
-                self.target_settings = Some(next_state);
+                self.target_settings = Some(TargetSettingsState::with_save_feedback(
+                    snapshot,
+                    &profile_name,
+                    feedback,
+                ));
                 self.target_settings_error = None;
             }
             Err(error) => {
                 if let Some(state) = self.target_settings.as_mut() {
-                    state.notice = Some(format!("save failed: {error}"));
-                    state.pending_reconnect_profile = None;
+                    state.set_notice_without_pending_reconnect(format!("save failed: {error}"));
                 }
             }
         }
@@ -1336,7 +858,7 @@ impl AppState {
         let profile_name = self
             .target_settings
             .as_ref()
-            .and_then(|s| s.pending_reconnect_profile.clone());
+            .and_then(|state| state.pending_reconnect_profile_name().map(str::to_owned));
         let Some(profile_name) = profile_name else {
             return;
         };
@@ -1345,8 +867,8 @@ impl AppState {
             Ok(c) => c,
             Err(error) => {
                 if let Some(state) = self.target_settings.as_mut() {
-                    state.notice = Some(format!("reconnect failed: {error}"));
-                    state.pending_reconnect_profile = None;
+                    state
+                        .set_notice_without_pending_reconnect(format!("reconnect failed: {error}"));
                 }
                 return;
             }
@@ -1355,15 +877,17 @@ impl AppState {
         if let Some(ref controller) = self.connection_controller {
             if controller.switch_target(connector).is_err() {
                 if let Some(state) = self.target_settings.as_mut() {
-                    state.notice = Some("reconnect command could not be sent; try again".into());
-                    state.pending_reconnect_profile = None;
+                    state.set_notice_without_pending_reconnect(
+                        "reconnect command could not be sent; try again",
+                    );
                 }
                 return;
             }
             self.pending_reconnect_profile_name = Some(profile_name.clone());
             if let Some(state) = self.target_settings.as_mut() {
-                state.notice = Some(format!("reconnecting to `{profile_name}`…"));
-                state.pending_reconnect_profile = None;
+                state.set_notice_without_pending_reconnect(format!(
+                    "reconnecting to `{profile_name}`…"
+                ));
             }
         }
     }
@@ -1406,26 +930,18 @@ impl AppState {
 
     fn move_job_picker(&mut self, delta: isize) {
         let items_len = self.job_picker_items().len();
-        let Some(picker) = self.job_picker.as_mut() else {
-            return;
-        };
-        if items_len == 0 {
-            picker.selected = None;
-            return;
+        if let Some(picker) = self.job_picker.as_mut() {
+            picker.move_selection(delta, items_len);
         }
-
-        let current = picker.selected.unwrap_or(items_len - 1) as isize;
-        let next = (current + delta).clamp(0, items_len.saturating_sub(1) as isize);
-        picker.selected = Some(next as usize);
     }
 
     fn kill_selected_job_from_picker(&mut self) {
-        let Some(selected) = self.job_picker.as_ref().and_then(|picker| picker.selected) else {
+        let Some(selected) = self.job_picker.as_ref().and_then(JobPickerState::selected) else {
             self.close_job_picker();
             return;
         };
         let items = self.job_picker_items();
-        let Some((target_id, _, _)) = items.get(selected).cloned() else {
+        let Some(target_id) = items.get(selected).map(|item| item.id.clone()) else {
             self.close_job_picker();
             return;
         };
@@ -1588,7 +1104,7 @@ impl AppState {
         let Some(target) = self.copy_target() else {
             return;
         };
-        if let Err(error) = copy_to_clipboard(&target.content) {
+        if let Err(error) = clipboard::copy_to_clipboard(&target.content) {
             tracing::warn!(%error, target = %target.label, "failed to copy content");
         }
     }
@@ -1694,17 +1210,10 @@ impl AppState {
     fn refresh_job_card(&mut self, card_index: usize, job: &JobRow) {
         self.main_view.set_card_output(
             card_index,
-            format_job_record(
-                &job.id,
-                &job.status,
-                job.start_scope.as_deref(),
-                job.end_scope.as_deref(),
-                &job.warnings,
-                job.pending_reason.as_deref(),
-            ),
+            record_format::format_job_record(job_record(job)),
         );
         self.main_view
-            .set_card_status(card_index, card_status_for_job(&job.status));
+            .set_card_status(card_index, status_view::job_card_status(&job.status));
     }
 
     fn upsert_cron(&mut self, id: String, label: String, status: CronStatus) {
@@ -1791,12 +1300,17 @@ impl AppState {
 
         self.main_view.set_card_output(
             card_index,
-            format_cron_trigger_record(&cron_id, &cron_label, cron_status, job.as_ref()),
+            record_format::format_cron_trigger_record(
+                &cron_id,
+                &cron_label,
+                cron_status,
+                job.as_ref().map(job_record),
+            ),
         );
         self.main_view.set_card_status(
             card_index,
             job.as_ref()
-                .map(|job| card_status_for_job(&job.status))
+                .map(|job| status_view::job_card_status(&job.status))
                 .unwrap_or(CardStatus::Pending),
         );
     }
@@ -1828,33 +1342,26 @@ impl AppState {
         self.open_preview_display(
             format!("cron:{}", cron.id),
             format!("cron {}", cron.id),
-            format_cron_preview(&cron),
+            record_format::format_cron_preview(&cron.id, &cron.label, cron.status),
         );
-    }
-
-    /// Convert a sidebar display row (newest-first) to the underlying vec index (oldest-first).
-    fn sidebar_row_to_index(&self, row: usize, len: usize) -> Option<usize> {
-        len.checked_sub(1)?.checked_sub(row)
     }
 
     fn activate_sidebar_row(&mut self, row: usize) {
         match self.mode {
             Mode::Job => {
-                let Some(idx) = self.sidebar_row_to_index(row, self.jobs.len()) else {
+                let Some(idx) = sidebar_action::display_row_to_index(row, self.jobs.len()) else {
                     return;
                 };
                 let Some(job) = self.jobs.get(idx) else {
                     return;
                 };
-                let command = if matches!(job.status, JobStatus::Running) {
-                    format!(":fg {}", job.id)
-                } else {
-                    format!(":tail {}", job.id)
-                };
-                self.update(AppMsg::Submit(command));
+                self.update(AppMsg::Submit(sidebar_action::job_open_command(
+                    &job.id,
+                    &job.status,
+                )));
             }
             Mode::Cron => {
-                if let Some(idx) = self.sidebar_row_to_index(row, self.crons.len()) {
+                if let Some(idx) = sidebar_action::display_row_to_index(row, self.crons.len()) {
                     self.open_cron_row(idx);
                 }
             }
@@ -1865,14 +1372,14 @@ impl AppState {
         let row = self.sidebar.selected?;
         match self.mode {
             Mode::Job => {
-                let idx = self.sidebar_row_to_index(row, self.jobs.len())?;
+                let idx = sidebar_action::display_row_to_index(row, self.jobs.len())?;
                 let job = self.jobs.get(idx)?;
-                matches!(job.status, JobStatus::Running).then(|| format!(":kill {}", job.id))
+                sidebar_action::running_job_kill_command(&job.id, &job.status)
             }
             Mode::Cron => {
-                let idx = self.sidebar_row_to_index(row, self.crons.len())?;
+                let idx = sidebar_action::display_row_to_index(row, self.crons.len())?;
                 let cron = self.crons.get(idx)?;
-                Some(format!(":kill {}", cron.id))
+                Some(sidebar_action::cron_kill_command(&cron.id))
             }
         }
     }
@@ -1886,23 +1393,9 @@ impl AppState {
                 return;
             }
         };
-        if candidates.is_empty() {
-            return;
-        }
-
         let word = self.input.content[range.clone()].to_string();
-        let replacement = if candidates.len() == 1 {
-            if candidates[0].ends_with('/') {
-                candidates[0].clone()
-            } else {
-                format!("{} ", candidates[0])
-            }
-        } else {
-            let shared = shared_prefix(&candidates);
-            if shared.len() <= word.len() {
-                return;
-            }
-            shared
+        let Some(replacement) = completion::completion_replacement(&candidates, &word) else {
+            return;
         };
         self.input.replace_range(range, &replacement);
     }
@@ -1918,58 +1411,24 @@ impl AppState {
     }
 
     fn completion_candidates(&self) -> anyhow::Result<Vec<String>> {
-        let content = &self.input.content;
-        let cursor = self.input.cursor.min(content.len());
-        let line_start = content[..cursor].rfind('\n').map_or(0, |idx| idx + 1);
-        let line_prefix = &content[line_start..cursor];
-        let trimmed = line_prefix.trim_start();
-        let range = self.input.current_word_range();
-        let word = &content[range];
-        if !trimmed.starts_with(':') {
-            return bare_completion_candidates(self.mode, line_prefix, word);
-        }
-
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.is_empty() {
-            return Ok(builtin_command_candidates(word));
-        }
-
-        if word.starts_with(':') && tokens.len() <= 1 {
-            return Ok(builtin_command_candidates(word));
-        }
-
-        let command = tokens[0];
-        let ids = match command {
-            ":out" | ":err" | ":tail" | ":retry" => self
-                .jobs
-                .iter()
-                .map(|job| job.id.clone())
-                .collect::<Vec<_>>(),
-            ":fg" | ":wait" => self
-                .jobs
-                .iter()
-                .map(|job| job.id.clone())
-                .collect::<Vec<_>>(),
-            ":send" => self
-                .jobs
-                .iter()
-                .map(|job| job.id.clone())
-                .collect::<Vec<_>>(),
-            ":kill" | ":cancel" | ":pause" | ":resume" | ":log" => {
-                let mut ids = self
-                    .jobs
-                    .iter()
-                    .map(|job| job.id.clone())
-                    .collect::<Vec<_>>();
-                ids.extend(self.crons.iter().map(|cron| cron.id.clone()));
-                ids
-            }
-            _ => Vec::new(),
-        };
-        Ok(ids
-            .into_iter()
-            .filter(|candidate| candidate.starts_with(word))
-            .collect())
+        let job_ids = self
+            .jobs
+            .iter()
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>();
+        let cron_ids = self
+            .crons
+            .iter()
+            .map(|cron| cron.id.clone())
+            .collect::<Vec<_>>();
+        completion::completion_candidates(CompletionScope {
+            mode: self.mode,
+            content: &self.input.content,
+            cursor: self.input.cursor,
+            word_range: self.input.current_word_range(),
+            job_ids: &job_ids,
+            cron_ids: &cron_ids,
+        })
     }
 
     /// TEA update: apply a message to the state.
@@ -2048,7 +1507,7 @@ impl AppState {
 
             AppMsg::Paste(text) => {
                 if self.fg_active() {
-                    self.send_fg_input(fg_paste_bytes(&text, self.fg_bracketed_paste()));
+                    self.send_fg_input(foreground::paste_bytes(&text, self.fg_bracketed_paste()));
                     return;
                 }
                 if self.job_picker_open() {
@@ -2059,7 +1518,7 @@ impl AppState {
             }
 
             AppMsg::Submit(text) => {
-                if let Some(local) = parse_local_command(&text) {
+                if let Some(local) = submission::parse_local_command(&text) {
                     self.input.update(InputMsg::Clear);
                     match local {
                         LocalCommand::Clear => self.update(AppMsg::ClearDisplay),
@@ -2069,8 +1528,8 @@ impl AppState {
                     return;
                 }
 
-                let warnings = operator_spacing_warnings(&text);
-                let card_index = submission_precreates_card(&text, self.mode, &warnings)
+                let warnings = submission::operator_spacing_warnings(&text);
+                let card_index = submission::precreates_card(&text, self.mode, &warnings)
                     .then(|| self.main_view.push_card(text.clone(), self.mode));
                 let pending =
                     PendingSubmission::user(card_index, text.clone(), self.mode, warnings);
@@ -2134,7 +1593,7 @@ impl AppState {
                 self.pending_script_finishes.clear();
                 self.status_bar.update(StatusBarMsg::Connected(false));
                 if let Some(state) = self.target_settings.as_mut() {
-                    state.notice = Some(match self.pending_reconnect_profile_name.as_deref() {
+                    state.set_notice(match self.pending_reconnect_profile_name.as_deref() {
                         Some(profile) => {
                             format!("reconnect to `{profile}` failed: {message}; retrying")
                         }
@@ -2157,7 +1616,7 @@ impl AppState {
                 if let Some(profile) = self.pending_reconnect_profile_name.take() {
                     self.session_profile_name = Some(profile.clone());
                     if let Some(state) = self.target_settings.as_mut() {
-                        state.notice = Some(format!("connected to `{profile}`"));
+                        state.set_notice(format!("connected to `{profile}`"));
                     }
                 }
             }
@@ -2174,7 +1633,7 @@ impl AppState {
                                 if pending.is_user_visible() {
                                     self.show_submission_result(
                                         pending,
-                                        format_ack_message(&pending.input),
+                                        submission::format_ack_message(&pending.input),
                                         CardStatus::Success,
                                         None,
                                     );
@@ -2197,7 +1656,7 @@ impl AppState {
                                     } => {
                                         self.upsert_job(
                                             job_id.clone(),
-                                            summarize_script_source(&item.source),
+                                            script_summary::summarize_source(&item.source),
                                             JobStatus::Running,
                                             start_scope.clone(),
                                             *open_hint,
@@ -2212,7 +1671,7 @@ impl AppState {
                                             {
                                                 self.upsert_job(
                                                     job_id.clone(),
-                                                    summarize_script_source(&job.pipeline),
+                                                    script_summary::summarize_source(&job.pipeline),
                                                     job.status.clone(),
                                                     job.start_scope.clone(),
                                                     *open_hint,
@@ -2225,7 +1684,7 @@ impl AppState {
                                     ScriptItemResult::Cron { cron_id } => {
                                         self.upsert_cron(
                                             cron_id.clone(),
-                                            summarize_script_source(&item.source),
+                                            script_summary::summarize_source(&item.source),
                                             CronStatus::Scheduled,
                                         );
                                         sidebar_dirty = true;
@@ -2241,7 +1700,7 @@ impl AppState {
                             {
                                 let card_index = self.show_submission_result(
                                     pending,
-                                    format_script_submission(
+                                    script_summary::format_submission(
                                         &source,
                                         &items,
                                         submit_error.as_ref(),
@@ -2275,7 +1734,7 @@ impl AppState {
                         } => {
                             let label = pending
                                 .as_ref()
-                                .map(|pending| normalize_command_label(&pending.input))
+                                .map(|pending| submission::normalize_command_label(&pending.input))
                                 .unwrap_or_else(|| job_id.clone());
                             self.upsert_job(
                                 job_id.clone(),
@@ -2312,14 +1771,14 @@ impl AppState {
                             if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
                             {
-                                let body = decorate_submission_output(
+                                let body = submission::decorate_output(
                                     &warnings,
                                     format!("{}: {}", chain_id, job_ids.join(", ")),
                                 );
                                 let card_index = self.show_submission_result(
                                     pending,
                                     body,
-                                    card_status_for_chain(&chain),
+                                    status_view::chain_card_status(&chain),
                                     Some(chain_id.clone()),
                                 );
                                 // Register chain → card mapping and annotate the card.
@@ -2352,7 +1811,7 @@ impl AppState {
                         OkPayload::CronAdded { cron_id } => {
                             let label = pending
                                 .as_ref()
-                                .map(|pending| normalize_command_label(&pending.input))
+                                .map(|pending| submission::normalize_command_label(&pending.input))
                                 .unwrap_or_else(|| cron_id.clone());
                             self.upsert_cron(cron_id.clone(), label, CronStatus::Scheduled);
                             self.sync_sidebar_items();
@@ -2380,7 +1839,7 @@ impl AppState {
                             }
                         }
                         OkPayload::JobList(list) => {
-                            let body = format_job_list_snapshot(&list);
+                            let body = record_format::format_job_list_snapshot(&list);
                             self.replace_jobs(list);
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
@@ -2432,15 +1891,20 @@ impl AppState {
                             if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
                             {
-                                let request =
-                                    display_request_from_submission(&pending.input, pending.mode)
-                                        .unwrap_or(DisplayRequest {
-                                            stream: DisplayStream::Stdout,
-                                            follow: false,
-                                        });
+                                let request = submission::display_request_from_submission(
+                                    &pending.input,
+                                    pending.mode,
+                                )
+                                .unwrap_or(
+                                    submission::DisplayRequest {
+                                        stream: Stream::Stdout,
+                                        follow: false,
+                                    },
+                                );
+                                let display_stream = display_stream_from_ipc(request.stream);
                                 self.show_output_display(
                                     id.clone(),
-                                    request.stream,
+                                    display_stream,
                                     data,
                                     truncated,
                                     request.follow,
@@ -2454,7 +1918,7 @@ impl AppState {
                                         } else {
                                             "opened"
                                         },
-                                        request.stream.label()
+                                        display_stream.label()
                                     ),
                                     CardStatus::Success,
                                     None,
@@ -2558,7 +2022,7 @@ impl AppState {
                 EventPayload::ChainProgress { chain } => {
                     if let Some(&card_index) = self.chain_cards.get(&chain.id) {
                         self.main_view
-                            .set_card_status(card_index, card_status_for_chain(&chain));
+                            .set_card_status(card_index, status_view::chain_card_status(&chain));
                         let running_step = chain
                             .jobs
                             .iter()
@@ -2631,7 +2095,7 @@ impl AppState {
                         self.copy_focus();
                         return;
                     }
-                    if let Some(bytes) = fg_key_bytes(key, self.fg_application_cursor()) {
+                    if let Some(bytes) = foreground::key_bytes(key, self.fg_application_cursor()) {
                         self.send_fg_input(bytes);
                     }
                     return;
@@ -2740,9 +2204,10 @@ impl AppState {
                         // Live reconnect: [R] when a pending reconnect profile exists.
                         KeyCode::Char('r') | KeyCode::Char('R')
                             if !key.modifiers.contains(KeyModifiers::CONTROL)
-                                && self.target_settings.as_ref().is_some_and(|settings| {
-                                    settings.pending_reconnect_profile.is_some()
-                                }) =>
+                                && self
+                                    .target_settings
+                                    .as_ref()
+                                    .is_some_and(TargetSettingsState::has_pending_reconnect) =>
                         {
                             self.trigger_reconnect_now();
                             return;
@@ -2779,25 +2244,20 @@ impl AppState {
 
                 if self.job_picker_open() {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        let popup = centered_rect(
-                            Rect::new(0, 0, self.terminal_width, self.terminal_height),
-                            70,
-                            60,
-                        );
+                        let popup = job_picker_popup_rect(Rect::new(
+                            0,
+                            0,
+                            self.terminal_width,
+                            self.terminal_height,
+                        ));
                         if !contains(popup, point) {
                             self.close_job_picker();
                             return;
                         }
-                        let inner = Rect::new(
-                            popup.x + 1,
-                            popup.y + 1,
-                            popup.width.saturating_sub(2),
-                            popup.height.saturating_sub(2),
-                        );
-                        let row = point.y.saturating_sub(inner.y) as usize;
+                        let row = point.y.saturating_sub(job_picker_content_rect(popup).y) as usize;
                         if row < self.job_picker_items().len() {
                             if let Some(picker) = self.job_picker.as_mut() {
-                                picker.selected = Some(row);
+                                picker.select(row);
                             }
                             self.kill_selected_job_from_picker();
                         }
@@ -2817,7 +2277,7 @@ impl AppState {
                             let already_selected = self
                                 .target_settings
                                 .as_ref()
-                                .is_some_and(|state| state.selected == index);
+                                .is_some_and(|state| state.selected_index() == index);
                             if already_selected {
                                 self.save_selected_target_profile();
                             } else {
@@ -2925,587 +2385,47 @@ impl Default for AppState {
     }
 }
 
-fn normalize_command_label(input: &str) -> String {
-    let trimmed = input.trim();
-    for prefix in [":run", ":cron"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let rest = rest.trim();
-            if !rest.is_empty() {
-                return rest.to_string();
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
-fn output_channel_for_job_id(id: &str) -> Option<EventChannel> {
-    match id.parse::<JobId>() {
-        Ok(job_id) => Some(EventChannel::Output(job_id)),
-        Err(error) => {
-            tracing::warn!(job_id = %id, "invalid output subscription target: {error}");
-            None
-        }
+fn job_record(job: &JobRow) -> JobRecord<'_> {
+    JobRecord {
+        id: &job.id,
+        status: &job.status,
+        start_scope: job.start_scope.as_deref(),
+        end_scope: job.end_scope.as_deref(),
+        warnings: &job.warnings,
+        pending_reason: job.pending_reason.as_deref(),
     }
 }
 
-fn summarize_script_source(source: &str) -> String {
-    let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_display_text(&compact, 96)
-}
-
-fn truncate_display_text(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
+fn job_sidebar_record(job: &JobRow) -> JobSidebarRecord<'_> {
+    JobSidebarRecord {
+        id: &job.id,
+        label: &job.label,
+        status: &job.status,
     }
 }
 
-fn format_script_submission(
-    source: &ScriptSource,
-    items: &[ScriptItemInfo],
-    submit_error: Option<&ScriptSubmitError>,
-) -> String {
-    let mut lines = vec![format!("submitted {} item(s)", items.len())];
-    if let ScriptSource::File { path } = source {
-        lines.push(format!("source: {path}"));
-    }
-    for item in items {
-        lines.push(format!(
-            "{}. {} -> {}",
-            item.index + 1,
-            summarize_script_source(&item.source),
-            format_script_item_result(&item.result),
-        ));
-    }
-    if let Some(error) = submit_error {
-        lines.push(String::new());
-        lines.push(format!(
-            "submit stopped at {}. {} [{}]: {}",
-            error.index + 1,
-            summarize_script_source(&error.source),
-            error.code,
-            error.message,
-        ));
-    }
-    lines.join("\n")
-}
-
-fn format_script_finished(
-    status: ScriptRunStatus,
-    exit_code: i32,
-    failed_item_index: Option<usize>,
-) -> String {
-    let mut text = format!("\nscript finished: {status:?}, exit={exit_code}");
-    if let Some(index) = failed_item_index {
-        text.push_str(&format!(" (failed at item {})", index + 1));
-    }
-    text
-}
-
-fn format_script_item_result(result: &ScriptItemResult) -> String {
-    match result {
-        ScriptItemResult::Job { job_id, .. } => job_id.clone(),
-        ScriptItemResult::Chain {
-            chain_id, job_ids, ..
-        } => {
-            if job_ids.is_empty() {
-                chain_id.clone()
-            } else {
-                format!("{chain_id} [{}]", job_ids.join(", "))
-            }
-        }
-        ScriptItemResult::Cron { cron_id } => cron_id.clone(),
-        ScriptItemResult::Message { text } => summarize_script_source(text),
+fn cron_sidebar_record(cron: &CronRow) -> CronSidebarRecord<'_> {
+    CronSidebarRecord {
+        id: &cron.id,
+        label: &cron.label,
+        status: cron.status,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalCommand {
-    Clear,
-    Quit,
-    Restart,
-}
-
-fn parse_local_command(input: &str) -> Option<LocalCommand> {
-    let trimmed = input.trim();
-    match trimmed {
-        ":clear" => Some(LocalCommand::Clear),
-        ":quit" | ":exit" => Some(LocalCommand::Quit),
-        ":restart" => Some(LocalCommand::Restart),
-        _ => None,
+fn job_picker_record(job: &JobRow) -> JobPickerRecord<'_> {
+    JobPickerRecord {
+        id: &job.id,
+        label: &job.label,
+        status: &job.status,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisplayRequest {
-    stream: DisplayStream,
-    follow: bool,
-}
-
-fn display_request_from_submission(input: &str, mode: Mode) -> Option<DisplayRequest> {
-    let trimmed = input.trim();
-    let command = if mode == Mode::Job && !trimmed.starts_with(':') {
-        return None;
-    } else {
-        trimmed.strip_prefix(':')?.split_whitespace().next()?
-    };
-
-    match command {
-        "out" => Some(DisplayRequest {
-            stream: DisplayStream::Stdout,
-            follow: false,
-        }),
-        "tail" => Some(DisplayRequest {
-            stream: DisplayStream::Stdout,
-            follow: true,
-        }),
-        "err" => Some(DisplayRequest {
-            stream: DisplayStream::Stderr,
-            follow: false,
-        }),
-        _ => None,
+fn cron_picker_record(cron: &CronRow) -> CronPickerRecord<'_> {
+    CronPickerRecord {
+        id: &cron.id,
+        label: &cron.label,
+        status: cron.status,
     }
-}
-
-fn decorate_submission_output(warnings: &[String], body: String) -> String {
-    if warnings.is_empty() {
-        return body;
-    }
-    if body.is_empty() {
-        return warnings.join("\n");
-    }
-    format!("{}\n\n{}", warnings.join("\n"), body)
-}
-
-fn operator_spacing_warnings(input: &str) -> Vec<String> {
-    const OPERATORS: [&str; 4] = ["|||", "|?|", "->", "~>"];
-
-    let mut warnings = Vec::new();
-    let mut pos = 0;
-    let mut in_quotes = false;
-
-    while pos < input.len() {
-        let rest = &input[pos..];
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-
-        if ch == '\\' && in_quotes {
-            pos += ch.len_utf8();
-            if let Some(next) = input[pos..].chars().next() {
-                pos += next.len_utf8();
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            pos += ch.len_utf8();
-            continue;
-        }
-
-        if !in_quotes && let Some(op) = OPERATORS.iter().find(|op| rest.starts_with(**op)) {
-            let before_ok = input[..pos]
-                .chars()
-                .next_back()
-                .is_none_or(char::is_whitespace);
-            let after_pos = pos + op.len();
-            let after_ok = input[after_pos..]
-                .chars()
-                .next()
-                .is_none_or(char::is_whitespace);
-            if !before_ok || !after_ok {
-                warnings.push(format!(
-                    "Warning: missing spaces around `{}`; did you mean `{}`?",
-                    op,
-                    spaced_operator_suggestion(input, pos, op),
-                ));
-            }
-            pos = after_pos;
-            continue;
-        }
-
-        pos += ch.len_utf8();
-    }
-
-    warnings
-}
-
-fn spaced_operator_suggestion(input: &str, pos: usize, op: &str) -> String {
-    let before = input[..pos].trim_end_matches([' ', '\t']);
-    let after = input[pos + op.len()..].trim_start_matches([' ', '\t']);
-    format!("{before} {op} {after}")
-}
-
-fn submission_precreates_card(input: &str, mode: Mode, warnings: &[String]) -> bool {
-    let _ = (input, mode, warnings);
-    false
-}
-
-fn is_mode_switch_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::BackTab)
-        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
-}
-
-fn fg_key_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
-    match key.code {
-        KeyCode::Char(ch) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                if ch.is_ascii_alphabetic() {
-                    Some(vec![(ch.to_ascii_lowercase() as u8) & 0x1f])
-                } else {
-                    None
-                }
-            } else {
-                Some(ch.to_string().into_bytes())
-            }
-        }
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Left => Some(if application_cursor {
-            b"\x1bOD".to_vec()
-        } else {
-            b"\x1b[D".to_vec()
-        }),
-        KeyCode::Right => Some(if application_cursor {
-            b"\x1bOC".to_vec()
-        } else {
-            b"\x1b[C".to_vec()
-        }),
-        KeyCode::Up => Some(if application_cursor {
-            b"\x1bOA".to_vec()
-        } else {
-            b"\x1b[A".to_vec()
-        }),
-        KeyCode::Down => Some(if application_cursor {
-            b"\x1bOB".to_vec()
-        } else {
-            b"\x1b[B".to_vec()
-        }),
-        KeyCode::Home => Some(if application_cursor {
-            b"\x1bOH".to_vec()
-        } else {
-            b"\x1b[H".to_vec()
-        }),
-        KeyCode::End => Some(if application_cursor {
-            b"\x1bOF".to_vec()
-        } else {
-            b"\x1b[F".to_vec()
-        }),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        _ => None,
-    }
-}
-
-fn fg_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    if bracketed {
-        let mut wrapped = b"\x1b[200~".to_vec();
-        wrapped.extend_from_slice(text.as_bytes());
-        wrapped.extend_from_slice(b"\x1b[201~");
-        wrapped
-    } else {
-        text.as_bytes().to_vec()
-    }
-}
-
-pub(crate) fn contains(area: Rect, point: Rect) -> bool {
-    point.x >= area.x
-        && point.x < area.x + area.width
-        && point.y >= area.y
-        && point.y < area.y + area.height
-}
-
-fn inner_rect(area: Rect) -> Rect {
-    Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    )
-}
-
-fn centered_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - height_pct) / 2),
-        Constraint::Percentage(height_pct),
-        Constraint::Percentage((100 - height_pct) / 2),
-    ])
-    .split(area);
-    let horizontal = Layout::horizontal([
-        Constraint::Percentage((100 - width_pct) / 2),
-        Constraint::Percentage(width_pct),
-        Constraint::Percentage((100 - width_pct) / 2),
-    ])
-    .split(vertical[1]);
-    horizontal[1]
-}
-
-fn format_ack_message(input: &str) -> String {
-    let trimmed = input.trim();
-    for (prefix, verb) in [
-        (":kill", "kill requested for"),
-        (":cancel", "cancel requested for"),
-        (":pause", "paused"),
-        (":resume", "resumed"),
-        (":send", "sent"),
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let rest = rest.trim();
-            if !rest.is_empty() {
-                return format!("{verb} {rest}");
-            }
-        }
-    }
-    "ok".to_string()
-}
-
-fn format_card_preview(card: &Card) -> String {
-    let mode = match card.mode {
-        Mode::Job => "JOB",
-        Mode::Cron => "CRON",
-    };
-    let status = match card.status {
-        CardStatus::Success => "success",
-        CardStatus::Error => "error",
-        CardStatus::Pending => "pending",
-        CardStatus::Streaming => "streaming",
-    };
-    let mut lines = vec![
-        format!("mode: {mode}"),
-        format!("input: {}", card.input),
-        format!("status: {status}"),
-    ];
-    if let Some(label) = &card.label {
-        lines.push(format!("label: {label}"));
-    }
-    if !card.output.is_empty() {
-        lines.push(String::new());
-        lines.push(card.output.clone());
-    }
-    lines.join("\n")
-}
-
-fn format_cron_preview(cron: &CronRow) -> String {
-    format!(
-        "id: {}\nstatus: {}\n{}",
-        cron.id,
-        format_cron_status(cron.status),
-        cron.label
-    )
-}
-
-fn format_cron_trigger_record(
-    cron_id: &str,
-    cron_label: &str,
-    cron_status: CronStatus,
-    job: Option<&JobRow>,
-) -> String {
-    let mut lines = vec![
-        format!("cron: {cron_id}"),
-        format!("cron status: {}", format_cron_status(cron_status)),
-        format!("definition: {cron_label}"),
-    ];
-
-    match job {
-        Some(job) => {
-            lines.push(String::new());
-            lines.push(format_job_record(
-                &job.id,
-                &job.status,
-                job.start_scope.as_deref(),
-                job.end_scope.as_deref(),
-                &job.warnings,
-                job.pending_reason.as_deref(),
-            ));
-        }
-        None => {
-            lines.push(String::new());
-            lines.push("job: awaiting snapshot".to_string());
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn format_job_list_snapshot(jobs: &[JobInfo]) -> String {
-    if jobs.is_empty() {
-        return "no jobs".into();
-    }
-    jobs.iter()
-        .map(|job| {
-            let mut lines = vec![format!(
-                "{} [{}] {}",
-                job.id,
-                format_job_status(&job.status),
-                job.pipeline
-            )];
-            if let Some(reason) = &job.pending_reason {
-                lines.push(format!("  pending reason: {reason}"));
-            }
-            lines.join("\n")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn format_job_record(
-    job_id: &str,
-    status: &JobStatus,
-    start_scope: Option<&str>,
-    end_scope: Option<&str>,
-    warnings: &[String],
-    pending_reason: Option<&str>,
-) -> String {
-    let mut lines = Vec::new();
-    lines.extend(warnings.iter().cloned());
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines.push(job_id.to_string());
-    lines.push(format!("status: {}", format_job_status(status)));
-    if let Some(reason) = pending_reason {
-        lines.push(format!("pending reason: {reason}"));
-    }
-    if let Some(start_scope) = start_scope {
-        lines.push(format!("start scope: {start_scope}"));
-    }
-    if status.is_terminal()
-        && let Some(end_scope) = end_scope
-    {
-        if start_scope == Some(end_scope) {
-            lines.push(format!("end scope: no side effect ({end_scope})"));
-        } else {
-            lines.push(format!("end scope: {end_scope}"));
-        }
-    }
-    lines.join("\n")
-}
-
-fn format_job_status(status: &JobStatus) -> String {
-    match status {
-        JobStatus::Pending => "pending".to_string(),
-        JobStatus::Running => "running".to_string(),
-        JobStatus::Done => "done".to_string(),
-        JobStatus::Failed => "failed".to_string(),
-        JobStatus::Killed => "killed".to_string(),
-        JobStatus::Cancelled(reason) => format!("cancelled({reason:?})").to_lowercase(),
-    }
-}
-
-fn card_status_for_job(status: &JobStatus) -> CardStatus {
-    match status {
-        JobStatus::Pending => CardStatus::Pending,
-        JobStatus::Running => CardStatus::Streaming,
-        JobStatus::Done => CardStatus::Success,
-        JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_) => CardStatus::Error,
-    }
-}
-
-fn card_status_for_chain(chain: &ChainInfo) -> CardStatus {
-    if chain.jobs.iter().any(|job| {
-        matches!(
-            job.status,
-            JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_)
-        )
-    }) {
-        return CardStatus::Error;
-    }
-    if chain
-        .jobs
-        .iter()
-        .any(|job| job.status == JobStatus::Running)
-    {
-        return CardStatus::Streaming;
-    }
-    if chain.total_jobs > 0
-        && chain.jobs.len() == chain.total_jobs
-        && chain.jobs.iter().all(|job| job.status == JobStatus::Done)
-    {
-        return CardStatus::Success;
-    }
-    CardStatus::Pending
-}
-
-fn shared_prefix(items: &[String]) -> String {
-    let Some(first) = items.first() else {
-        return String::new();
-    };
-    let mut prefix = first.clone();
-    for item in &items[1..] {
-        let shared_len = prefix
-            .chars()
-            .zip(item.chars())
-            .take_while(|(a, b)| a == b)
-            .map(|(ch, _)| ch.len_utf8())
-            .sum();
-        prefix.truncate(shared_len);
-        if prefix.is_empty() {
-            break;
-        }
-    }
-    prefix
-}
-
-fn job_sidebar_item(job: &JobRow) -> SidebarItem {
-    SidebarItem {
-        id: job.id.clone(),
-        label: job.label.clone(),
-        status_icon: job_status_icon(&job.status),
-    }
-}
-
-fn job_status_icon(status: &JobStatus) -> &'static str {
-    match status {
-        JobStatus::Pending => "⏳",
-        JobStatus::Running => "🔄",
-        JobStatus::Done => "✅",
-        JobStatus::Failed => "❌",
-        JobStatus::Killed => "🛑",
-        JobStatus::Cancelled(_) => "⏹",
-    }
-}
-
-fn cron_status_icon(status: CronStatus) -> &'static str {
-    match status {
-        CronStatus::Scheduled => "⏰",
-        CronStatus::Paused => "⏸",
-        CronStatus::Completed => "✅",
-        CronStatus::Expired => "⌛",
-        CronStatus::Failed => "✖",
-    }
-}
-
-fn cron_sidebar_item(cron: &CronRow) -> SidebarItem {
-    SidebarItem {
-        id: cron.id.clone(),
-        label: cron.label.clone(),
-        status_icon: cron_status_icon(cron.status),
-    }
-}
-
-fn format_cron_status(status: CronStatus) -> &'static str {
-    match status {
-        CronStatus::Scheduled => "scheduled",
-        CronStatus::Paused => "paused",
-        CronStatus::Completed => "completed",
-        CronStatus::Expired => "expired",
-        CronStatus::Failed => "failed",
-    }
-}
-
-fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
-    let encoded = BASE64_STANDARD.encode(text.as_bytes());
-    let mut stdout = std::io::stdout();
-    stdout.write_all(b"\x1b]52;c;")?;
-    stdout.write_all(encoded.as_bytes())?;
-    stdout.write_all(b"\x07")?;
-    stdout.flush()
 }
 
 #[cfg(test)]
@@ -3532,11 +2452,8 @@ mod tests {
         state
             .pending_submissions
             .iter()
-            .find_map(|(request_id, pending)| match &pending.kind {
-                PendingSubmissionKind::DisplaySubscribe { id } if id == expected_job_id => {
-                    Some(*request_id)
-                }
-                _ => None,
+            .find_map(|(request_id, pending)| {
+                (pending.display_subscribe_id() == Some(expected_job_id)).then_some(*request_id)
             })
             .expect("pending display subscribe request")
     }
@@ -3545,22 +2462,10 @@ mod tests {
         state
             .pending_submissions
             .iter()
-            .find_map(|(request_id, pending)| match &pending.kind {
-                PendingSubmissionKind::DisplayUnsubscribe { id } if id == expected_job_id => {
-                    Some(*request_id)
-                }
-                _ => None,
+            .find_map(|(request_id, pending)| {
+                (pending.display_unsubscribe_id() == Some(expected_job_id)).then_some(*request_id)
             })
             .expect("pending display unsubscribe request")
-    }
-
-    #[test]
-    fn output_subscription_channel_requires_job_id() {
-        assert_eq!(
-            output_channel_for_job_id("J7"),
-            Some(EventChannel::Output(JobId(7)))
-        );
-        assert!(output_channel_for_job_id("C7").is_none());
     }
 
     fn chain_info(id: &str, statuses: Vec<JobStatus>) -> ChainInfo {
@@ -3582,26 +2487,6 @@ mod tests {
                 })
                 .collect(),
         }
-    }
-
-    #[test]
-    fn script_submission_format_includes_file_source() {
-        let text = format_script_submission(
-            &ScriptSource::File {
-                path: "scripts/build.cue".into(),
-            },
-            &[],
-            None,
-        );
-        assert!(text.contains("submitted 0 item(s)"));
-        assert!(text.contains("source: scripts/build.cue"));
-    }
-
-    #[test]
-    fn script_finished_format_includes_exit_and_failed_item() {
-        let text = format_script_finished(ScriptRunStatus::Failed, 2, Some(1));
-        assert!(text.contains("exit=2"));
-        assert!(text.contains("failed at item 2"));
     }
 
     #[test]
@@ -4218,7 +3103,7 @@ mod tests {
         assert_eq!(state.job_picker_selected(), Some(0));
         assert_eq!(state.job_picker_title(), "Crons");
         assert_eq!(state.job_picker_submit_label(), "remove");
-        assert_eq!(state.job_picker_items()[0].0, "C1");
+        assert_eq!(state.job_picker_items()[0].id, "C1");
     }
 
     #[test]
@@ -4429,7 +3314,7 @@ destination = "devbox"
             state
                 .target_settings
                 .as_ref()
-                .map(|state| state.snapshot.default_profile.as_str()),
+                .map(TargetSettingsState::default_profile_name),
             Some("remote")
         );
 
@@ -4469,7 +3354,7 @@ destination = "devbox"
             state
                 .target_settings
                 .as_ref()
-                .and_then(|state| state.notice.as_deref())
+                .and_then(TargetSettingsState::notice)
                 .is_some_and(|notice| notice.contains("already the default target"))
         );
     }
@@ -4541,14 +3426,14 @@ socket = "/tmp/alt.sock"
             state
                 .target_settings
                 .as_ref()
-                .and_then(|state| state.notice.as_deref())
+                .and_then(TargetSettingsState::notice)
                 .is_some_and(|notice| notice.contains("Press R to reconnect now"))
         );
         assert_eq!(
             state
                 .target_settings
                 .as_ref()
-                .and_then(|state| state.pending_reconnect_profile.as_deref()),
+                .and_then(TargetSettingsState::pending_reconnect_profile_name),
             Some("alt")
         );
 
@@ -4621,14 +3506,14 @@ destination = "devbox"
             state
                 .target_settings
                 .as_ref()
-                .and_then(|state| state.notice.as_deref())
+                .and_then(TargetSettingsState::notice)
                 .is_some_and(|notice| notice.contains("Press R to reconnect now"))
         );
         assert_eq!(
             state
                 .target_settings
                 .as_ref()
-                .and_then(|state| state.pending_reconnect_profile.as_deref()),
+                .and_then(TargetSettingsState::pending_reconnect_profile_name),
             Some("remote")
         );
 
@@ -4661,7 +3546,7 @@ destination = "devbox"
         let notice = state
             .target_settings
             .as_ref()
-            .and_then(|state| state.notice.as_deref())
+            .and_then(TargetSettingsState::notice)
             .expect("reconnect failure notice");
         assert!(notice.contains("alt"), "{notice}");
         assert!(notice.contains("dial failed"), "{notice}");
@@ -4760,7 +3645,7 @@ destination = "devbox"
             state
                 .target_settings
                 .as_ref()
-                .and_then(|state| state.notice.as_deref())
+                .and_then(TargetSettingsState::notice)
                 .is_some_and(|notice| notice.contains("not a usable target profile"))
         );
     }
@@ -5387,26 +4272,6 @@ destination = "devbox"
     }
 
     #[test]
-    fn job_list_snapshot_formats_pending_reason() {
-        let text = format_job_list_snapshot(&[JobInfo {
-            id: "J1".into(),
-            status: JobStatus::Pending,
-            pipeline: "train".into(),
-            exit_code: None,
-            start_scope: None,
-            end_scope: None,
-            open_hint: JobOpenHint::Stream,
-            chain_id: None,
-            chain_index: None,
-            chain_total: None,
-            pending_reason: Some("gpu: waiting GPU".into()),
-        }]);
-
-        assert!(text.contains("J1 [pending] train"));
-        assert!(text.contains("pending reason: gpu: waiting GPU"));
-    }
-
-    #[test]
     fn job_list_snapshot_preserves_start_scope() {
         let mut state = AppState::new();
 
@@ -5429,22 +4294,6 @@ destination = "devbox"
 
         assert_eq!(state.jobs.len(), 1);
         assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
-    }
-
-    #[test]
-    fn fg_key_bytes_use_application_cursor_sequences_when_enabled() {
-        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(fg_key_bytes(key, false), Some(b"\x1b[A".to_vec()));
-        assert_eq!(fg_key_bytes(key, true), Some(b"\x1bOA".to_vec()));
-    }
-
-    #[test]
-    fn fg_paste_bytes_wrap_when_bracketed_paste_is_enabled() {
-        assert_eq!(fg_paste_bytes("echo hi", false), b"echo hi".to_vec());
-        assert_eq!(
-            fg_paste_bytes("echo hi", true),
-            b"\x1b[200~echo hi\x1b[201~".to_vec()
-        );
     }
 
     #[test]

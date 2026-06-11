@@ -4,6 +4,8 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use cue_core::Mode;
+use cue_core::cron::CronStatus;
+use cue_core::job::JobStatus;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -11,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::Component;
-use crate::app::AppMsg;
+use crate::message::AppMsg;
 
 // ── Types ──
 
@@ -26,12 +28,59 @@ pub(crate) struct SidebarItem {
     pub(crate) status_icon: &'static str,
 }
 
+pub(crate) struct JobSidebarRecord<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) label: &'a str,
+    pub(crate) status: &'a JobStatus,
+}
+
+pub(crate) struct CronSidebarRecord<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) label: &'a str,
+    pub(crate) status: CronStatus,
+}
+
+pub(crate) fn job_sidebar_item(record: JobSidebarRecord<'_>) -> SidebarItem {
+    SidebarItem {
+        id: record.id.to_string(),
+        label: record.label.to_string(),
+        status_icon: crate::status_view::job_status_icon(record.status),
+    }
+}
+
+pub(crate) fn cron_sidebar_item(record: CronSidebarRecord<'_>) -> SidebarItem {
+    SidebarItem {
+        id: record.id.to_string(),
+        label: record.label.to_string(),
+        status_icon: crate::status_view::cron_status_icon(record.status),
+    }
+}
+
 /// Aggregate counts mirrored into the top header.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OverviewCounts {
     pub(crate) jobs: u32,
     pub(crate) jobs_running: u32,
     pub(crate) crons: u32,
+}
+
+pub(crate) fn overview_counts<'a>(
+    job_statuses: impl IntoIterator<Item = &'a JobStatus>,
+    crons: usize,
+) -> OverviewCounts {
+    let mut jobs = 0usize;
+    let mut jobs_running = 0usize;
+    for status in job_statuses {
+        jobs += 1;
+        if matches!(status, JobStatus::Running) {
+            jobs_running += 1;
+        }
+    }
+    OverviewCounts {
+        jobs: jobs as u32,
+        jobs_running: jobs_running as u32,
+        crons: crons as u32,
+    }
 }
 
 // ── Component messages ──
@@ -251,6 +300,43 @@ mod tests {
                 .collect(),
         ));
         sidebar
+    }
+
+    #[test]
+    fn overview_counts_summarize_jobs_and_crons() {
+        assert_eq!(
+            overview_counts(
+                [&JobStatus::Running, &JobStatus::Done, &JobStatus::Running],
+                2
+            ),
+            OverviewCounts {
+                jobs: 3,
+                jobs_running: 2,
+                crons: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn sidebar_items_use_status_icons_without_app_rows() {
+        assert_eq!(
+            job_sidebar_item(JobSidebarRecord {
+                id: "J7",
+                label: "cargo test",
+                status: &JobStatus::Running,
+            })
+            .status_icon,
+            "🔄"
+        );
+        assert_eq!(
+            cron_sidebar_item(CronSidebarRecord {
+                id: "C2",
+                label: "daily",
+                status: CronStatus::Paused,
+            })
+            .status_icon,
+            "⏸"
+        );
     }
 
     #[test]

@@ -21,8 +21,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use tui_term::widget::PseudoTerminal;
 
 use crate::ansi;
-use crate::app::{AppState, FocusArea};
+use crate::app::AppState;
 use crate::component::Component;
+use crate::focus::FocusArea;
+use crate::job_picker::job_picker_popup_rect;
+use crate::target_settings::{target_settings_modal_footer_text, target_settings_popup_rect};
 
 /// Render the entire TUI into the current frame.
 pub(crate) fn draw(frame: &mut Frame, state: &AppState) {
@@ -180,7 +183,7 @@ fn render_display_tabs(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_job_picker(frame: &mut Frame, state: &AppState, area: Rect) {
-    let popup = centered_rect(area, 70, 60);
+    let popup = job_picker_popup_rect(area);
     frame.render_widget(Clear, popup);
 
     let items = state.job_picker_items();
@@ -212,26 +215,26 @@ fn render_job_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     let rows: Vec<ListItem> = items
         .into_iter()
         .enumerate()
-        .map(|(index, (id, label, icon))| {
+        .map(|(index, item)| {
             let style = if selected == Some(index) {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else {
                 Style::default().fg(Color::White)
             };
-            ListItem::new(Line::from(format!("{icon} {id} {label}"))).style(style)
+            ListItem::new(Line::from(format!(
+                "{} {} {}",
+                item.status_icon, item.id, item.label
+            )))
+            .style(style)
         })
         .collect();
     frame.render_widget(List::new(rows), inner);
 }
 
 fn render_target_settings_modal(frame: &mut Frame, state: &AppState, area: Rect) {
-    let popup = centered_rect(area, 82, 78);
+    let popup = target_settings_popup_rect(area);
     frame.render_widget(Clear, popup);
-    let footer = if state.target_settings_can_save() {
-        " Enter save   Ctrl+R reload   Esc close "
-    } else {
-        " Ctrl+R reload   Esc close "
-    };
+    let footer = target_settings_modal_footer_text(state.target_settings_can_save());
 
     let block = Block::new()
         .borders(Borders::ALL)
@@ -246,20 +249,4 @@ fn render_target_settings_modal(frame: &mut Frame, state: &AppState, area: Rect)
             .style(Style::default().fg(Color::White)),
         inner,
     );
-}
-
-fn centered_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - height_pct) / 2),
-        Constraint::Percentage(height_pct),
-        Constraint::Percentage((100 - height_pct) / 2),
-    ])
-    .split(area);
-    let horizontal = Layout::horizontal([
-        Constraint::Percentage((100 - width_pct) / 2),
-        Constraint::Percentage(width_pct),
-        Constraint::Percentage((100 - width_pct) / 2),
-    ])
-    .split(vertical[1]);
-    horizontal[1]
 }

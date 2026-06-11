@@ -1,3 +1,6 @@
+use ratatui::layout::Rect;
+
+use crate::geometry::{centered_rect, contains, inner_rect};
 use crate::target_config::{
     TargetProfileKind, TargetProfileSource, TargetProfileSummary, TargetSettingsSnapshot,
     display_path,
@@ -5,12 +8,12 @@ use crate::target_config::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct TargetSettingsState {
-    pub(crate) snapshot: TargetSettingsSnapshot,
-    pub(crate) selected: usize,
-    pub(crate) notice: Option<String>,
+    snapshot: TargetSettingsSnapshot,
+    selected: usize,
+    notice: Option<String>,
     /// Profile name waiting for an R-key reconnect trigger.
     /// `None` when no pending live-reconnect is available.
-    pub(crate) pending_reconnect_profile: Option<String>,
+    pending_reconnect_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,23 @@ pub(crate) struct TargetSettingsView {
 pub(crate) struct TargetProfileSaveFeedback {
     pub(crate) notice: String,
     pub(crate) pending_reconnect: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TargetProfileSaveAction {
+    Save {
+        snapshot: TargetSettingsSnapshot,
+        profile_name: String,
+    },
+    Notice(String),
+}
+
+pub(crate) fn target_settings_popup_rect(area: Rect) -> Rect {
+    centered_rect(area, 82, 78)
+}
+
+pub(crate) fn target_settings_content_rect(popup: Rect) -> Rect {
+    inner_rect(popup)
 }
 
 impl TargetSettingsState {
@@ -46,6 +66,47 @@ impl TargetSettingsState {
         state
     }
 
+    pub(crate) fn with_save_feedback(
+        snapshot: TargetSettingsSnapshot,
+        profile_name: &str,
+        feedback: TargetProfileSaveFeedback,
+    ) -> Self {
+        let mut state = Self::with_notice(snapshot, feedback.notice);
+        if feedback.pending_reconnect {
+            state.pending_reconnect_profile = Some(profile_name.into());
+        }
+        state
+    }
+
+    pub(crate) fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    pub(crate) fn set_notice_without_pending_reconnect(&mut self, notice: impl Into<String>) {
+        self.set_notice(notice);
+        self.pending_reconnect_profile = None;
+    }
+
+    pub(crate) fn has_pending_reconnect(&self) -> bool {
+        self.pending_reconnect_profile.is_some()
+    }
+
+    pub(crate) fn pending_reconnect_profile_name(&self) -> Option<&str> {
+        self.pending_reconnect_profile.as_deref()
+    }
+
+    pub(crate) fn default_profile_name(&self) -> &str {
+        &self.snapshot.default_profile
+    }
+
+    pub(crate) fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
     pub(crate) fn move_selection(&mut self, delta: isize) {
         if self.snapshot.profiles.is_empty() {
             self.selected = 0;
@@ -65,6 +126,33 @@ impl TargetSettingsState {
 
     pub(crate) fn selected_profile(&self) -> Option<&TargetProfileSummary> {
         self.snapshot.profiles.get(self.selected)
+    }
+
+    pub(crate) fn selected_profile_can_be_saved(&self) -> bool {
+        self.selected_profile()
+            .is_some_and(target_profile_can_be_saved)
+    }
+
+    pub(crate) fn selected_profile_save_action(&self) -> Option<TargetProfileSaveAction> {
+        let selected_profile = self.selected_profile()?;
+        let profile_name = selected_profile.name.clone();
+
+        if !target_profile_can_be_saved(selected_profile) {
+            return Some(TargetProfileSaveAction::Notice(format!(
+                "`{profile_name}` is not a usable target profile; fix the config and reload"
+            )));
+        }
+
+        if self.default_profile_name() == profile_name {
+            return Some(TargetProfileSaveAction::Notice(format!(
+                "`{profile_name}` is already the default target for the next launch"
+            )));
+        }
+
+        Some(TargetProfileSaveAction::Save {
+            snapshot: self.snapshot.clone(),
+            profile_name,
+        })
     }
 
     pub(crate) fn select_first(&mut self) {
@@ -103,7 +191,7 @@ pub(crate) fn format_target_settings_view(
             "current session target: {}",
             session_profile_name.unwrap_or("n/a")
         ),
-        format!("default on next launch: {}", state.snapshot.default_profile),
+        format!("default on next launch: {}", state.default_profile_name()),
         format!(
             "ssh auto-detection: {}",
             if state.snapshot.auto_detect_ssh {
@@ -113,7 +201,7 @@ pub(crate) fn format_target_settings_view(
             }
         ),
         match state.selected_profile_name() {
-            Some(selected) if selected == state.snapshot.default_profile => {
+            Some(selected) if selected == state.default_profile_name() => {
                 format!("selection: {selected} (already the saved default)")
             }
             Some(selected) => {
@@ -134,7 +222,7 @@ pub(crate) fn format_target_settings_view(
         if session_profile_name == Some(profile.name.as_str()) {
             tags.push("session");
         }
-        if state.snapshot.default_profile == profile.name {
+        if state.default_profile_name() == profile.name {
             tags.push("default");
         }
         if Some(profile.name.as_str()) == state.selected_profile_name() {
@@ -158,7 +246,7 @@ pub(crate) fn format_target_settings_view(
         lines.push(format!("    {}", profile.detail));
     }
 
-    if let Some(notice) = &state.notice {
+    if let Some(notice) = state.notice() {
         lines.push(String::new());
         lines.push(format!("note: {notice}"));
     }
@@ -184,6 +272,45 @@ fn target_profile_source_tag(profile: &TargetProfileSummary) -> Option<&'static 
         TargetProfileSource::AutoDetectedSsh => Some("auto"),
         TargetProfileSource::Missing => None,
     }
+}
+
+pub(crate) fn target_settings_footer_text(can_save: bool, has_pending_reconnect: bool) -> String {
+    let reconnect_hint = if has_pending_reconnect {
+        "  •  R reconnect now"
+    } else {
+        ""
+    };
+    let primary_action = if can_save {
+        "Enter save default  •  "
+    } else {
+        ""
+    };
+    format!(
+        "Targets: Up/Down/Home/End select  •  {primary_action}Ctrl+R reload  •  \
+         Esc/Ctrl+T close  •  Ctrl+Y copy  •  Shift+Tab mode{reconnect_hint}"
+    )
+}
+
+pub(crate) fn target_settings_modal_footer_text(can_save: bool) -> &'static str {
+    if can_save {
+        " Enter save   Ctrl+R reload   Esc close "
+    } else {
+        " Ctrl+R reload   Esc close "
+    }
+}
+
+pub(crate) fn target_settings_profile_hit(
+    view: &TargetSettingsView,
+    content_area: Rect,
+    point: Rect,
+) -> Option<usize> {
+    if !contains(content_area, point) {
+        return None;
+    }
+    let relative_y = point.y.saturating_sub(content_area.y) as usize;
+    view.profile_line_rows
+        .iter()
+        .position(|line| *line == relative_y)
 }
 
 pub(crate) fn target_profile_supports_live_reconnect(profile: &TargetProfileSummary) -> bool {
@@ -266,6 +393,66 @@ mod tests {
     }
 
     #[test]
+    fn target_settings_modal_rects_share_popup_and_content_geometry() {
+        let popup = target_settings_popup_rect(Rect::new(0, 0, 100, 50));
+
+        assert_eq!(popup, Rect::new(9, 6, 82, 39));
+        assert_eq!(
+            target_settings_content_rect(popup),
+            Rect::new(10, 7, 80, 37)
+        );
+    }
+
+    #[test]
+    fn target_settings_footer_mentions_available_actions() {
+        let plain = target_settings_footer_text(false, false);
+        let actionable = target_settings_footer_text(true, true);
+
+        assert!(!plain.contains("Enter save default"));
+        assert!(!plain.contains("R reconnect now"));
+        assert!(actionable.contains("Enter save default"));
+        assert!(actionable.contains("R reconnect now"));
+    }
+
+    #[test]
+    fn target_settings_modal_footer_mentions_available_action() {
+        assert_eq!(
+            target_settings_modal_footer_text(true),
+            " Enter save   Ctrl+R reload   Esc close "
+        );
+        assert_eq!(
+            target_settings_modal_footer_text(false),
+            " Ctrl+R reload   Esc close "
+        );
+    }
+
+    #[test]
+    fn target_settings_profile_hit_maps_profile_rows_only() {
+        let view = TargetSettingsView {
+            content: String::new(),
+            profile_line_rows: vec![2, 4],
+        };
+        let content_area = Rect::new(10, 20, 40, 10);
+
+        assert_eq!(
+            target_settings_profile_hit(&view, content_area, Rect::new(12, 22, 1, 1)),
+            Some(0)
+        );
+        assert_eq!(
+            target_settings_profile_hit(&view, content_area, Rect::new(12, 24, 1, 1)),
+            Some(1)
+        );
+        assert_eq!(
+            target_settings_profile_hit(&view, content_area, Rect::new(12, 23, 1, 1)),
+            None
+        );
+        assert_eq!(
+            target_settings_profile_hit(&view, content_area, Rect::new(9, 22, 1, 1)),
+            None
+        );
+    }
+
+    #[test]
     fn ssh_target_profile_supports_live_reconnect_without_alerts() {
         let profile = test_profile(
             "remote",
@@ -300,6 +487,117 @@ mod tests {
         let view = format_target_settings_view(&state, Some("local"));
 
         assert!(view.content.contains("[default, selected, missing]"));
+    }
+
+    #[test]
+    fn selected_profile_save_rule_requires_usable_target() {
+        let state = TargetSettingsState::new(test_snapshot(
+            "/tmp/client.toml",
+            "remote",
+            vec![test_profile(
+                "remote",
+                TargetProfileKind::Missing,
+                "profile is referenced by default_profile but not defined",
+                TargetProfileSource::Missing,
+            )],
+        ));
+        assert!(!state.selected_profile_can_be_saved());
+
+        let state = TargetSettingsState::new(test_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![test_profile(
+                "local",
+                TargetProfileKind::Unix,
+                "unix:///tmp/cue.sock",
+                TargetProfileSource::Configured,
+            )],
+        ));
+        assert!(state.selected_profile_can_be_saved());
+    }
+
+    #[test]
+    fn selected_profile_save_action_distinguishes_notice_and_save() {
+        let missing = TargetSettingsState::new(test_snapshot(
+            "/tmp/client.toml",
+            "remote",
+            vec![test_profile(
+                "remote",
+                TargetProfileKind::Missing,
+                "profile is referenced by default_profile but not defined",
+                TargetProfileSource::Missing,
+            )],
+        ));
+        assert!(matches!(
+            missing.selected_profile_save_action(),
+            Some(TargetProfileSaveAction::Notice(notice))
+                if notice.contains("not a usable target profile")
+        ));
+
+        let already_default = TargetSettingsState::new(test_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![test_profile(
+                "local",
+                TargetProfileKind::Unix,
+                "unix:///tmp/cue.sock",
+                TargetProfileSource::Configured,
+            )],
+        ));
+        assert!(matches!(
+            already_default.selected_profile_save_action(),
+            Some(TargetProfileSaveAction::Notice(notice))
+                if notice.contains("already the default target")
+        ));
+
+        let mut can_save = TargetSettingsState::new(test_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![
+                test_profile(
+                    "local",
+                    TargetProfileKind::Unix,
+                    "unix:///tmp/cue.sock",
+                    TargetProfileSource::Configured,
+                ),
+                test_profile(
+                    "remote",
+                    TargetProfileKind::Ssh,
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
+            ],
+        ));
+        can_save.select_profile_name("remote");
+        assert!(matches!(
+            can_save.selected_profile_save_action(),
+            Some(TargetProfileSaveAction::Save { profile_name, .. }) if profile_name == "remote"
+        ));
+    }
+
+    #[test]
+    fn notice_helpers_control_pending_reconnect_state() {
+        let snapshot = test_snapshot("/tmp/client.toml", "remote", Vec::new());
+        let feedback = TargetProfileSaveFeedback {
+            notice: "saved".into(),
+            pending_reconnect: true,
+        };
+        let mut state = TargetSettingsState::with_save_feedback(snapshot, "remote", feedback);
+
+        assert_eq!(state.pending_reconnect_profile_name(), Some("remote"));
+        assert!(state.has_pending_reconnect());
+
+        state.set_notice("saved again");
+
+        assert_eq!(state.notice(), Some("saved again"));
+        assert_eq!(state.pending_reconnect_profile_name(), Some("remote"));
+        assert!(state.has_pending_reconnect());
+
+        state.set_notice_without_pending_reconnect("reconnecting");
+
+        assert_eq!(state.notice(), Some("reconnecting"));
+        assert_eq!(state.pending_reconnect_profile_name(), None);
+        assert!(!state.has_pending_reconnect());
     }
 
     #[test]

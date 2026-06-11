@@ -16,7 +16,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use cue_core::Mode;
 
 use super::Component;
-use crate::app::AppMsg;
+use crate::message::AppMsg;
 
 /// Messages local to the input line.
 pub(crate) enum InputMsg {

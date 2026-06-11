@@ -12,11 +12,11 @@ use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent};
 use tokio::sync::mpsc;
 
-use crate::app::AppMsg;
 use crate::client::{
     ClientConnector, ClientReader, ConnectionController, ConnectionEvent,
     spawn_connection_manager_controllable,
 };
+use crate::message::AppMsg;
 use cue_core::ipc::Message;
 
 /// Spawn the event-producing tasks and return a receiver of [`AppMsg`] and a

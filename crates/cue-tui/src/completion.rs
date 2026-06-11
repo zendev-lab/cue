@@ -7,6 +7,85 @@ use anyhow::Context;
 use cue_core::Mode;
 use cue_core::command_spec::command_names;
 
+pub(crate) struct CompletionScope<'a> {
+    pub(crate) mode: Mode,
+    pub(crate) content: &'a str,
+    pub(crate) cursor: usize,
+    pub(crate) word_range: std::ops::Range<usize>,
+    pub(crate) job_ids: &'a [String],
+    pub(crate) cron_ids: &'a [String],
+}
+
+pub(crate) fn completion_candidates(scope: CompletionScope<'_>) -> anyhow::Result<Vec<String>> {
+    let cursor = scope.cursor.min(scope.content.len());
+    let line_start = scope.content[..cursor].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_prefix = &scope.content[line_start..cursor];
+    let trimmed = line_prefix.trim_start();
+    let word = &scope.content[scope.word_range];
+    if !trimmed.starts_with(':') {
+        return bare_completion_candidates(scope.mode, line_prefix, word);
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(builtin_command_candidates(word));
+    }
+
+    if word.starts_with(':') && tokens.len() <= 1 {
+        return Ok(builtin_command_candidates(word));
+    }
+
+    let ids = target_id_candidates(tokens[0], scope.job_ids, scope.cron_ids);
+    Ok(ids
+        .into_iter()
+        .filter(|candidate| candidate.starts_with(word))
+        .collect())
+}
+
+pub(crate) fn completion_replacement(candidates: &[String], word: &str) -> Option<String> {
+    match candidates {
+        [] => None,
+        [candidate] if candidate.ends_with('/') => Some(candidate.clone()),
+        [candidate] => Some(format!("{candidate} ")),
+        _ => {
+            let shared = shared_prefix(candidates);
+            (shared.len() > word.len()).then_some(shared)
+        }
+    }
+}
+
+fn shared_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for item in &items[1..] {
+        let shared_len = prefix
+            .chars()
+            .zip(item.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(ch, _)| ch.len_utf8())
+            .sum();
+        prefix.truncate(shared_len);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+fn target_id_candidates(command: &str, job_ids: &[String], cron_ids: &[String]) -> Vec<String> {
+    match command {
+        ":out" | ":err" | ":tail" | ":retry" | ":fg" | ":wait" | ":send" => job_ids.to_vec(),
+        ":kill" | ":cancel" | ":pause" | ":resume" | ":log" => {
+            let mut ids = job_ids.to_vec();
+            ids.extend_from_slice(cron_ids);
+            ids
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn builtin_command_candidates(word: &str) -> Vec<String> {
     let prefix = word.strip_prefix(':').unwrap_or(word);
     command_names()
@@ -276,6 +355,63 @@ fn token_spans(input: &str) -> Vec<(&str, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_target_completion_filters_job_and_cron_ids_by_command() {
+        let job_ids = vec!["J1".to_string(), "J2".to_string()];
+        let cron_ids = vec!["C1".to_string()];
+        let wait_candidates = completion_candidates(CompletionScope {
+            mode: Mode::Job,
+            content: ":wait J",
+            cursor: 7,
+            word_range: 6..7,
+            job_ids: &job_ids,
+            cron_ids: &cron_ids,
+        })
+        .expect("wait completion");
+        let kill_candidates = completion_candidates(CompletionScope {
+            mode: Mode::Job,
+            content: ":kill C",
+            cursor: 7,
+            word_range: 6..7,
+            job_ids: &job_ids,
+            cron_ids: &cron_ids,
+        })
+        .expect("kill completion");
+
+        assert_eq!(wait_candidates, vec!["J1".to_string(), "J2".to_string()]);
+        assert_eq!(kill_candidates, vec!["C1".to_string()]);
+    }
+
+    #[test]
+    fn completion_replacement_handles_empty_single_and_shared_candidates() {
+        assert_eq!(completion_replacement(&[], ""), None);
+        assert_eq!(
+            completion_replacement(&["cargo".into()], "car"),
+            Some("cargo ".into())
+        );
+        assert_eq!(
+            completion_replacement(&["src/".into()], "sr"),
+            Some("src/".into())
+        );
+        assert_eq!(
+            completion_replacement(&["build-debug".into(), "build-release".into()], "bui"),
+            Some("build-".into())
+        );
+        assert_eq!(
+            completion_replacement(&["build-debug".into(), "build-release".into()], "build-"),
+            None
+        );
+    }
+
+    #[test]
+    fn shared_prefix_respects_utf8_boundaries() {
+        assert_eq!(
+            shared_prefix(&["编译-main".into(), "编译-test".into()]),
+            "编译-"
+        );
+        assert_eq!(shared_prefix(&["abc".into(), "xyz".into()]), "");
+    }
 
     #[cfg(unix)]
     #[test]

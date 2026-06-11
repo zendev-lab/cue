@@ -8,6 +8,7 @@
 //! daemon uses its own PID file, database, and socket — never colliding with a
 //! real running `cued` instance.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -20,6 +21,7 @@ use tokio::io::{
 };
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -33,6 +35,19 @@ use cue_core::mode::Mode;
 
 /// Per-test timeout to prevent hangs.
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// These integration tests spawn real daemons and child processes. Run them one
+/// at a time so the default Rust test harness does not create cross-test
+/// process/resource interference.
+static DAEMON_TEST_PERMIT: Semaphore = Semaphore::const_new(1);
+
+async fn run_daemon_test(test: impl Future<Output = ()>) {
+    let _permit = DAEMON_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("daemon integration test permit is never closed");
+    timeout(TEST_TIMEOUT, test).await.expect("test timed out");
+}
 
 /// A self-contained test environment with unique dirs and socket.
 struct TestEnv {
@@ -417,7 +432,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_daemon_lifecycle() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("lifecycle");
         let mut child = env.spawn_daemon();
 
@@ -451,13 +466,12 @@ async fn test_daemon_lifecycle() {
         // Might exit 0 or via signal — both are acceptable.
         let _ = status;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_foreground_sigint_exits_promptly() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("sigint-exit");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -475,13 +489,12 @@ async fn test_foreground_sigint_exits_promptly() {
 
         let _ = stream.shutdown().await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_simple_job_execution() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("simplejob");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -549,13 +562,12 @@ async fn test_simple_job_execution() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_resource_cli_provider_admission_env_and_inspection() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("resource-cli-provider");
         let provider_script = env.root.join("license-provider.sh");
         let state_file = env.root.join("license-held");
@@ -600,7 +612,7 @@ keys = ["license"]
 probe = ["{}", "probe", "{}"]
 reserve = ["{}", "reserve", "{}"]
 release = ["{}", "release", "{}"]
-timeout_ms = 1000
+timeout_ms = 5000
 "#,
                 provider_script.display(),
                 state_file.display(),
@@ -701,13 +713,12 @@ timeout_ms = 1000
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_restores_jobs_and_scope_head() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("persist");
         let persisted_cwd = env.root.join("persisted-cwd");
         std::fs::create_dir_all(&persisted_cwd).expect("create persisted cwd");
@@ -814,13 +825,12 @@ async fn test_restart_restores_jobs_and_scope_head() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_jobs_merge_ambient_path_into_restored_scope() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("ambient-path");
         let live_bin = env.root.join("live-bin");
         std::fs::create_dir_all(&live_bin).expect("create live bin");
@@ -877,13 +887,12 @@ async fn test_restart_jobs_merge_ambient_path_into_restored_scope() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_env_set_prints_deduped_scope_side_effects() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("env-set-effects");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -925,13 +934,12 @@ async fn test_env_set_prints_deduped_scope_side_effects() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cd_rejects_missing_directory() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("badcd");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -957,13 +965,12 @@ async fn test_cd_rejects_missing_directory() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_spawn_failure_does_not_reuse_stale_output_log() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("stale-log");
         let stale_output = env.root.join("data/cue-shell/output");
         std::fs::create_dir_all(&stale_output).expect("create stale output dir");
@@ -1009,13 +1016,12 @@ async fn test_spawn_failure_does_not_reuse_stale_output_log() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_chain_execution() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("chain");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1077,13 +1083,12 @@ async fn test_chain_execution() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_job_logical_operators_stay_single_job() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("job-logical");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1124,13 +1129,12 @@ async fn test_job_logical_operators_stay_single_job() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_chain_parallel_operator_uses_triple_pipe() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("triple-pipe");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1153,13 +1157,12 @@ async fn test_chain_parallel_operator_uses_triple_pipe() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_job_local_cd_does_not_update_global_scope_by_default() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("job-local-cd");
         let job_cwd = env.root.join("job-cwd");
         std::fs::create_dir_all(&job_cwd).expect("create job cwd");
@@ -1242,13 +1245,12 @@ async fn test_job_local_cd_does_not_update_global_scope_by_default() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_job_kill() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("kill");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1315,13 +1317,12 @@ async fn test_job_kill() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_pipe_mode_job_kill() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("pipe-kill");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1384,13 +1385,12 @@ async fn test_pipe_mode_job_kill() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_single_pipe_mode_stdin_is_closed_by_default() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("pipe-stdin-null");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1415,13 +1415,12 @@ async fn test_single_pipe_mode_stdin_is_closed_by_default() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_pipe_mode_pipeline_stdin_is_closed_by_default() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("pipe-chain-stdin-null");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1446,13 +1445,12 @@ async fn test_pipe_mode_pipeline_stdin_is_closed_by_default() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fg_attach_input_and_detach() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("fg");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1586,13 +1584,12 @@ async fn test_fg_attach_input_and_detach() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_jobs_run_in_tty() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("tty");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1640,13 +1637,12 @@ async fn test_jobs_run_in_tty() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_job_command_expands_tilde_and_env_vars() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("expand");
         let bin_dir = env.root.join("bin");
         fs::create_dir_all(&bin_dir).expect("create test bin dir");
@@ -1704,13 +1700,12 @@ async fn test_job_command_expands_tilde_and_env_vars() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_add_and_list() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("cron");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1760,13 +1755,12 @@ async fn test_cron_add_and_list() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_mode_bare_input_adds_cron() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("cron-mode");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1813,13 +1807,12 @@ async fn test_cron_mode_bare_input_adds_cron() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_bare_question_returns_current_mode_help() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("mode-help");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -1850,13 +1843,12 @@ async fn test_bare_question_returns_current_mode_help() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gateway_stdio_bridge_shares_state_and_keeps_output_subscriptions_per_client() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("bridge-shared-state");
         let script_path = env.root.join("delayed-output.sh");
         write_executable_script(
@@ -1958,13 +1950,12 @@ async fn test_gateway_stdio_bridge_shares_state_and_keeps_output_subscriptions_p
 
         shutdown_daemon(&mut local, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("bridge-fg-release");
         let mut child = env.spawn_daemon();
         let mut local = wait_for_socket(&env.socket, &mut child).await;
@@ -2071,15 +2062,14 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
 
         shutdown_daemon(&mut local, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_err_command_returns_output_for_pty_job() {
     // Single-process jobs still run in PTY mode (stdout and stderr are merged).
     // `:err J<n>` should return the combined output prefixed with the PTY notice.
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("err-pty");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -2129,13 +2119,12 @@ async fn test_err_command_returns_output_for_pty_job() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_native_stdout_pipeline_preserves_arguments_and_real_stderr() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("pipe-stdout");
         let producer = env.root.join("producer.sh");
         let consumer = env.root.join("consumer.sh");
@@ -2220,13 +2209,12 @@ async fn test_native_stdout_pipeline_preserves_arguments_and_real_stderr() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_native_stderr_only_pipeline_keeps_stdout_outside_pipe() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("pipe-stderr-only");
         let producer = env.root.join("producer.sh");
         let consumer = env.root.join("consumer.sh");
@@ -2307,13 +2295,12 @@ async fn test_native_stderr_only_pipeline_keeps_stdout_outside_pipe() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_wrapper_allowlist_wraps_single_pipeline_and_logical_jobs() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("wrapper-allowlist");
         let wrapper_log = env.root.join("wrapper.log");
         let wrapper = env.root.join("rtk-test");
@@ -2397,13 +2384,12 @@ commands = ["printf", "sed", "true"]
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_wrapper_non_allowlisted_and_param_disabled_do_not_wrap() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("wrapper-skip");
         let wrapper_log = env.root.join("wrapper.log");
         let wrapper = env.root.join("rtk-test");
@@ -2467,13 +2453,12 @@ commands = ["printf"]
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_scopes_returns_scope_list() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("scopes-list");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -2517,13 +2502,12 @@ async fn test_scopes_returns_scope_list() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_config_show_returns_weft_info() {
-    timeout(TEST_TIMEOUT, async {
+    run_daemon_test(async {
         let env = TestEnv::new("config-show");
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
@@ -2564,6 +2548,5 @@ async fn test_config_show_returns_weft_info() {
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
-    .await
-    .expect("test timed out");
+    .await;
 }

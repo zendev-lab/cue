@@ -9,22 +9,37 @@ mod ansi;
 mod app;
 pub mod cli;
 mod client;
+mod clipboard;
 mod completion;
 mod component;
+mod display;
 mod event;
+mod focus;
+mod footer;
+mod foreground;
+mod geometry;
 mod history;
+mod job_picker;
+mod message;
+mod mouse_mode;
+mod record_format;
+mod script_summary;
+mod sidebar_action;
+mod status_view;
+mod submission;
 mod target_config;
 mod target_settings;
 mod terminal;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{AppMsg, AppState};
+use app::AppState;
 use crossterm::event::{
     DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use cue_client::{ClientConnector, CuedClient, RestartHandle};
+use message::AppMsg;
 use terminal::{PanicHookGuard, TerminalRestoreGuard, initial_terminal_size};
 
 /// Inputs needed to start the TUI.

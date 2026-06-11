@@ -10,6 +10,10 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use cue_core::chain::{
+    LeafStatus, advance_chain, aggregate_chain_exit_code, flatten_leaves, initially_ready,
+    is_chain_terminal,
+};
 use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{CronSchedule, CronStatus, parse_schedule_text};
 use cue_core::ipc::{
@@ -19,7 +23,9 @@ use cue_core::ipc::{
 };
 use cue_core::job::{CancelReason, EXIT_CODE_UNAVAILABLE, JobStatus};
 use cue_core::mode::Mode;
-use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp, command_prefers_foreground};
+use cue_core::pipeline::{ChainNode, command_prefers_foreground};
+#[cfg(test)]
+use cue_core::pipeline::{ParallelOp, SerialOp};
 use cue_core::resource::Need;
 use cue_core::scope::{EnvDelta, EnvSnapshot};
 use cue_core::{ChainId, CronId, EventChannel, JobId, ScopeHash, ScriptId};
@@ -43,28 +49,6 @@ use super::{
 };
 
 const MAX_OUTPUT_TAIL_BYTES: usize = cue_core::ipc::MAX_MESSAGE_SIZE / 4;
-
-// ── Leaf status within a chain ──────────────────────────────────────────────
-
-/// Status of a single leaf (pipeline) within a chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LeafStatus {
-    Pending,
-    Running,
-    Done(i32),
-    Failed(i32),
-    Cancelled,
-}
-
-impl LeafStatus {
-    /// Returns `true` if the leaf has reached a final state.
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            LeafStatus::Done(_) | LeafStatus::Failed(_) | LeafStatus::Cancelled
-        )
-    }
-}
 
 // ── Chain state ─────────────────────────────────────────────────────────────
 
@@ -91,23 +75,6 @@ struct ChainState {
     /// per-leaf at admission time and released on each leaf's terminal
     /// transition. Empty `Need` short-circuits the registry path entirely.
     needs: Need,
-}
-
-/// Flattened representation of a chain leaf for easy lookup.
-struct FlatLeaf {
-    /// Index in the DFS-order leaf list.
-    index: usize,
-    /// Full job plan.
-    plan: cue_core::pipeline::JobPlan,
-    /// Human-readable pipeline text.
-    pipeline_text: String,
-}
-
-impl FlatLeaf {
-    /// First segment's command words (for scope-transform detection and open hint).
-    fn command(&self) -> &[String] {
-        self.plan.first_command()
-    }
 }
 
 // ── Job tracking ────────────────────────────────────────────────────────────
@@ -911,41 +878,6 @@ async fn get_head_snapshot(
 
 // ── Chain helpers ────────────────────────────────────────────────────────────
 
-/// Count the number of leaf nodes (Pipelines) in a `ChainNode`.
-fn leaf_count(node: &ChainNode) -> usize {
-    match node {
-        ChainNode::Leaf(_) => 1,
-        ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
-            leaf_count(left) + leaf_count(right)
-        }
-    }
-}
-
-/// Flatten a `ChainNode` into a list of `FlatLeaf` entries (DFS, left-to-right).
-fn flatten_leaves(node: &ChainNode) -> Vec<FlatLeaf> {
-    let mut out = Vec::new();
-    flatten_leaves_inner(node, &mut out);
-    out
-}
-
-fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
-    match node {
-        ChainNode::Leaf(plan) => {
-            let idx = out.len();
-            let pipeline_text = plan.to_string();
-            out.push(FlatLeaf {
-                index: idx,
-                plan: plan.clone(),
-                pipeline_text,
-            });
-        }
-        ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
-            flatten_leaves_inner(left, out);
-            flatten_leaves_inner(right, out);
-        }
-    }
-}
-
 fn parse_chain_text(text: &str) -> Result<ChainNode, String> {
     match parse_command(&format!(":run {text}"), cue_core::Mode::Job).map_err(|err| err.message)? {
         ResolvedCommand::Run { chain, .. } => Ok(chain),
@@ -953,238 +885,14 @@ fn parse_chain_text(text: &str) -> Result<ChainNode, String> {
     }
 }
 
-/// Determine which leaf indices are *initially ready* given the chain structure.
-///
-/// Returns a `Vec<usize>` of leaf indices that should be spawned immediately.
-fn initially_ready(node: &ChainNode) -> Vec<usize> {
-    let mut ready = Vec::new();
-    initially_ready_inner(node, 0, &mut ready);
-    ready
-}
-
-fn initially_ready_inner(node: &ChainNode, offset: usize, ready: &mut Vec<usize>) {
-    match node {
-        ChainNode::Leaf(_) => {
-            ready.push(offset);
-        }
-        ChainNode::Serial { left, .. } => {
-            // Only the left subtree is ready initially.
-            initially_ready_inner(left, offset, ready);
-        }
-        ChainNode::Parallel { left, right, .. } => {
-            // Both subtrees are ready.
-            let left_count = leaf_count(left);
-            initially_ready_inner(left, offset, ready);
-            initially_ready_inner(right, offset + left_count, ready);
-        }
-    }
-}
-
-/// After a leaf finishes, determine which new leaves become ready
-/// and whether any should be cancelled.
-///
-/// Returns `(newly_ready, to_cancel)` leaf indices.
-fn advance_chain(
-    node: &ChainNode,
-    finished_idx: usize,
-    statuses: &HashMap<usize, LeafStatus>,
-) -> (Vec<usize>, Vec<usize>) {
-    let mut ready = Vec::new();
-    let mut cancel = Vec::new();
-    advance_inner(node, 0, finished_idx, statuses, &mut ready, &mut cancel);
-    (ready, cancel)
-}
-
-fn advance_inner(
-    node: &ChainNode,
-    offset: usize,
-    finished_idx: usize,
-    statuses: &HashMap<usize, LeafStatus>,
-    ready: &mut Vec<usize>,
-    cancel: &mut Vec<usize>,
-) {
-    match node {
-        ChainNode::Leaf(_) => {
-            // Nothing to advance for a bare leaf.
-        }
-        ChainNode::Serial { left, op, right } => {
-            let left_count = leaf_count(left);
-            let left_range = offset..offset + left_count;
-            let right_offset = offset + left_count;
-
-            if left_range.contains(&finished_idx) {
-                // Finished leaf is in the left subtree. Recurse into left.
-                advance_inner(left, offset, finished_idx, statuses, ready, cancel);
-
-                // Check if the entire left subtree is complete.
-                if all_leaves_terminal(left, offset, statuses) {
-                    match op {
-                        SerialOp::Then => {
-                            // Right runs only if all left leaves succeeded (exit 0).
-                            if all_leaves_succeeded(left, offset, statuses) {
-                                mark_ready(right, right_offset, statuses, ready);
-                            } else {
-                                mark_cancelled(right, right_offset, statuses, cancel);
-                            }
-                        }
-                        SerialOp::Always => {
-                            // Right always runs after left completes.
-                            mark_ready(right, right_offset, statuses, ready);
-                        }
-                    }
-                }
-            } else {
-                // Finished leaf is in the right subtree. Recurse into right.
-                advance_inner(right, right_offset, finished_idx, statuses, ready, cancel);
-            }
-        }
-        ChainNode::Parallel { left, right, op } => {
-            let left_count = leaf_count(left);
-            let right_offset = offset + left_count;
-
-            // Recurse into the subtree that owns the finished leaf.
-            if finished_idx < right_offset {
-                advance_inner(left, offset, finished_idx, statuses, ready, cancel);
-            } else {
-                advance_inner(right, right_offset, finished_idx, statuses, ready, cancel);
-            }
-
-            // For Race, check entire branch success (subtree terminal + all ok),
-            // not individual leaf success.
-            if *op == ParallelOp::Race {
-                let right_count = leaf_count(right);
-                let left_terminal = (offset..offset + left_count)
-                    .all(|i| statuses.get(&i).is_some_and(|s| s.is_terminal()));
-                let left_ok = left_terminal
-                    && (offset..offset + left_count)
-                        .all(|i| matches!(statuses.get(&i), Some(LeafStatus::Done(0))));
-
-                let right_terminal = (right_offset..right_offset + right_count)
-                    .all(|i| statuses.get(&i).is_some_and(|s| s.is_terminal()));
-                let right_ok = right_terminal
-                    && (right_offset..right_offset + right_count)
-                        .all(|i| matches!(statuses.get(&i), Some(LeafStatus::Done(0))));
-
-                if left_ok || right_ok {
-                    // Cancel the OTHER branch's pending/running leaves.
-                    let cancel_range = if left_ok {
-                        right_offset..right_offset + right_count
-                    } else {
-                        offset..offset + left_count
-                    };
-                    for i in cancel_range {
-                        if !statuses.get(&i).is_none_or(|s| s.is_terminal()) {
-                            cancel.push(i);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Check whether every leaf in the subtree has reached a terminal state.
-fn all_leaves_terminal(
-    node: &ChainNode,
-    offset: usize,
-    statuses: &HashMap<usize, LeafStatus>,
-) -> bool {
-    match node {
-        ChainNode::Leaf(_) => matches!(
-            statuses.get(&offset),
-            Some(LeafStatus::Done(_) | LeafStatus::Failed(_) | LeafStatus::Cancelled)
-        ),
-        ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
-            let left_count = leaf_count(left);
-            all_leaves_terminal(left, offset, statuses)
-                && all_leaves_terminal(right, offset + left_count, statuses)
-        }
-    }
-}
-
-fn aggregate_chain_exit_code(chain: &ChainState) -> i32 {
-    let mut last = 0;
-    for idx in 0..leaf_count(&chain.node) {
-        match chain.leaf_status.get(&idx) {
-            Some(LeafStatus::Done(code)) => last = *code,
-            Some(LeafStatus::Failed(code)) => return *code,
-            Some(LeafStatus::Cancelled) => return EXIT_CODE_UNAVAILABLE,
-            Some(LeafStatus::Pending | LeafStatus::Running) | None => return EXIT_CODE_UNAVAILABLE,
-        }
-    }
-    last
-}
-
 fn chain_final_scope(chain: &ChainState, state: &SchedulerState) -> Option<ScopeHash> {
-    (0..leaf_count(&chain.node)).rev().find_map(|idx| {
+    (0..chain.node.leaf_count()).rev().find_map(|idx| {
         chain
             .leaf_jobs
             .get(&idx)
             .and_then(|job_id| state.jobs.get(job_id))
             .and_then(|entry| entry.end_scope.or(entry.start_scope))
     })
-}
-
-/// Check whether every leaf in the subtree succeeded (exit code 0).
-fn all_leaves_succeeded(
-    node: &ChainNode,
-    offset: usize,
-    statuses: &HashMap<usize, LeafStatus>,
-) -> bool {
-    match node {
-        ChainNode::Leaf(_) => matches!(statuses.get(&offset), Some(LeafStatus::Done(0))),
-        ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
-            let left_count = leaf_count(left);
-            all_leaves_succeeded(left, offset, statuses)
-                && all_leaves_succeeded(right, offset + left_count, statuses)
-        }
-    }
-}
-
-/// Mark all pending leaves in the subtree as ready.
-fn mark_ready(
-    node: &ChainNode,
-    offset: usize,
-    statuses: &HashMap<usize, LeafStatus>,
-    ready: &mut Vec<usize>,
-) {
-    match node {
-        ChainNode::Leaf(_) => {
-            if matches!(statuses.get(&offset), Some(LeafStatus::Pending) | None) {
-                ready.push(offset);
-            }
-        }
-        ChainNode::Serial { left, .. } => {
-            // Only the left side is initially ready.
-            mark_ready(left, offset, statuses, ready);
-        }
-        ChainNode::Parallel { left, right, .. } => {
-            let left_count = leaf_count(left);
-            mark_ready(left, offset, statuses, ready);
-            mark_ready(right, offset + left_count, statuses, ready);
-        }
-    }
-}
-
-/// Mark all pending leaves in the subtree as cancelled.
-fn mark_cancelled(
-    node: &ChainNode,
-    offset: usize,
-    statuses: &HashMap<usize, LeafStatus>,
-    cancel: &mut Vec<usize>,
-) {
-    match node {
-        ChainNode::Leaf(_) => {
-            if matches!(statuses.get(&offset), Some(LeafStatus::Pending) | None) {
-                cancel.push(offset);
-            }
-        }
-        ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
-            let left_count = leaf_count(left);
-            mark_cancelled(left, offset, statuses, cancel);
-            mark_cancelled(right, offset + left_count, statuses, cancel);
-        }
-    }
 }
 
 async fn publish_job_created(
@@ -1993,15 +1701,16 @@ async fn set_job_terminal_state(
             persist_error,
         };
     };
-    let (newly_ready, to_cancel) = advance_chain(&chain.node, leaf_idx, &chain.leaf_status);
+    let transition = advance_chain(&chain.node, leaf_idx, &chain.leaf_status);
     TerminalStateOutcome {
         chain_advance: Some(ChainAdvance {
             chain_id,
-            newly_ready: newly_ready
+            newly_ready: transition
+                .newly_ready
                 .into_iter()
                 .map(|idx| (idx, next_scope))
                 .collect(),
-            to_cancel,
+            to_cancel: transition.to_cancel,
         }),
         persist_error,
     }
@@ -2952,11 +2661,11 @@ async fn process_chain_advance(
     publish_chain_progress(io.sys, state, chain_id).await;
 
     if let Some(chain) = state.chains.get(&chain_id)
-        && all_leaves_terminal(&chain.node, 0, &chain.leaf_status)
+        && is_chain_terminal(&chain.node, &chain.leaf_status)
     {
         outcome.completed_chain = build_chain_info(state, chain_id);
         let completion = ChainCompletion {
-            exit_code: aggregate_chain_exit_code(chain),
+            exit_code: aggregate_chain_exit_code(&chain.node, &chain.leaf_status),
             end_scope: chain_final_scope(chain, state),
         };
         let exit_code = completion.exit_code;

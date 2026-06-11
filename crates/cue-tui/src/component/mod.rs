@@ -9,7 +9,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
-use crate::app::AppMsg;
+use crate::message::AppMsg;
 
 /// A self-contained UI panel that owns its local state.
 ///

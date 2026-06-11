@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::Component;
 use crate::ansi;
-use crate::app::AppMsg;
+use crate::message::AppMsg;
 
 // ── Card types ──
 
@@ -148,7 +148,7 @@ impl MainView {
     }
 
     pub(crate) fn card_at_point(&self, area: Rect, point: Rect) -> Option<usize> {
-        if !crate::app::contains(area, point) {
+        if !crate::geometry::contains(area, point) {
             return None;
         }
 
@@ -169,7 +169,7 @@ impl MainView {
             }
             y -= h;
             let card_area = Rect::new(area.x, y, area.width, h);
-            if crate::app::contains(card_area, point) {
+            if crate::geometry::contains(card_area, point) {
                 return Some(idx);
             }
             if y <= area.y {

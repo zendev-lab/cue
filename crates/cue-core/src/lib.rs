@@ -4,6 +4,7 @@
 //! by both the daemon (cued) and clients (cue-tui, cue-cli). It contains no
 //! daemon runtime or I/O logic.
 
+pub mod chain;
 pub mod command;
 pub mod command_spec;
 pub mod cron;
