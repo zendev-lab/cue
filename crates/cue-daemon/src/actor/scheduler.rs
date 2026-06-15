@@ -14,6 +14,7 @@ use cue_core::chain::{
     LeafStatus, advance_chain, aggregate_chain_exit_code, flatten_leaves, initially_ready,
     is_chain_terminal,
 };
+use cue_core::command::ModeParams;
 use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{CronSchedule, CronStatus, parse_schedule_text};
 use cue_core::ipc::{
@@ -61,16 +62,10 @@ struct ChainState {
     leaf_status: HashMap<usize, LeafStatus>,
     scope_hash: ScopeHash,
     pipeline_text: String,
-    /// Explicit working directory override for all jobs in this chain.
-    cwd_override: Option<std::path::PathBuf>,
+    /// Process execution options shared by jobs in this chain.
+    process: ProcessJobContext,
     /// Whether scope-transform leaves may derive a new scope for later leaves.
     scope_enabled: bool,
-    /// Whether the wrapper binary is enabled for this chain's jobs.
-    wrapper_enabled: bool,
-    /// Whether to allocate a PTY for spawned leaf commands.
-    pty_enabled: bool,
-    /// Client that should receive output for spawned leaves directly.
-    direct_output_client: Option<u64>,
     /// Resource needs declared via `:run(need.X=Y)` mode params. Reserved
     /// per-leaf at admission time and released on each leaf's terminal
     /// transition. Empty `Need` short-circuits the registry path entirely.
@@ -1478,20 +1473,6 @@ async fn retry_pending_resource_admissions(state: &mut SchedulerState, io: Sched
     }
 }
 
-fn process_job_options(
-    cwd_override: Option<std::path::PathBuf>,
-    wrapper_enabled: bool,
-    pty_enabled: bool,
-    direct_output_client: Option<u64>,
-) -> ProcessJobOptions {
-    ProcessJobOptions {
-        cwd_override,
-        wrapper_enabled,
-        pty_enabled,
-        direct_output_client,
-    }
-}
-
 async fn kill_process_job(sys: &ActorSystem, job_id: JobId) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     sys.process_mgr
@@ -1509,19 +1490,20 @@ struct TerminalStateUpdate {
     advance_chain: bool,
 }
 
-struct ChainSpawnOptions {
+#[derive(Clone)]
+struct ProcessJobContext {
     cwd_override: Option<std::path::PathBuf>,
-    scope_enabled: bool,
+    sandbox: Option<crate::sandbox::SandboxConfig>,
     wrapper_enabled: bool,
     pty_enabled: bool,
     direct_output_client: Option<u64>,
-    needs: Need,
 }
 
-impl ChainSpawnOptions {
+impl ProcessJobContext {
     fn process_job_options(&self) -> ProcessJobOptions {
         ProcessJobOptions {
             cwd_override: self.cwd_override.clone(),
+            sandbox: self.sandbox.clone(),
             wrapper_enabled: self.wrapper_enabled,
             pty_enabled: self.pty_enabled,
             direct_output_client: self.direct_output_client,
@@ -1529,10 +1511,71 @@ impl ChainSpawnOptions {
     }
 }
 
+struct ChainExecutionOptions {
+    process: ProcessJobContext,
+    scope_enabled: bool,
+    needs: Need,
+}
+
+impl ChainExecutionOptions {
+    fn from_params(
+        params: &ModeParams,
+        state: &SchedulerState,
+        config: &Config,
+        direct_output_client: Option<u64>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            process: ProcessJobContext {
+                cwd_override: params.cwd(),
+                sandbox: crate::sandbox::SandboxConfig::from_params(params)?,
+                wrapper_enabled: params
+                    .wrapper_enabled()
+                    .unwrap_or_else(|| state.wrapper_enabled(config)),
+                pty_enabled: params.pty_enabled(),
+                direct_output_client,
+            },
+            scope_enabled: params.scope().unwrap_or(false),
+            needs: params.needs(),
+        })
+    }
+
+    fn from_cron_entry(entry: &CronEntry) -> Self {
+        Self {
+            process: ProcessJobContext {
+                cwd_override: entry.cwd_override.clone(),
+                sandbox: None,
+                wrapper_enabled: entry.wrapper_enabled,
+                pty_enabled: true,
+                direct_output_client: None,
+            },
+            scope_enabled: entry.scope_enabled,
+            needs: entry.needs.clone(),
+        }
+    }
+
+    fn retry_default(state: &SchedulerState, config: &Config) -> Self {
+        Self {
+            process: ProcessJobContext {
+                cwd_override: None,
+                sandbox: None,
+                wrapper_enabled: state.wrapper_enabled(config),
+                pty_enabled: true,
+                direct_output_client: None,
+            },
+            scope_enabled: false,
+            needs: Need::new(),
+        }
+    }
+
+    fn process_job_options(&self) -> ProcessJobOptions {
+        self.process.process_job_options()
+    }
+}
+
 struct SpawnChainRequest {
     chain: ChainNode,
     scope_hash: ScopeHash,
-    options: ChainSpawnOptions,
+    options: ChainExecutionOptions,
     warnings: Vec<String>,
     retain_completed_chain: bool,
 }
@@ -1548,8 +1591,17 @@ struct ChainAdvanceRequest {
     newly_ready: Vec<(usize, ScopeHash)>,
     to_cancel: Vec<usize>,
     capture_first: usize,
-    cwd_override: Option<std::path::PathBuf>,
     retain_completed_chain: bool,
+}
+
+impl ChainExecutionOptions {
+    fn from_chain(chain: &ChainState) -> Self {
+        Self {
+            process: chain.process.clone(),
+            scope_enabled: chain.scope_enabled,
+            needs: chain.needs.clone(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1817,10 +1869,7 @@ async fn fire_due_crons(
         let scope_hash = entry.scope_hash;
         let schedule = entry.schedule.clone();
         let is_oneshot = schedule.is_oneshot();
-        let cwd_override = entry.cwd_override.clone();
-        let scope_enabled = entry.scope_enabled;
-        let wrapper_enabled = entry.wrapper_enabled;
-        let needs = entry.needs.clone();
+        let options = ChainExecutionOptions::from_cron_entry(entry);
 
         info!(%cron_id, "scheduler: cron triggered");
         let warnings = match check_chain_guardrails(&chain, config) {
@@ -1836,14 +1885,7 @@ async fn fire_due_crons(
             SpawnChainRequest {
                 chain,
                 scope_hash,
-                options: ChainSpawnOptions {
-                    cwd_override,
-                    scope_enabled,
-                    wrapper_enabled,
-                    pty_enabled: true,
-                    direct_output_client: None,
-                    needs,
-                },
+                options,
                 warnings,
                 retain_completed_chain: false,
             },
@@ -2251,11 +2293,8 @@ async fn spawn_chain(
         leaf_status,
         scope_hash,
         pipeline_text: chain_text,
-        cwd_override: options.cwd_override.clone(),
+        process: options.process.clone(),
         scope_enabled: options.scope_enabled,
-        wrapper_enabled: options.wrapper_enabled,
-        pty_enabled: options.pty_enabled,
-        direct_output_client: options.direct_output_client,
         needs: options.needs.clone(),
     };
     state.chains.insert(chain_id, chain_state);
@@ -2270,7 +2309,6 @@ async fn spawn_chain(
                 .collect(),
             to_cancel: Vec::new(),
             capture_first: ready_indices.len(),
-            cwd_override: options.cwd_override,
             retain_completed_chain,
         },
         state,
@@ -2337,17 +2375,12 @@ async fn handle_job_finished(
     .await;
     if let Some(chain_advance) = outcome.chain_advance {
         let chain_id = chain_advance.chain_id;
-        let cwd_override = state
-            .chains
-            .get(&chain_id)
-            .and_then(|c| c.cwd_override.clone());
         let advance = process_chain_advance(
             ChainAdvanceRequest {
                 chain_id,
                 newly_ready: chain_advance.newly_ready,
                 to_cancel: chain_advance.to_cancel,
                 capture_first: 0,
-                cwd_override,
                 retain_completed_chain: false,
             },
             state,
@@ -2373,17 +2406,12 @@ async fn apply_user_terminal_job_update(
     let mut persist_error = outcome.persist_error.clone();
     if let Some(chain_advance) = outcome.chain_advance {
         let chain_id = chain_advance.chain_id;
-        let cwd_override = state
-            .chains
-            .get(&chain_id)
-            .and_then(|c| c.cwd_override.clone());
         let advance = process_chain_advance(
             ChainAdvanceRequest {
                 chain_id,
                 newly_ready: chain_advance.newly_ready,
                 to_cancel: chain_advance.to_cancel,
                 capture_first: 0,
-                cwd_override,
                 retain_completed_chain: false,
             },
             state,
@@ -2412,7 +2440,6 @@ async fn process_chain_advance(
         newly_ready,
         to_cancel,
         capture_first,
-        cwd_override,
         retain_completed_chain,
     } = request;
     let mut outcome = ChainAdvanceOutcome::default();
@@ -2420,17 +2447,13 @@ async fn process_chain_advance(
         outcome.record_persist_error(error);
     }
 
-    let (leaves, wrapper_enabled, scope_enabled, pty_enabled, direct_output_client, needs) = {
+    let (leaves, chain_context) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return outcome;
         };
         (
             flatten_leaves(&chain.node),
-            chain.wrapper_enabled,
-            chain.scope_enabled,
-            chain.pty_enabled,
-            chain.direct_output_client,
-            chain.needs.clone(),
+            ChainExecutionOptions::from_chain(chain),
         )
     };
 
@@ -2479,7 +2502,8 @@ async fn process_chain_advance(
         )
         .await;
 
-        match scope_enabled
+        match chain_context
+            .scope_enabled
             .then(|| scope_transform_from_command(leaves[idx].command()))
             .transpose()
         {
@@ -2537,13 +2561,8 @@ async fn process_chain_advance(
                 }
             }
             Ok(None) => {
-                let proc_options = process_job_options(
-                    cwd_override.clone(),
-                    wrapper_enabled,
-                    pty_enabled,
-                    direct_output_client,
-                );
-                match admit_resource_scope(io.sys, jid, start_scope, &needs).await {
+                let proc_options = chain_context.process_job_options();
+                match admit_resource_scope(io.sys, jid, start_scope, &chain_context.needs).await {
                     Ok(ResourceAdmission::Pending(reason)) => {
                         if let Some(chain) = state.chains.get_mut(&chain_id) {
                             chain.leaf_status.insert(idx, LeafStatus::Pending);
@@ -2556,7 +2575,7 @@ async fn process_chain_advance(
                                 plan: leaves[idx].plan.clone(),
                                 base_scope: start_scope,
                                 options: proc_options,
-                                needs: needs.clone(),
+                                needs: chain_context.needs.clone(),
                             },
                         );
                         debug!(%chain_id, %jid, leaf_idx = idx, "scheduler: chain leaf waiting for resources");
@@ -3281,25 +3300,20 @@ async fn handle_command_with_scope(
                 Ok(warnings) => warnings,
                 Err(reason) => return ResponsePayload::err(error_code::BLOCKED, reason),
             };
-            let cwd_override = params.cwd();
-            let scope_enabled = params.scope().unwrap_or(false);
-            let wrapper_enabled = params
-                .wrapper_enabled()
-                .unwrap_or_else(|| state.wrapper_enabled(config));
-            let pty_enabled = params.pty_enabled();
-            let needs = params.needs();
+            let options = match ChainExecutionOptions::from_params(
+                &params,
+                state,
+                config,
+                context.direct_output_client,
+            ) {
+                Ok(options) => options,
+                Err(reason) => return ResponsePayload::err(error_code::INVALID_SYNTAX, reason),
+            };
             spawn_chain(
                 SpawnChainRequest {
                     chain,
                     scope_hash,
-                    options: ChainSpawnOptions {
-                        cwd_override,
-                        scope_enabled,
-                        wrapper_enabled,
-                        pty_enabled,
-                        direct_output_client: context.direct_output_client,
-                        needs,
-                    },
+                    options,
                     warnings,
                     retain_completed_chain: context.scope_override.is_some(),
                 },
@@ -3330,6 +3344,10 @@ async fn handle_command_with_scope(
                     format!("cannot compute next trigger for schedule: {display_text}"),
                 );
             };
+            let options = match ChainExecutionOptions::from_params(&params, state, config, None) {
+                Ok(options) => options,
+                Err(reason) => return ResponsePayload::err(error_code::INVALID_SYNTAX, reason),
+            };
             let entry = CronEntry {
                 cron_id,
                 schedule,
@@ -3337,12 +3355,10 @@ async fn handle_command_with_scope(
                 scope_hash,
                 status: CronStatus::Scheduled,
                 next_trigger,
-                cwd_override: params.cwd(),
-                scope_enabled: params.scope().unwrap_or(false),
-                wrapper_enabled: params
-                    .wrapper_enabled()
-                    .unwrap_or_else(|| state.wrapper_enabled(config)),
-                needs: params.needs(),
+                cwd_override: options.process.cwd_override,
+                scope_enabled: options.scope_enabled,
+                wrapper_enabled: options.process.wrapper_enabled,
+                needs: options.needs,
             };
             if let Err(error) = persist_cron_entry(db, &entry).await {
                 return ResponsePayload::err(error_code::INTERNAL, error.to_string());
@@ -3909,19 +3925,11 @@ async fn handle_command_with_scope(
             let delay = std::time::Duration::from_millis(500);
             info!(%job_id, ?delay, "scheduler: retrying job with delay");
             tokio::time::sleep(delay).await;
-            let wrapper_enabled = state.wrapper_enabled(config);
             spawn_chain(
                 SpawnChainRequest {
                     chain,
                     scope_hash: start_scope,
-                    options: ChainSpawnOptions {
-                        cwd_override: None,
-                        scope_enabled: false,
-                        wrapper_enabled,
-                        pty_enabled: true,
-                        direct_output_client: None,
-                        needs: Need::new(),
-                    },
+                    options: ChainExecutionOptions::retry_default(state, config),
                     warnings: Vec::new(),
                     retain_completed_chain: false,
                 },
@@ -4959,12 +4967,15 @@ mod tests {
         test_chain_spawn_with_options(
             chain,
             scope_hash,
-            ChainSpawnOptions {
-                cwd_override: None,
+            ChainExecutionOptions {
+                process: ProcessJobContext {
+                    cwd_override: None,
+                    sandbox: None,
+                    wrapper_enabled: false,
+                    pty_enabled: true,
+                    direct_output_client: None,
+                },
                 scope_enabled: false,
-                wrapper_enabled: false,
-                pty_enabled: true,
-                direct_output_client: None,
                 needs: Need::new(),
             },
         )
@@ -4984,12 +4995,15 @@ mod tests {
         test_chain_spawn_with_options(
             chain,
             scope_hash,
-            ChainSpawnOptions {
-                cwd_override: None,
+            ChainExecutionOptions {
+                process: ProcessJobContext {
+                    cwd_override: None,
+                    sandbox: None,
+                    wrapper_enabled: false,
+                    pty_enabled: true,
+                    direct_output_client: None,
+                },
                 scope_enabled: true,
-                wrapper_enabled: false,
-                pty_enabled: true,
-                direct_output_client: None,
                 needs: Need::new(),
             },
         )
@@ -4998,7 +5012,7 @@ mod tests {
     fn test_chain_spawn_with_options(
         chain: ChainNode,
         scope_hash: ScopeHash,
-        options: ChainSpawnOptions,
+        options: ChainExecutionOptions,
     ) -> SpawnChainRequest {
         SpawnChainRequest {
             chain,

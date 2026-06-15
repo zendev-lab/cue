@@ -40,6 +40,8 @@ pub(crate) const CLIENT_EVENT_CAP: usize = 64;
 pub(crate) struct ProcessJobOptions {
     /// Override the scope's cwd for this specific invocation.
     pub cwd_override: Option<std::path::PathBuf>,
+    /// Optional per-run filesystem sandbox configuration.
+    pub sandbox: Option<crate::sandbox::SandboxConfig>,
     /// Whether the wrapper binary should be prepended to each segment.
     pub wrapper_enabled: bool,
     /// Whether to allocate a PTY. `false` uses pipes (stdout/stderr).

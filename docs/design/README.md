@@ -75,6 +75,7 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ```
 :run(cwd=/repo, pty=false) cargo test
 :run(need.gpu=1, need.gpu_mem=24GiB) python train.py
+:run(sandbox=overlay, sandbox.upper=tmpfs) cargo test
 :cron(cwd=/repo) every 5m cargo clippy
 ```
 
@@ -83,7 +84,11 @@ execution behavior. They override `daemon.toml` defaults. Only launcher-style
 commands support mode params: `:run` and `:cron`; supported keys are declared
 per command so unsupported keys fail during parsing instead of being ignored.
 Resource needs use the `need.<resource>=<quantity>` namespace; resource keys are
-owned by configured providers rather than hardcoded in core.
+owned by configured providers rather than hardcoded in core. `:run` can opt into
+an overlayfs sandbox with `sandbox=overlay`; by default its upperdir is a
+runtime directory, and `sandbox.upper=tmpfs` mounts that upperdir on tmpfs for
+ephemeral in-memory writes. Overlay sandboxing is Linux-only and intentionally
+not persisted for `:cron` entries.
 
 ## Scope Model
 

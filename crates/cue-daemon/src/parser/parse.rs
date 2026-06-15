@@ -1251,6 +1251,22 @@ mod tests {
     }
 
     #[test]
+    fn mode_params_accept_overlay_sandbox() {
+        let ast = Parser::parse(":run(sandbox=overlay,sandbox.upper=tmpfs) cargo test").unwrap();
+        match ast {
+            Ast::Command { mode_params, .. } => {
+                let map: std::collections::BTreeMap<_, _> = mode_params
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect();
+                assert_eq!(map.get("sandbox"), Some(&Value::Str("overlay".into())));
+                assert_eq!(map.get("sandbox.upper"), Some(&Value::Str("tmpfs".into())));
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
     fn mode_params_need_empty_suffix_is_rejected() {
         let err =
             Parser::parse(":run(need.=1) cargo test").expect_err("empty key suffix should fail");
