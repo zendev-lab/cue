@@ -3,14 +3,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use toml::Value;
 
 use crate::client::default_socket_path;
 use crate::config_paths::{client_config_paths, read_client_config_sources};
-use crate::host_discovery::{HostDiscoveryConfig, detected_configured_hosts};
-use crate::ssh_config::detected_ssh_hosts;
-
-const CLIENT_ROOT_SECTIONS: &[&str] = &["extensions", "transport"];
+use crate::host_discovery::HostDiscoveryConfig;
+use crate::transport_discovery::detected_transport_hosts;
+use crate::transport_schema::{
+    LOCAL_PROFILE_NAME, SSH_DESTINATION_FIELD, SSH_GATEWAY_COMMAND_FIELD, SSH_START_COMMAND_FIELD,
+    UNIX_SOCKET_FIELD, default_auto_detect_ssh, default_gateway_command, default_profile_name,
+    default_start_command, transport_profile_field_path, transport_profile_path,
+    validate_client_config_root_sections, validate_default_profile_name, validate_profile_name,
+    validate_socket_path, validate_trimmed_non_empty,
+};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct TransportConfigFile {
@@ -57,12 +61,8 @@ impl TransportConfig {
     {
         self.validate()?;
 
-        if let Some(socket_path) = socket_override {
-            validate_socket_path("CUE_SOCKET", &socket_path)?;
-            return Ok(ResolvedTransport::Unix {
-                profile_name: "env:CUE_SOCKET".into(),
-                socket_path,
-            });
+        if let Some(transport) = resolve_socket_override(socket_override)? {
+            return Ok(transport);
         }
 
         self.resolve_profile_with_detection_after_validate(&self.default_profile, detect_hosts)
@@ -74,17 +74,7 @@ impl TransportConfig {
         socket_override: Option<PathBuf>,
         detected_hosts: BTreeSet<String>,
     ) -> Result<ResolvedTransport> {
-        self.validate()?;
-
-        if let Some(socket_path) = socket_override {
-            validate_socket_path("CUE_SOCKET", &socket_path)?;
-            return Ok(ResolvedTransport::Unix {
-                profile_name: "env:CUE_SOCKET".into(),
-                socket_path,
-            });
-        }
-
-        self.resolve_profile_with_detected(&self.default_profile, &detected_hosts)
+        self.resolve_transport_with_detection(socket_override, || Ok(detected_hosts))
     }
 
     pub fn resolve_profile(&self, profile_name: &str) -> Result<ResolvedTransport> {
@@ -119,17 +109,6 @@ impl TransportConfig {
         }
 
         bail!("unknown client transport profile `{profile_name}`")
-    }
-
-    #[cfg(test)]
-    fn resolve_profile_with_detected(
-        &self,
-        profile_name: &str,
-        detected_hosts: &BTreeSet<String>,
-    ) -> Result<ResolvedTransport> {
-        self.validate()?;
-        self.resolve_profile_from_detected(profile_name, detected_hosts)
-            .ok_or_else(|| anyhow::anyhow!("unknown client transport profile `{profile_name}`"))
     }
 
     fn detected_hosts(&self) -> Result<BTreeSet<String>> {
@@ -169,28 +148,21 @@ impl TransportConfig {
     ) -> BTreeMap<String, TransportProfile> {
         let mut profiles = self.profiles.clone();
 
-        match profiles.get("local") {
+        match profiles.get(LOCAL_PROFILE_NAME) {
             Some(TransportProfile::Unix(_)) => {}
             _ => {
-                profiles.insert(
-                    "local".into(),
-                    TransportProfile::Unix(UnixProfile::default()),
-                );
+                profiles.insert(LOCAL_PROFILE_NAME.into(), local_unix_profile());
             }
         }
 
         if self.auto_detect_ssh {
             for host in detected_hosts {
-                if host == "local" {
+                if host == LOCAL_PROFILE_NAME {
                     continue;
                 }
-                profiles.entry(host.clone()).or_insert_with(|| {
-                    TransportProfile::Ssh(SshProfile {
-                        destination: host.clone(),
-                        gateway_command: default_gateway_command(),
-                        start_command: default_start_command(),
-                    })
-                });
+                profiles
+                    .entry(host.clone())
+                    .or_insert_with(|| detected_ssh_profile(host));
             }
         }
 
@@ -199,8 +171,14 @@ impl TransportConfig {
 
     pub fn validate(&self) -> Result<()> {
         validate_default_profile_name(&self.default_profile)?;
-        if matches!(self.profiles.get("local"), Some(TransportProfile::Ssh(_))) {
-            bail!("transport.profiles.local is reserved for unix transport");
+        if matches!(
+            self.profiles.get(LOCAL_PROFILE_NAME),
+            Some(TransportProfile::Ssh(_))
+        ) {
+            bail!(
+                "{} is reserved for unix transport",
+                transport_profile_path(LOCAL_PROFILE_NAME)
+            );
         }
         for (name, profile) in &self.profiles {
             validate_profile_name(name)?;
@@ -213,71 +191,39 @@ impl TransportConfig {
     }
 }
 
-pub(crate) fn validate_default_profile_name(name: &str) -> Result<()> {
-    validate_name_boundary(
-        name,
-        "transport.default_profile must not be empty",
-        "transport.default_profile must not have leading or trailing whitespace",
-    )
-}
-
-pub(crate) fn validate_profile_name(name: &str) -> Result<()> {
-    validate_name_boundary(
-        name,
-        "transport profile names must not be empty",
-        "transport profile names must not have leading or trailing whitespace",
-    )
-}
-
-fn validate_name_boundary(name: &str, empty_message: &str, padded_message: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("{empty_message}");
-    }
-    if name.trim() != name {
-        bail!("{padded_message}");
-    }
-    Ok(())
+fn resolve_socket_override(socket_override: Option<PathBuf>) -> Result<Option<ResolvedTransport>> {
+    let Some(socket_path) = socket_override else {
+        return Ok(None);
+    };
+    validate_socket_path("CUE_SOCKET", &socket_path)?;
+    Ok(Some(ResolvedTransport::Unix {
+        profile_name: "env:CUE_SOCKET".into(),
+        socket_path,
+    }))
 }
 
 fn validate_unix_profile(name: &str, profile: &UnixProfile) -> Result<()> {
     if let Some(socket) = &profile.socket {
-        validate_socket_path(&format!("transport.profiles.{name}.socket"), socket)?;
+        validate_socket_path(
+            &transport_profile_field_path(name, UNIX_SOCKET_FIELD),
+            socket,
+        )?;
     }
     Ok(())
 }
 
-fn validate_socket_path(field: &str, socket: &Path) -> Result<()> {
-    let Some(socket) = socket.to_str() else {
-        bail!("{field} must be valid UTF-8");
-    };
-    validate_name_boundary(
-        socket,
-        &format!("{field} must not be empty"),
-        &format!("{field} must not have leading or trailing whitespace"),
-    )
+fn validate_ssh_profile(name: &str, profile: &SshProfile) -> Result<()> {
+    validate_ssh_field(name, SSH_DESTINATION_FIELD, &profile.destination)?;
+    validate_ssh_field(name, SSH_GATEWAY_COMMAND_FIELD, &profile.gateway_command)?;
+    validate_ssh_field(name, SSH_START_COMMAND_FIELD, &profile.start_command)
 }
 
-fn validate_ssh_profile(name: &str, profile: &SshProfile) -> Result<()> {
-    validate_name_boundary(
-        &profile.destination,
-        &format!("transport.profiles.{name}.destination must not be empty"),
-        &format!(
-            "transport.profiles.{name}.destination must not have leading or trailing whitespace"
-        ),
-    )?;
-    validate_name_boundary(
-        &profile.gateway_command,
-        &format!("transport.profiles.{name}.gateway_command must not be empty"),
-        &format!(
-            "transport.profiles.{name}.gateway_command must not have leading or trailing whitespace"
-        ),
-    )?;
-    validate_name_boundary(
-        &profile.start_command,
-        &format!("transport.profiles.{name}.start_command must not be empty"),
-        &format!(
-            "transport.profiles.{name}.start_command must not have leading or trailing whitespace"
-        ),
+fn validate_ssh_field(name: &str, field: &str, value: &str) -> Result<()> {
+    let path = transport_profile_field_path(name, field);
+    validate_trimmed_non_empty(
+        value,
+        &format!("{path} must not be empty"),
+        &format!("{path} must not have leading or trailing whitespace"),
     )
 }
 
@@ -346,54 +292,20 @@ pub fn parse_transport_config(text: &str, path: &Path) -> Result<TransportConfig
     Ok(file.transport)
 }
 
-pub(crate) fn detected_transport_hosts(
-    discovery: &HostDiscoveryConfig,
-) -> Result<BTreeSet<String>> {
-    let mut hosts = detected_ssh_hosts()?;
-    hosts.extend(detected_configured_hosts(discovery)?);
-    Ok(hosts)
+fn local_unix_profile() -> TransportProfile {
+    TransportProfile::Unix(UnixProfile::default())
 }
 
-pub(crate) fn default_profile_name() -> String {
-    "local".into()
-}
-
-fn default_auto_detect_ssh() -> bool {
-    true
-}
-
-pub(crate) fn default_gateway_command() -> String {
-    "cued gateway --stdio".into()
-}
-
-pub(crate) fn default_start_command() -> String {
-    "cued start".into()
+fn detected_ssh_profile(host: &str) -> TransportProfile {
+    TransportProfile::Ssh(SshProfile {
+        destination: host.to_string(),
+        gateway_command: default_gateway_command(),
+        start_command: default_start_command(),
+    })
 }
 
 fn default_profiles() -> BTreeMap<String, TransportProfile> {
-    BTreeMap::from([(
-        "local".into(),
-        TransportProfile::Unix(UnixProfile::default()),
-    )])
-}
-
-pub fn validate_client_config_root_sections(text: &str, path: &Path) -> Result<()> {
-    let value: Value = toml::from_str(text)
-        .with_context(|| format!("parse config root sections {}", path.display()))?;
-    let Some(table) = value.as_table() else {
-        bail!("config root must be a TOML table");
-    };
-    for key in table.keys() {
-        if !CLIENT_ROOT_SECTIONS.contains(&key.as_str()) {
-            bail!(
-                "unknown top-level client config section `{key}` in {}; supported top-level sections: {}",
-                path.display(),
-                CLIENT_ROOT_SECTIONS.join(", ")
-            );
-        }
-    }
-
-    Ok(())
+    BTreeMap::from([(LOCAL_PROFILE_NAME.into(), local_unix_profile())])
 }
 
 #[cfg(test)]

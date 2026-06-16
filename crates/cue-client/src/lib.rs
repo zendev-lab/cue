@@ -11,6 +11,8 @@ pub mod script_runner;
 mod ssh_config;
 mod ssh_transport;
 mod transport_config;
+mod transport_discovery;
+mod transport_schema;
 mod transport_settings;
 pub mod version_check;
 
@@ -31,8 +33,8 @@ pub use ssh_transport::{connect_ssh_transport, transport_connector};
 pub use transport_config::{
     ResolvedTransport, SshProfile, TransportConfig, TransportProfile, UnixProfile,
     load_transport_config, load_transport_config_from_sources, parse_transport_config,
-    validate_client_config_root_sections,
 };
+pub use transport_schema::validate_client_config_root_sections;
 pub use transport_settings::{
     TransportProfileKind, TransportProfileSource, TransportProfileSummary,
     TransportSettingsSnapshot, load_transport_settings_snapshot,
