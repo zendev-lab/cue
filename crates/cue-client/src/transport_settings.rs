@@ -1264,8 +1264,8 @@ default_profile = "local"
 [transport.profiles.local]
 transport = "unix"
 
-[weft]
-socket_path = "./weft.sock"
+[extensions]
+path_lookup = true
 "#,
         )
         .unwrap();
@@ -1282,11 +1282,11 @@ socket_path = "./weft.sock"
         );
         assert_eq!(
             document
-                .get("weft")
+                .get("extensions")
                 .and_then(Value::as_table)
-                .and_then(|weft| weft.get("socket_path"))
-                .and_then(Value::as_str),
-            Some("./weft.sock")
+                .and_then(|extensions| extensions.get("path_lookup"))
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 

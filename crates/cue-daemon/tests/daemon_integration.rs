@@ -2903,7 +2903,7 @@ async fn test_scopes_returns_scope_list() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_config_show_returns_weft_info() {
+async fn test_config_show_returns_daemon_info() {
     run_daemon_test(async {
         let env = TestEnv::new("config-show");
         let mut child = env.spawn_daemon();
@@ -2922,8 +2922,8 @@ async fn test_config_show_returns_weft_info() {
         match resp {
             ResponsePayload::Ok(OkPayload::EvalText { text }) => {
                 assert!(
-                    text.contains("weft.socket_path"),
-                    "expected 'weft.socket_path' in config output, got: {text:?}"
+                    text.contains("retention.max_job_history"),
+                    "expected daemon config output, got: {text:?}"
                 );
             }
             other => panic!("expected EvalText config response, got {other:?}"),

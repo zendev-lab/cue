@@ -4696,9 +4696,28 @@ fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
     lines.join("\n")
 }
 
-/// Format the active config as human-readable text.
+/// Format the active daemon config as human-readable text.
 fn format_config_text(config: &Config) -> String {
-    format!("weft.socket_path = {}", config.weft.socket_path.display())
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "retention.max_job_history = {}",
+        config.retention.max_job_history
+    ));
+    lines.push(format!(
+        "retention.max_script_runs = {}",
+        config.retention.max_script_runs
+    ));
+    lines.push(format!(
+        "resources.nvidia.enabled = {}",
+        config.resources.nvidia.enabled
+    ));
+    lines.push(format!("wrapper.enabled = {}", config.wrapper.enabled));
+    lines.push(format!("wrapper.binary = {:?}", config.wrapper.binary));
+    lines.push(format!(
+        "wrapper.allowlist.commands = [{}]",
+        config.wrapper.allowlist.commands.join(", ")
+    ));
+    lines.join("\n")
 }
 
 async fn read_job_output(
