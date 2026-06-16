@@ -164,6 +164,7 @@ impl Scope {
 mod tests {
     use super::*;
     use crate::resource::ResourceQuantity;
+    use insta::assert_json_snapshot;
 
     fn test_snapshot() -> EnvSnapshot {
         let mut env = BTreeMap::new();
@@ -222,6 +223,62 @@ mod tests {
             execution: ExecutionSettings::default(),
         };
         assert_eq!(snapshot.compute_hash(), explicit.compute_hash());
+    }
+
+    #[test]
+    fn default_execution_settings_are_skipped_in_snapshot_json() {
+        assert_json_snapshot!(test_snapshot(), @r###"
+        {
+          "env": {
+            "HOME": "/home/test",
+            "PATH": "/usr/bin"
+          },
+          "cwd": "/tmp"
+        }
+        "###);
+    }
+
+    #[test]
+    fn non_default_execution_settings_snapshot_json() {
+        let mut snapshot = test_snapshot();
+        snapshot.execution = ExecutionSettings {
+            pty_enabled: Some(false),
+            needs: Need::from_pairs([
+                ("gpu", ResourceQuantity::Count(1)),
+                ("gpu_mem", ResourceQuantity::Bytes(24 * 1024 * 1024 * 1024)),
+            ]),
+            sandbox: Some(SandboxSettings {
+                mode: SandboxMode::Overlay,
+                upper: Some(SandboxUpper::Tmpfs),
+            }),
+        };
+
+        assert_json_snapshot!(snapshot, @r###"
+        {
+          "env": {
+            "HOME": "/home/test",
+            "PATH": "/usr/bin"
+          },
+          "cwd": "/tmp",
+          "execution": {
+            "pty_enabled": false,
+            "needs": {
+              "gpu": {
+                "kind": "count",
+                "value": 1
+              },
+              "gpu_mem": {
+                "kind": "bytes",
+                "value": 25769803776
+              }
+            },
+            "sandbox": {
+              "mode": "overlay",
+              "upper": "tmpfs"
+            }
+          }
+        }
+        "###);
     }
 
     #[test]

@@ -1000,6 +1000,7 @@ fn suggest_command(name: &str) -> Vec<String> {
 mod tests {
     use super::super::token::IdKind;
     use super::*;
+    use insta::assert_snapshot;
 
     fn leaf_pipeline(chain: &ChainNode) -> &Pipeline {
         match chain {
@@ -1269,6 +1270,43 @@ mod tests {
             err.message
                 .contains("mode parameter `need.gpu` is not supported by `:cron`")
         );
+    }
+
+    #[test]
+    fn mode_param_error_messages_snapshot() {
+        let cases = [
+            ("cron_need", ":cron(need.gpu=1) every 5m cargo test"),
+            ("empty_need_suffix", ":run(need.=1) cargo test"),
+            ("wrong_pty_type", ":run(pty=soon) cargo test"),
+        ];
+        let mut rendered = String::new();
+        for (name, input) in cases {
+            let err = Parser::parse(input).expect_err("case should fail");
+            rendered.push_str(name);
+            rendered.push_str("\n  kind: ");
+            rendered.push_str(&format!("{:?}", err.kind));
+            rendered.push_str("\n  message: ");
+            rendered.push_str(&err.message);
+            if !err.suggestions.is_empty() {
+                rendered.push_str("\n  suggestions: ");
+                rendered.push_str(&err.suggestions.join(", "));
+            }
+            rendered.push('\n');
+        }
+
+        assert_snapshot!(rendered, @r###"
+        cron_need
+          kind: InvalidModeParam
+          message: mode parameter `need.gpu` is not supported by `:cron`
+        empty_need_suffix
+          kind: InvalidModeParam
+          message: `need.` requires a key suffix (e.g. `need.gpu_mem=24GiB`)
+          suggestions: need.gpu=1, need.gpu_mem=24GiB
+        wrong_pty_type
+          kind: InvalidModeParam
+          message: mode parameter `pty` expects a boolean (e.g. false)
+          suggestions: pty=false
+        "###);
     }
 
     #[test]
