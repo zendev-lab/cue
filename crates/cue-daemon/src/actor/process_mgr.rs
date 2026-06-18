@@ -729,18 +729,27 @@ fn prepare_job_sandbox(
     job_id: JobId,
     snapshot: &EnvSnapshot,
     options: &ProcessJobOptions,
+    sys: &ActorSystem,
 ) -> Result<Option<crate::sandbox::PreparedSandbox>, String> {
     let Some(config) = options.sandbox.as_ref() else {
         return Ok(None);
     };
     let lower_dir = effective_cwd(snapshot, options.cwd_override.as_deref());
-    crate::sandbox::prepare(job_id, config, lower_dir)
-        .map(Some)
-        .map_err(|error| {
-            let message = format!("sandbox setup failed: {error:#}");
-            error!(%job_id, err = %message, "process_mgr: sandbox setup failed");
-            message
-        })
+    crate::sandbox::prepare(
+        job_id,
+        config,
+        lower_dir,
+        &crate::sandbox::SandboxDefaults {
+            upper_root: sys.config.sandbox.default_upper_root.clone(),
+            min_free_ratio: sys.config.sandbox.min_free_ratio,
+        },
+    )
+    .map(Some)
+    .map_err(|error| {
+        let message = format!("sandbox setup failed: {error:#}");
+        error!(%job_id, err = %message, "process_mgr: sandbox setup failed");
+        message
+    })
 }
 
 async fn prepare_job_sandbox_or_emit(
@@ -749,7 +758,7 @@ async fn prepare_job_sandbox_or_emit(
     options: &ProcessJobOptions,
     sys: &ActorSystem,
 ) -> Result<Option<crate::sandbox::PreparedSandbox>, ()> {
-    match prepare_job_sandbox(job_id, snapshot, options) {
+    match prepare_job_sandbox(job_id, snapshot, options, sys) {
         Ok(sandbox) => Ok(sandbox),
         Err(message) => {
             emit_spawn_setup_stderr(sys, job_id, &message, options.direct_output_client).await;

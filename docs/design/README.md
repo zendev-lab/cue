@@ -87,10 +87,16 @@ scope without changing the caller's session cursor. `pty`, `need.*`, and
 `sandbox.*` are per-job launch options; they are not part of scope identity.
 Resource keys are provider-owned via the `need.<resource>=<quantity>` namespace
 rather than hardcoded in core. `:run` can opt into an overlayfs workspace view
-with `sandbox=overlay` and, on Linux, `sandbox.upper=tmpfs` for ephemeral
-in-memory writes. Overlay sandboxing is a workspace view, not a security
-boundary: it does not isolate absolute paths outside the working tree, network
-access, process credentials, or inherited environment variables.
+with `sandbox=overlay`. Each sandboxed job gets its own per-job upper/work
+directories under a configurable upper root (default `/dev/shm/cue-shell-sandbox`,
+so writes land in shared memory), and on Linux `sandbox.upper=tmpfs` forces an
+ephemeral in-memory upper for that job. An explicit `sandbox.upper=<dir>` is
+treated as an upper *root*: the daemon still derives `<dir>/<job-id>/{upper,work}`
+per job so concurrent jobs never share one upperdir. Overlay sandboxing is a
+workspace view, not a security boundary: it does not isolate absolute paths
+outside the working tree, network access, process credentials, or inherited
+environment variables. See [docs/design/sandbox-threat-model.md](sandbox-threat-model.md)
+for the full trust model and capability boundaries.
 
 TODO: add a macOS-compatible copy-on-write workspace backend for `sandbox=overlay`.
 Prefer APFS clonefile / `cp -c` for fast CoW materialization, fall back to

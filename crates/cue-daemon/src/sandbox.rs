@@ -31,6 +31,18 @@ pub(crate) struct SandboxConfig {
     pub upper: Option<SandboxUpper>,
 }
 
+/// Daemon-configured defaults applied when preparing an overlay sandbox.
+///
+/// `upper_root` is the root under which each sandboxed job receives its own
+/// `<upper_root>/<job-id>/{upper,work}` pair, and `min_free_ratio` guards the
+/// backing filesystem (typically `/dev/shm`) against being exhausted by runaway
+/// writes.
+#[derive(Clone, Debug)]
+pub(crate) struct SandboxDefaults {
+    pub upper_root: PathBuf,
+    pub min_free_ratio: f64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSandbox {
     lower_dir: PathBuf,
@@ -53,7 +65,7 @@ impl PreparedSandbox {
 #[derive(Debug)]
 struct SandboxCleanup {
     mount_dir: PathBuf,
-    _upper_dir: PathBuf,
+    upper_root: Option<PathBuf>,
     work_dir: PathBuf,
     tmpfs_upper_mount: Option<PathBuf>,
     root_dir: PathBuf,
@@ -73,6 +85,12 @@ impl Drop for SandboxCleanup {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             warn!(path = %self.work_dir.display(), err = %error, "sandbox: failed to remove sandbox workdir");
+        }
+        if let Some(path) = self.upper_root.as_ref()
+            && let Err(error) = std::fs::remove_dir_all(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), err = %error, "sandbox: failed to remove sandbox upper root");
         }
         if let Err(error) = std::fs::remove_dir_all(&self.root_dir)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -145,9 +163,10 @@ pub(crate) fn prepare(
     job_id: cue_core::JobId,
     config: &SandboxConfig,
     lower_dir: &Path,
+    defaults: &SandboxDefaults,
 ) -> Result<PreparedSandbox> {
     match config.mode {
-        SandboxMode::Overlay => prepare_overlay(job_id, config, lower_dir),
+        SandboxMode::Overlay => prepare_overlay(job_id, config, lower_dir, defaults),
     }
 }
 
@@ -156,6 +175,7 @@ fn prepare_overlay(
     job_id: cue_core::JobId,
     config: &SandboxConfig,
     lower_dir: &Path,
+    defaults: &SandboxDefaults,
 ) -> Result<PreparedSandbox> {
     let lower_dir = std::fs::canonicalize(lower_dir)
         .with_context(|| format!("canonicalize sandbox lowerdir {}", lower_dir.display()))?;
@@ -168,30 +188,19 @@ fn prepare_overlay(
 
     let root_dir = sandbox_root(job_id)?;
     let mount_dir = root_dir.join("merged");
-    let default_upper_dir = root_dir.join("upper");
-    let default_work_dir = root_dir.join("work");
     let tmpfs_dir = root_dir.join("tmpfs");
     std::fs::create_dir_all(&mount_dir)
         .with_context(|| format!("create sandbox mount dir {}", mount_dir.display()))?;
 
-    let (upper_dir, work_dir, tmpfs_upper_mount) = match config.upper.as_ref() {
+    let (upper_dir, work_dir, tmpfs_upper_mount, upper_root) = match config.upper.as_ref() {
         Some(SandboxUpper::Directory(path)) => {
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("create sandbox upperdir {}", path.display()))?;
-            let upper_dir = std::fs::canonicalize(path)
-                .with_context(|| format!("canonicalize sandbox upperdir {}", path.display()))?;
-            let work_dir = upper_dir
-                .parent()
-                .unwrap_or_else(|| Path::new("/tmp"))
-                .join(format!(".cue-shell-work-{job_id}"));
-            if let Err(error) = std::fs::remove_dir_all(&work_dir)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(error).with_context(|| {
-                    format!("remove stale sandbox workdir {}", work_dir.display())
-                });
-            }
-            (upper_dir, work_dir, None)
+            ensure_upper_root_has_free_space(path, defaults.min_free_ratio)?;
+            let job_upper_root = job_upper_root(path, job_id)?;
+            let upper_dir = job_upper_root.join("upper");
+            let work_dir = job_upper_root.join("work");
+            std::fs::create_dir_all(&upper_dir)
+                .with_context(|| format!("create sandbox upperdir {}", upper_dir.display()))?;
+            (upper_dir, work_dir, None, Some(job_upper_root))
         }
         Some(SandboxUpper::Tmpfs) => {
             std::fs::create_dir_all(&tmpfs_dir)
@@ -205,13 +214,16 @@ fn prepare_overlay(
             })?;
             std::fs::create_dir_all(&work_dir)
                 .with_context(|| format!("create sandbox tmpfs workdir {}", work_dir.display()))?;
-            (upper_dir, work_dir, Some(tmpfs_dir))
+            (upper_dir, work_dir, Some(tmpfs_dir), None)
         }
         None => {
-            std::fs::create_dir_all(&default_upper_dir).with_context(|| {
-                format!("create sandbox upperdir {}", default_upper_dir.display())
-            })?;
-            (default_upper_dir, default_work_dir, None)
+            ensure_upper_root_has_free_space(&defaults.upper_root, defaults.min_free_ratio)?;
+            let job_upper_root = job_upper_root(&defaults.upper_root, job_id)?;
+            let upper_dir = job_upper_root.join("upper");
+            let work_dir = job_upper_root.join("work");
+            std::fs::create_dir_all(&upper_dir)
+                .with_context(|| format!("create sandbox upperdir {}", upper_dir.display()))?;
+            (upper_dir, work_dir, None, Some(job_upper_root))
         }
     };
     std::fs::create_dir_all(&work_dir)
@@ -228,7 +240,12 @@ fn prepare_overlay(
             )
         })
     {
-        cleanup_failed_mount(&root_dir, &work_dir, tmpfs_upper_mount.as_deref());
+        cleanup_failed_mount(
+            &root_dir,
+            &work_dir,
+            tmpfs_upper_mount.as_deref(),
+            upper_root.as_deref(),
+        );
         return Err(error);
     }
 
@@ -247,7 +264,7 @@ fn prepare_overlay(
         mount_dir: mount_dir.clone(),
         _cleanup: Some(Arc::new(SandboxCleanup {
             mount_dir,
-            _upper_dir: upper_dir,
+            upper_root,
             work_dir,
             tmpfs_upper_mount,
             root_dir,
@@ -260,6 +277,7 @@ fn prepare_overlay(
     _job_id: cue_core::JobId,
     _config: &SandboxConfig,
     _lower_dir: &Path,
+    _defaults: &SandboxDefaults,
 ) -> Result<PreparedSandbox> {
     bail!("overlay sandbox is only supported on Linux")
 }
@@ -271,6 +289,83 @@ fn sandbox_root(job_id: cue_core::JobId) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sandbox dir {}", dir.display()))?;
     Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn job_upper_root(upper_root: &Path, job_id: cue_core::JobId) -> Result<PathBuf> {
+    let dir = upper_root.join(job_id.to_string());
+    cleanup_stale_sandbox_upper_root(&dir)?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create sandbox upper root {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Refuse to prepare a sandbox when the upper-root filesystem is nearly full.
+///
+/// The overlay upperdir is where all sandboxed writes land; on the default
+/// `/dev/shm` (tmpfs) backing store this consumes RAM, so a runaway job could
+/// otherwise exhaust shared memory for the whole host. The guard creates the
+/// root (so `statvfs` can resolve it), then rejects when the free-space ratio
+/// is below `min_free_ratio`. A ratio of `0.0` disables the check.
+#[cfg(target_os = "linux")]
+fn ensure_upper_root_has_free_space(upper_root: &Path, min_free_ratio: f64) -> Result<()> {
+    if min_free_ratio <= 0.0 {
+        return Ok(());
+    }
+    std::fs::create_dir_all(upper_root)
+        .with_context(|| format!("create sandbox upper root {}", upper_root.display()))?;
+    let Some((free_ratio, free_bytes, total_bytes)) = filesystem_free_ratio(upper_root)? else {
+        return Ok(());
+    };
+    if free_ratio < min_free_ratio {
+        bail!(
+            "sandbox upper root {} has only {:.1}% free ({} of {} bytes); \
+             below the configured sandbox.min_free_ratio of {:.1}%. \
+             hint: free space on the upper-root filesystem (often tmpfs such as /dev/shm), \
+             point [sandbox].default_upper_root at a larger filesystem, or lower min_free_ratio",
+            upper_root.display(),
+            free_ratio * 100.0,
+            free_bytes,
+            total_bytes,
+            min_free_ratio * 100.0,
+        );
+    }
+    Ok(())
+}
+
+/// Return `(free_ratio, free_bytes, total_bytes)` for the filesystem backing
+/// `path`, or `None` when the total size reports as zero (ratio undefined).
+#[cfg(target_os = "linux")]
+fn filesystem_free_ratio(path: &Path) -> Result<Option<(f64, u64, u64)>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: zeroed statvfs is a valid initial state; c_path is a valid NUL-terminated path.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statvfs sandbox upper root {}", path.display()));
+    }
+    let block_size = stat.f_frsize as u64;
+    let total_bytes = block_size.saturating_mul(stat.f_blocks as u64);
+    let free_bytes = block_size.saturating_mul(stat.f_bavail as u64);
+    if total_bytes == 0 {
+        return Ok(None);
+    }
+    let free_ratio = free_bytes as f64 / total_bytes as f64;
+    Ok(Some((free_ratio, free_bytes, total_bytes)))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_sandbox_upper_root(dir: &Path) -> Result<()> {
+    if let Err(error) = std::fs::remove_dir_all(dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error)
+            .with_context(|| format!("remove stale sandbox upper root {}", dir.display()));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -377,7 +472,12 @@ fn mount(
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_failed_mount(root_dir: &Path, work_dir: &Path, tmpfs_upper_mount: Option<&Path>) {
+fn cleanup_failed_mount(
+    root_dir: &Path,
+    work_dir: &Path,
+    tmpfs_upper_mount: Option<&Path>,
+    upper_root: Option<&Path>,
+) {
     if let Some(path) = tmpfs_upper_mount
         && let Err(error) = unmount(path)
     {
@@ -387,6 +487,12 @@ fn cleanup_failed_mount(root_dir: &Path, work_dir: &Path, tmpfs_upper_mount: Opt
         && error.kind() != std::io::ErrorKind::NotFound
     {
         warn!(path = %work_dir.display(), err = %error, "sandbox: failed to clean up workdir after mount error");
+    }
+    if let Some(path) = upper_root
+        && let Err(error) = std::fs::remove_dir_all(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), err = %error, "sandbox: failed to clean up upper root after mount error");
     }
     if let Err(error) = std::fs::remove_dir_all(root_dir)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -431,6 +537,16 @@ mod tests {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_defaults(upper_root: &Path) -> SandboxDefaults {
+        SandboxDefaults {
+            upper_root: upper_root.to_path_buf(),
+            // Disable the free-space guard so smoke tests do not depend on host
+            // tmpfs utilisation.
+            min_free_ratio: 0.0,
+        }
     }
 
     #[test]
@@ -556,12 +672,18 @@ mod tests {
         let lower = temp_path("lower");
         std::fs::create_dir_all(&lower).expect("create lower");
         std::fs::write(lower.join("kept.txt"), "lower").expect("write lower file");
+        let upper_root = temp_path("upper-root");
         let config = SandboxConfig {
             mode: SandboxMode::Overlay,
             upper: None,
         };
 
-        match prepare(cue_core::JobId(424242), &config, &lower) {
+        match prepare(
+            cue_core::JobId(424242),
+            &config,
+            &lower,
+            &test_defaults(&upper_root),
+        ) {
             Ok(prepared) => {
                 let merged = prepared.cwd_for(&lower);
                 assert!(merged.join("kept.txt").exists());
@@ -580,6 +702,83 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&lower);
+        let _ = std::fs::remove_dir_all(&upper_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_default_upper_root_is_namespaced_per_job() {
+        let lower = temp_path("per-job-lower");
+        std::fs::create_dir_all(&lower).expect("create lower");
+        let upper_root = temp_path("per-job-upper-root");
+        let config = SandboxConfig {
+            mode: SandboxMode::Overlay,
+            upper: None,
+        };
+
+        let job_a = cue_core::JobId(515151);
+        let job_b = cue_core::JobId(515152);
+        let prepared_a = match prepare(job_a, &config, &lower, &test_defaults(&upper_root)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("mount overlay sandbox")
+                        || message.contains("Operation not permitted")
+                        || message.contains("permission denied"),
+                    "unexpected overlay error: {message}"
+                );
+                let _ = std::fs::remove_dir_all(&lower);
+                let _ = std::fs::remove_dir_all(&upper_root);
+                return;
+            }
+        };
+
+        // Each job derives an independent <upper_root>/<job-id>/upper directory,
+        // so a write inside job A's merged view must not be visible to job B's.
+        let merged_a = prepared_a.cwd_for(&lower);
+        std::fs::write(merged_a.join("only-in-a.txt"), "a").expect("write in job a sandbox");
+        assert!(upper_root.join(job_a.to_string()).join("upper").exists());
+
+        let prepared_b = prepare(job_b, &config, &lower, &test_defaults(&upper_root))
+            .expect("prepare job b sandbox");
+        let merged_b = prepared_b.cwd_for(&lower);
+        assert!(
+            !merged_b.join("only-in-a.txt").exists(),
+            "job B sandbox must not observe job A's overlay writes"
+        );
+        assert!(upper_root.join(job_b.to_string()).join("upper").exists());
+        assert_ne!(
+            upper_root.join(job_a.to_string()),
+            upper_root.join(job_b.to_string())
+        );
+
+        drop(prepared_a);
+        drop(prepared_b);
+        // Per-job upper roots are removed on sandbox drop.
+        assert!(!upper_root.join(job_a.to_string()).exists());
+        assert!(!upper_root.join(job_b.to_string()).exists());
+
+        let _ = std::fs::remove_dir_all(&lower);
+        let _ = std::fs::remove_dir_all(&upper_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ensure_upper_root_free_space_guard_rejects_when_below_ratio() {
+        let upper_root = temp_path("free-space-guard");
+        // A min_free_ratio of 1.0 is unreachable (a non-empty filesystem always
+        // has used blocks), so the guard must reject regardless of host state.
+        let error = ensure_upper_root_has_free_space(&upper_root, 1.0)
+            .expect_err("unreachable free ratio should reject");
+        let message = format!("{error:#}");
+        assert!(message.contains("has only"), "{message}");
+        assert!(message.contains("sandbox.min_free_ratio"), "{message}");
+
+        // A ratio of 0.0 disables the guard entirely.
+        ensure_upper_root_has_free_space(&upper_root, 0.0).expect("disabled guard should pass");
+
+        let _ = std::fs::remove_dir_all(&upper_root);
     }
 
     #[cfg(target_os = "linux")]
@@ -592,7 +791,12 @@ mod tests {
             upper: Some(SandboxUpper::Tmpfs),
         };
 
-        match prepare(cue_core::JobId(424243), &config, &lower) {
+        match prepare(
+            cue_core::JobId(424243),
+            &config,
+            &lower,
+            &test_defaults(&temp_path("tmpfs-default-root")),
+        ) {
             Ok(prepared) => {
                 let merged = prepared.cwd_for(&lower);
                 std::fs::write(merged.join("tmpfs-created.txt"), "overlay")
@@ -623,14 +827,27 @@ mod tests {
     }
 
     #[cfg(not(target_os = "linux"))]
+    fn test_defaults(upper_root: &Path) -> SandboxDefaults {
+        SandboxDefaults {
+            upper_root: upper_root.to_path_buf(),
+            min_free_ratio: 0.0,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn overlay_prepare_reports_not_supported_on_non_linux() {
         let config = SandboxConfig {
             mode: SandboxMode::Overlay,
             upper: None,
         };
-        let error = prepare(cue_core::JobId(424242), &config, Path::new("/tmp"))
-            .expect_err("non-linux overlay should be unsupported");
+        let error = prepare(
+            cue_core::JobId(424242),
+            &config,
+            Path::new("/tmp"),
+            &test_defaults(Path::new("/tmp/cue-shell-sandbox")),
+        )
+        .expect_err("non-linux overlay should be unsupported");
         assert!(error.to_string().contains("only supported on Linux"));
     }
 
@@ -641,8 +858,13 @@ mod tests {
             mode: SandboxMode::Overlay,
             upper: Some(SandboxUpper::Tmpfs),
         };
-        let error = prepare(cue_core::JobId(424243), &config, Path::new("/tmp"))
-            .expect_err("non-linux tmpfs overlay should be unsupported");
+        let error = prepare(
+            cue_core::JobId(424243),
+            &config,
+            Path::new("/tmp"),
+            &test_defaults(Path::new("/tmp/cue-shell-sandbox")),
+        )
+        .expect_err("non-linux tmpfs overlay should be unsupported");
         assert!(error.to_string().contains("only supported on Linux"));
     }
 }

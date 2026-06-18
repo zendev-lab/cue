@@ -648,6 +648,43 @@ async fn test_daemon_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unhandshaken_client_can_recover_by_handshaking_on_same_connection() {
+    run_daemon_test(async {
+        let env = TestEnv::new("handshake-recover");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_raw_socket(&env.socket, &mut child).await;
+
+        let response = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "?".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match response {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, "INVALID_REQUEST");
+                assert_eq!(message, "client session handshake required");
+            }
+            other => panic!("expected missing-session error before handshake, got {other:?}"),
+        }
+
+        handshake(&mut stream, "recover-session", &env.root).await;
+        let response = roundtrip(&mut stream, 2, RequestPayload::Ping {}).await;
+        assert!(
+            matches!(response, ResponsePayload::Ok(OkPayload::Pong { .. })),
+            "expected Pong after late handshake, got {response:?}"
+        );
+
+        let _ = roundtrip(&mut stream, 3, RequestPayload::Shutdown {}).await;
+        let _ = child.wait().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_foreground_sigint_exits_promptly() {
     run_daemon_test(async {
         let env = TestEnv::new("sigint-exit");

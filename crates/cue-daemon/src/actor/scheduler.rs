@@ -4832,6 +4832,14 @@ fn format_config_text(config: &Config) -> String {
         "wrapper.allowlist.commands = [{}]",
         config.wrapper.allowlist.commands.join(", ")
     ));
+    lines.push(format!(
+        "sandbox.default_upper_root = {}",
+        config.sandbox.default_upper_root.display()
+    ));
+    lines.push(format!(
+        "sandbox.min_free_ratio = {}",
+        config.sandbox.min_free_ratio
+    ));
     lines.join("\n")
 }
 

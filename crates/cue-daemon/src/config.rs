@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -13,6 +13,7 @@ const DAEMON_ROOT_SECTIONS: &[&str] = &[
     "block",
     "resources",
     "retention",
+    "sandbox",
     "warn",
     "wrapper",
 ];
@@ -28,6 +29,8 @@ pub struct Config {
     pub resources: ResourceConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     #[serde(default)]
     pub wrapper: WrapperConfig,
 }
@@ -451,6 +454,75 @@ fn default_max_script_runs() -> usize {
     100
 }
 
+/// Filesystem sandbox defaults applied to `:run(sandbox=overlay)` jobs.
+///
+/// ```toml
+/// [sandbox]
+/// # Root under which each sandboxed job gets its own <root>/<job-id>/{upper,work}.
+/// default_upper_root = "/dev/shm/cue-shell-sandbox"
+/// # Refuse to prepare a sandbox when the upper-root filesystem has less than
+/// # this fraction of space available (0.0 disables the guard). Protects shared
+/// # memory (/dev/shm) from being exhausted by runaway writes.
+/// min_free_ratio = 0.1
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    #[serde(default = "default_sandbox_upper_root")]
+    pub default_upper_root: PathBuf,
+    #[serde(default = "default_sandbox_min_free_ratio")]
+    pub min_free_ratio: f64,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            default_upper_root: default_sandbox_upper_root(),
+            min_free_ratio: default_sandbox_min_free_ratio(),
+        }
+    }
+}
+
+impl SandboxConfig {
+    fn validate(&self, path: &Path) -> Result<()> {
+        validate_non_empty_path(&self.default_upper_root, "sandbox.default_upper_root", path)?;
+        if !self.min_free_ratio.is_finite()
+            || self.min_free_ratio < 0.0
+            || self.min_free_ratio >= 1.0
+        {
+            bail!(
+                "sandbox.min_free_ratio in {} must be in the range [0.0, 1.0)",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_sandbox_upper_root() -> PathBuf {
+    PathBuf::from("/dev/shm/cue-shell-sandbox")
+}
+
+fn default_sandbox_min_free_ratio() -> f64 {
+    0.1
+}
+
+fn validate_non_empty_path(value: &Path, field: &str, config_path: &Path) -> Result<()> {
+    let Some(value) = value.to_str() else {
+        bail!("{field} in {} must be valid UTF-8", config_path.display());
+    };
+    if value.trim().is_empty() {
+        bail!("{field} in {} must not be empty", config_path.display());
+    }
+    if value.trim() != value {
+        bail!(
+            "{field} in {} must not have leading or trailing whitespace",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()?;
@@ -481,6 +553,7 @@ impl Config {
     fn validate(&self, path: &Path) -> Result<()> {
         self.wrapper.validate(path)?;
         self.resources.validate(path)?;
+        self.sandbox.validate(path)?;
         Ok(())
     }
 
@@ -1269,5 +1342,91 @@ git = "Review git command before running."
         let config = Config::default();
         assert_eq!(config.retention.max_job_history, 200);
         assert_eq!(config.retention.max_script_runs, 100);
+    }
+
+    #[test]
+    fn default_sandbox_config_uses_shared_memory_upper_root() {
+        let config = Config::default();
+        assert_eq!(
+            config.sandbox.default_upper_root,
+            Path::new("/dev/shm/cue-shell-sandbox")
+        );
+        assert_eq!(config.sandbox.min_free_ratio, 0.1);
+    }
+
+    #[test]
+    fn sandbox_config_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[sandbox]
+default_upper_root = "/mnt/fast/cue-upper"
+min_free_ratio = 0.25
+"#,
+        )))
+        .expect("load config");
+        assert_eq!(
+            config.sandbox.default_upper_root,
+            Path::new("/mnt/fast/cue-upper")
+        );
+        assert_eq!(config.sandbox.min_free_ratio, 0.25);
+    }
+
+    #[test]
+    fn sandbox_config_rejects_unknown_field() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[sandbox]
+upper_root = "/tmp/typo"
+"#,
+        )))
+        .expect_err("unknown sandbox field should fail");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("parse config daemon.toml"), "{message}");
+        assert!(message.contains("unknown field `upper_root`"), "{message}");
+    }
+
+    #[test]
+    fn sandbox_config_rejects_empty_or_padded_upper_root() {
+        let empty = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            "[sandbox]\ndefault_upper_root = \"\"\n",
+        )))
+        .expect_err("empty upper root should fail");
+        assert!(
+            format!("{empty:#}")
+                .contains("sandbox.default_upper_root in daemon.toml must not be empty"),
+            "{empty:#}"
+        );
+
+        let padded = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            "[sandbox]\ndefault_upper_root = \" /dev/shm/cue \"\n",
+        )))
+        .expect_err("padded upper root should fail");
+        assert!(
+            format!("{padded:#}").contains(
+                "sandbox.default_upper_root in daemon.toml must not have leading or trailing whitespace"
+            ),
+            "{padded:#}"
+        );
+    }
+
+    #[test]
+    fn sandbox_config_rejects_out_of_range_min_free_ratio() {
+        for value in ["-0.1", "1.0", "1.5"] {
+            let error = Config::load_from_source(Some((
+                Path::new("daemon.toml"),
+                &format!("[sandbox]\nmin_free_ratio = {value}\n"),
+            )))
+            .expect_err("out-of-range min_free_ratio should fail");
+            assert!(
+                format!("{error:#}")
+                    .contains("sandbox.min_free_ratio in daemon.toml must be in the range"),
+                "min_free_ratio {value} produced unexpected error: {error:#}"
+            );
+        }
     }
 }

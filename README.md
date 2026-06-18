@@ -261,6 +261,30 @@ mode params such as `:run(wrapper=false) cargo test` and cron params such as
 `:cron(wrapper=true) every 5m cargo test` override enablement for that
 invocation, but still must match the allowlist.
 
+`daemon.toml` configures the overlay workspace sandbox used by
+`:run(sandbox=overlay)`:
+
+```toml
+[sandbox]
+# Root under which each sandboxed job gets its own <root>/<job-id>/{upper,work}.
+# Defaults to shared memory so writes stay off disk; point it at a disk-backed
+# path if /dev/shm is too small for your builds.
+default_upper_root = "/dev/shm/cue-shell-sandbox"
+# Refuse to start a sandbox when the upper-root filesystem has less than this
+# fraction free (0.0 disables the guard). Protects /dev/shm from runaway writes.
+min_free_ratio = 0.1
+```
+
+Each sandboxed job gets an independent per-job upper/work pair, so concurrent
+jobs never share an overlay layer, and the writes are discarded when the job
+finishes. An explicit `:run(sandbox=overlay, sandbox.upper=<dir>)` treats `<dir>`
+as an upper *root* (the daemon still appends `/<job-id>/{upper,work}`), while
+`sandbox.upper=tmpfs` forces a fresh in-memory upper for that job. Overlay
+sandboxing is a workspace view, **not** a security boundary — it does not isolate
+absolute paths outside the working tree, network access, process credentials, or
+environment variables. See `docs/design/sandbox-threat-model.md` for the full
+trust model.
+
 Typical remote flow:
 
 ```bash
