@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -14,7 +14,6 @@ const DAEMON_ROOT_SECTIONS: &[&str] = &[
     "resources",
     "retention",
     "warn",
-    "weft",
     "wrapper",
 ];
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -29,8 +28,6 @@ pub struct Config {
     pub resources: ResourceConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
-    #[serde(default)]
-    pub weft: WeftConfig,
     #[serde(default)]
     pub wrapper: WrapperConfig,
 }
@@ -516,25 +513,6 @@ fn validate_root_config_shape(text: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WeftConfig {
-    #[serde(default = "default_weft_socket_path")]
-    pub socket_path: PathBuf,
-}
-
-impl Default for WeftConfig {
-    fn default() -> Self {
-        Self {
-            socket_path: default_weft_socket_path(),
-        }
-    }
-}
-
-fn default_weft_socket_path() -> PathBuf {
-    PathBuf::from("./weft.sock")
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Wrapper config
 // ────────────────────────────────────────────────────────────────────
@@ -653,15 +631,9 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn default_config_sets_weft_socket() {
-        let config = Config::default();
-        assert_eq!(config.weft.socket_path, PathBuf::from("./weft.sock"));
-    }
-
-    #[test]
     fn invalid_config_is_not_silently_defaulted() {
         let error =
-            Config::load_from_source(Some((Path::new("daemon.toml"), "[weft]\nsocket_path = [")))
+            Config::load_from_source(Some((Path::new("daemon.toml"), "[wrapper]\nenabled = [")))
                 .expect_err("invalid config should fail");
 
         assert!(error.to_string().contains("parse config daemon.toml"));
@@ -685,14 +657,6 @@ commandz = {}
 max_jobs = 10
 "#,
                 "unknown field `max_jobs`",
-            ),
-            (
-                "weft",
-                r#"
-[weft]
-socket = "/tmp/weft.sock"
-"#,
-                "unknown field `socket`",
             ),
             (
                 "warn",
@@ -750,7 +714,7 @@ socket_path = "/tmp/typo.sock"
         let message = format!("{error:#}");
         assert!(message.contains("unknown top-level daemon config section `wefft`"));
         assert!(message.contains("daemon.toml"));
-        assert!(message.contains("weft"));
+        assert!(message.contains("wrapper"));
         assert!(!message.contains("transport"));
     }
 
@@ -923,20 +887,6 @@ release = ["license-helper", "release"]
             ),
             "{error:#}"
         );
-    }
-
-    #[test]
-    fn parses_weft_socket_path() {
-        let config = Config::load_from_source(Some((
-            Path::new("daemon.toml"),
-            r#"
-[weft]
-socket_path = "/var/run/weft.sock"
-"#,
-        )))
-        .expect("load config");
-
-        assert_eq!(config.weft.socket_path, PathBuf::from("/var/run/weft.sock"));
     }
 
     #[test]

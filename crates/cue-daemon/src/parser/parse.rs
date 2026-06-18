@@ -303,6 +303,16 @@ impl<'a> Parser<'a> {
                     // daemon's ProviderRegistry is responsible for the
                     // semantic validation of `<X>`.
                     if let Some(suffix) = key.strip_prefix("need.") {
+                        if mode_param_spec_for_command(command, "need.<resource>").is_none() {
+                            return Err(ParseError {
+                                span: key_span,
+                                message: format!(
+                                    "mode parameter `{key}` is not supported by `:{command}`"
+                                ),
+                                kind: ParseErrorKind::InvalidModeParam,
+                                suggestions: vec![],
+                            });
+                        }
                         if suffix.is_empty() {
                             return Err(ParseError {
                                 span: key_span,
@@ -990,6 +1000,7 @@ fn suggest_command(name: &str) -> Vec<String> {
 mod tests {
     use super::super::token::IdKind;
     use super::*;
+    use insta::assert_snapshot;
 
     fn leaf_pipeline(chain: &ChainNode) -> &Pipeline {
         match chain {
@@ -1245,6 +1256,70 @@ mod tests {
                     .collect();
                 assert_eq!(map.get("need.gpu"), Some(&Value::Str("1".into())));
                 assert_eq!(map.get("need.gpu_mem"), Some(&Value::Str("24GiB".into())),);
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn mode_params_need_namespace_is_run_only() {
+        let err = Parser::parse(":cron(need.gpu=1) every 5m cargo test")
+            .expect_err("cron must not accept run-only resource need params");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(
+            err.message
+                .contains("mode parameter `need.gpu` is not supported by `:cron`")
+        );
+    }
+
+    #[test]
+    fn mode_param_error_messages_snapshot() {
+        let cases = [
+            ("cron_need", ":cron(need.gpu=1) every 5m cargo test"),
+            ("empty_need_suffix", ":run(need.=1) cargo test"),
+            ("wrong_pty_type", ":run(pty=soon) cargo test"),
+        ];
+        let mut rendered = String::new();
+        for (name, input) in cases {
+            let err = Parser::parse(input).expect_err("case should fail");
+            rendered.push_str(name);
+            rendered.push_str("\n  kind: ");
+            rendered.push_str(&format!("{:?}", err.kind));
+            rendered.push_str("\n  message: ");
+            rendered.push_str(&err.message);
+            if !err.suggestions.is_empty() {
+                rendered.push_str("\n  suggestions: ");
+                rendered.push_str(&err.suggestions.join(", "));
+            }
+            rendered.push('\n');
+        }
+
+        assert_snapshot!(rendered, @r###"
+        cron_need
+          kind: InvalidModeParam
+          message: mode parameter `need.gpu` is not supported by `:cron`
+        empty_need_suffix
+          kind: InvalidModeParam
+          message: `need.` requires a key suffix (e.g. `need.gpu_mem=24GiB`)
+          suggestions: need.gpu=1, need.gpu_mem=24GiB
+        wrong_pty_type
+          kind: InvalidModeParam
+          message: mode parameter `pty` expects a boolean (e.g. false)
+          suggestions: pty=false
+        "###);
+    }
+
+    #[test]
+    fn mode_params_accept_overlay_sandbox() {
+        let ast = Parser::parse(":run(sandbox=overlay,sandbox.upper=tmpfs) cargo test").unwrap();
+        match ast {
+            Ast::Command { mode_params, .. } => {
+                let map: std::collections::BTreeMap<_, _> = mode_params
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect();
+                assert_eq!(map.get("sandbox"), Some(&Value::Str("overlay".into())));
+                assert_eq!(map.get("sandbox.upper"), Some(&Value::Str("tmpfs".into())));
             }
             _ => panic!("expected Command"),
         }

@@ -75,27 +75,41 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ```
 :run(cwd=/repo, pty=false) cargo test
 :run(need.gpu=1, need.gpu_mem=24GiB) python train.py
+:run(sandbox=overlay, sandbox.upper=tmpfs) cargo test
 :cron(cwd=/repo) every 5m cargo clippy
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
-execution behavior. They override `daemon.toml` defaults. Only launcher-style
-commands support mode params: `:run` and `:cron`; supported keys are declared
-per command so unsupported keys fail during parsing instead of being ignored.
-Resource needs use the `need.<resource>=<quantity>` namespace; resource keys are
-owned by configured providers rather than hardcoded in core.
+launch behavior. Only launcher-style commands support mode params: `:run` and
+`:cron`; the concrete support matrix lives in
+`crates/cue-core/src/command_spec.rs`. `cwd=...` derives a job or cron start
+scope without changing the caller's session cursor. `pty`, `need.*`, and
+`sandbox.*` are per-job launch options; they are not part of scope identity.
+Resource keys are provider-owned via the `need.<resource>=<quantity>` namespace
+rather than hardcoded in core. `:run` can opt into an overlayfs workspace view
+with `sandbox=overlay` and, on Linux, `sandbox.upper=tmpfs` for ephemeral
+in-memory writes. Overlay sandboxing is a workspace view, not a security
+boundary: it does not isolate absolute paths outside the working tree, network
+access, process credentials, or inherited environment variables.
+
+TODO: add a macOS-compatible copy-on-write workspace backend for `sandbox=overlay`.
+Prefer APFS clonefile / `cp -c` for fast CoW materialization, fall back to
+recursive copy when CoW cloning is unavailable, and keep this separate from a
+future Seatbelt/bubblewrap permission sandbox backend.
 
 ## Scope Model
 
 Scopes are **immutable, content-addressed environment snapshots**:
 
-- ID = blake3(env + cwd + ...) → identical environments share the same hash
-- Delta storage: `parent_hash` + `EnvDelta` (set/unset/cwd changes)
+- ID = blake3(snapshot content) → identical snapshots share the same hash
+- Delta storage: `parent_hash` + `EnvDelta` (exact schema in `crates/cue-core/src/scope.rs`)
 - Display: `S@a3f1` (short content hash)
 - Job holds `start_scope` and `end_scope` (None until complete)
-- Default scope = movable HEAD pointer, modified via `:env set` / `:cd`
+- Each logical client session owns a mutable scope cursor, modified via `:env set` / `:cd`
+- `cwd=...` mode params derive child scopes for jobs/crons without moving the session cursor
+- Launch options such as `pty`, `need.*`, and `sandbox.*` live with the job launch request, not the scope
 
-Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default scope ≈ HEAD.
+Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, session cursor ≈ a checked-out ref.
 
 ## IPC Protocol
 

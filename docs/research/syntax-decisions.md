@@ -181,8 +181,8 @@ every 30m between 9am-5pm on mon-fri do ./check.sh  # 复杂自由格式
 
 ## Part 3: 模式设计演进（v1 → v2）
 
-> 本文只保留最终留下来的语法 / 模式演进结论；已经整体迁出到 weft
-> 的 AGENT bridge 试验不再作为 cue-shell 当前文档的一部分。
+> 本文只保留最终留下来的语法 / 模式演进结论；已经整体迁出到上层
+> agent runtime 的 AGENT bridge 试验不再作为 cue-shell 当前文档的一部分。
 
 ### 3.1 v1 设计（已弃用）
 

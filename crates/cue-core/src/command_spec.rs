@@ -113,7 +113,7 @@ const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
         commands: &["run", "cron"],
         value_kind: ModeParamValueKind::String,
         value_hint: "/path",
-        detail: "Run from this working directory without moving HEAD",
+        detail: "Run from this working directory without changing the session cwd",
     },
     ModeParamSpec {
         name: "wrapper",
@@ -135,6 +135,27 @@ const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
         value_kind: ModeParamValueKind::Bool,
         value_hint: "false",
         detail: "Run the job without allocating a PTY",
+    },
+    ModeParamSpec {
+        name: "sandbox",
+        commands: &["run"],
+        value_kind: ModeParamValueKind::String,
+        value_hint: "overlay",
+        detail: "Run the job inside an opt-in sandbox",
+    },
+    ModeParamSpec {
+        name: "sandbox.upper",
+        commands: &["run"],
+        value_kind: ModeParamValueKind::String,
+        value_hint: "tmpfs",
+        detail: "Use tmpfs or a directory path for the overlay sandbox upperdir",
+    },
+    ModeParamSpec {
+        name: "need.<resource>",
+        commands: &["run"],
+        value_kind: ModeParamValueKind::String,
+        value_hint: "1",
+        detail: "Declare a provider-owned resource need quantity",
     },
 ];
 
@@ -302,7 +323,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,
         usage: ":env [subcommand]",
-        detail: "Inspect or update the persisted HEAD environment",
+        detail: "Inspect or update the current session environment",
         documented: true,
     },
     CommandSpec {
@@ -310,7 +331,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,
         usage: ":cd <path>",
-        detail: "Move the persisted HEAD working directory",
+        detail: "Move the current session working directory",
         documented: true,
     },
     CommandSpec {
@@ -343,6 +364,14 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg_kind: CommandArgKind::OptionalText,
         usage: ":wrap [on|off|status]",
         detail: "Override or inspect the runtime wrapper",
+        documented: true,
+    },
+    CommandSpec {
+        name: "pty",
+        category: CommandCategory::System,
+        arg_kind: CommandArgKind::OptionalText,
+        usage: ":pty [on|off|status]",
+        detail: "Override or inspect this session's PTY default",
         documented: true,
     },
     CommandSpec {
@@ -455,8 +484,13 @@ mod tests {
     #[test]
     fn mode_param_command_boundaries_are_explicit() {
         assert!(mode_param_spec_for_command("run", "pty").is_some());
+        assert!(mode_param_spec_for_command("run", "sandbox").is_some());
+        assert!(mode_param_spec_for_command("run", "sandbox.upper").is_some());
         assert!(mode_param_spec_for_command("cron", "pty").is_none());
+        assert!(mode_param_spec_for_command("cron", "sandbox").is_none());
         assert!(mode_param_spec_for_command("cron", "cwd").is_some());
+        assert!(mode_param_spec_for_command("run", "need.<resource>").is_some());
+        assert!(mode_param_spec_for_command("cron", "need.<resource>").is_none());
         assert!(command_spec("run").is_some_and(CommandSpec::accepts_mode_params));
         assert!(command_spec("cron").is_some_and(CommandSpec::accepts_mode_params));
         assert!(!command_spec("kill").is_some_and(CommandSpec::accepts_mode_params));
@@ -520,14 +554,15 @@ mod tests {
     }
 
     #[test]
-    fn parser_design_docs_cover_mode_params() {
+    fn parser_design_docs_point_to_mode_param_source_of_truth() {
         let docs = include_str!("../../../docs/design/parser.md");
-        for spec in MODE_PARAM_SPECS {
-            assert!(
-                docs.contains(spec.name),
-                "docs/design/parser.md is missing mode param `{}`",
-                spec.name
-            );
-        }
+        assert!(
+            docs.contains("cue-core::command_spec"),
+            "docs/design/parser.md should point to command_spec for mode params"
+        );
+        assert!(
+            docs.contains("Mode params"),
+            "docs/design/parser.md should explain mode-param parsing at a high level"
+        );
     }
 }

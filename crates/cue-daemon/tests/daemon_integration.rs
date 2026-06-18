@@ -8,6 +8,7 @@
 //! daemon uses its own PID file, database, and socket — never colliding with a
 //! real running `cued` instance.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -110,6 +111,25 @@ impl Drop for TestEnv {
 
 /// Wait (with retries) until the socket file appears and is connectable.
 async fn wait_for_socket(socket: &Path, child: &mut Child) -> UnixStream {
+    let mut stream = wait_for_raw_socket(socket, child).await;
+    let session_id = default_test_session_id(socket);
+    let cwd = default_test_session_cwd(socket);
+    handshake(&mut stream, &session_id, &cwd).await;
+    stream
+}
+
+async fn wait_for_socket_with_session(
+    socket: &Path,
+    child: &mut Child,
+    session_id: &str,
+    cwd: &Path,
+) -> UnixStream {
+    let mut stream = wait_for_raw_socket(socket, child).await;
+    handshake(&mut stream, session_id, cwd).await;
+    stream
+}
+
+async fn wait_for_raw_socket(socket: &Path, child: &mut Child) -> UnixStream {
     for _ in 0..80 {
         if socket.exists()
             && let Ok(stream) = UnixStream::connect(socket).await
@@ -130,6 +150,17 @@ async fn wait_for_socket(socket: &Path, child: &mut Child) -> UnixStream {
         "daemon did not create socket within 8 s: {}; stderr:\n{stderr}",
         socket.display(),
     );
+}
+
+fn default_test_session_id(socket: &Path) -> String {
+    format!("itest:{}", socket.display())
+}
+
+fn default_test_session_cwd(socket: &Path) -> PathBuf {
+    socket
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().expect("current dir"))
 }
 
 async fn read_child_stderr(child: &mut Child) -> String {
@@ -202,17 +233,35 @@ async fn connect_bridge(
     SplitStream<DuplexStream, DuplexStream>,
     JoinHandle<anyhow::Result<()>>,
 ) {
+    connect_bridge_with_session(
+        socket,
+        &default_test_session_id(socket),
+        &default_test_session_cwd(socket),
+    )
+    .await
+}
+
+async fn connect_bridge_with_session(
+    socket: &Path,
+    session_id: &str,
+    cwd: &Path,
+) -> (
+    SplitStream<DuplexStream, DuplexStream>,
+    JoinHandle<anyhow::Result<()>>,
+) {
     let (client_writer, relay_input) = duplex(16 * 1024);
     let (relay_output, client_reader) = duplex(16 * 1024);
-    let socket = UnixStream::connect(socket)
+    let socket_stream = UnixStream::connect(socket)
         .await
         .expect("connect bridge socket");
     let relay = tokio::spawn(cue_daemon::relay_gateway_stdio(
         relay_input,
         relay_output,
-        socket,
+        socket_stream,
     ));
-    (SplitStream::new(client_reader, client_writer), relay)
+    let mut stream = SplitStream::new(client_reader, client_writer);
+    handshake(&mut stream, session_id, cwd).await;
+    (stream, relay)
 }
 
 fn write_executable_script(path: &Path, body: &str) {
@@ -231,6 +280,17 @@ fn write_daemon_config(env: &TestEnv, text: &str) {
 fn job_id_from_created(resp: ResponsePayload) -> String {
     match resp {
         ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+        other => panic!("expected JobCreated, got {other:?}"),
+    }
+}
+
+fn job_created_from_response(resp: ResponsePayload) -> (String, Option<String>) {
+    match resp {
+        ResponsePayload::Ok(OkPayload::JobCreated {
+            job_id,
+            start_scope,
+            ..
+        }) => (job_id, start_scope),
         other => panic!("expected JobCreated, got {other:?}"),
     }
 }
@@ -259,6 +319,23 @@ where
 /// Build a `Request` envelope.
 fn request(id: u32, payload: RequestPayload) -> Message {
     Message::Request { id, payload }
+}
+
+async fn handshake<S>(stream: &mut S, session_id: &str, cwd: &Path)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let resp = roundtrip(
+        stream,
+        0,
+        RequestPayload::Handshake {
+            session_id: session_id.to_string(),
+            cwd: cwd.display().to_string(),
+            env: BTreeMap::new(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, ResponsePayload::Ok(OkPayload::Ack {})));
 }
 
 /// Send a request and return the matching response payload.
@@ -357,6 +434,107 @@ where
     wait_for_job_status(stream, request_id, job_id, |job| job.status.is_terminal())
         .await
         .status
+}
+
+async fn run_pwd_and_read<S>(stream: &mut S, next_request_id: &mut u32) -> PathBuf
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let resp = roundtrip(
+        stream,
+        *next_request_id,
+        RequestPayload::Eval {
+            input: "/bin/pwd".into(),
+            mode: Mode::Job,
+        },
+    )
+    .await;
+    *next_request_id += 1;
+    let job_id = job_id_from_created(resp);
+    let status = wait_for_job_terminal(stream, *next_request_id, &job_id).await;
+    *next_request_id += 1;
+    assert_eq!(status, JobStatus::Done);
+    let out = roundtrip(
+        stream,
+        *next_request_id,
+        RequestPayload::Eval {
+            input: format!(":out {job_id}"),
+            mode: Mode::Job,
+        },
+    )
+    .await;
+    *next_request_id += 1;
+    match out {
+        ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+            std::fs::canonicalize(data.trim()).expect("canonicalize pwd output")
+        }
+        other => panic!("expected Output, got {other:?}"),
+    }
+}
+
+async fn scope_cwd_from_list<S>(stream: &mut S, request_id: u32, scope_hash: &str) -> String
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let resp = roundtrip(
+        stream,
+        request_id,
+        RequestPayload::Eval {
+            input: ":scopes".into(),
+            mode: Mode::Job,
+        },
+    )
+    .await;
+    match resp {
+        ResponsePayload::Ok(OkPayload::ScopeList(scopes)) => {
+            scopes
+                .into_iter()
+                .find(|scope| scope.hash == scope_hash)
+                .unwrap_or_else(|| panic!("scope {scope_hash} missing from :scopes"))
+                .cwd
+        }
+        other => panic!("expected ScopeList, got {other:?}"),
+    }
+}
+
+async fn wait_for_done_job_matching<S>(
+    stream: &mut S,
+    mut request_id: u32,
+    exclude: &std::collections::HashSet<String>,
+    predicate: impl Fn(&JobInfo) -> bool,
+) -> JobInfo
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = roundtrip(
+            stream,
+            request_id,
+            RequestPayload::Eval {
+                input: ":jobs".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::JobList(list)) => {
+                if let Some(job) = list.into_iter().find(|job| {
+                    job.status == JobStatus::Done && !exclude.contains(&job.id) && predicate(job)
+                }) {
+                    return job;
+                }
+            }
+            other => panic!("expected JobList, got {other:?}"),
+        }
+        request_id += 1;
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "matching done job did not appear in time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Subscribe to a set of channels.
@@ -717,7 +895,243 @@ timeout_ms = 5000
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_restart_restores_jobs_and_scope_head() {
+async fn test_run_cwd_is_start_scope_and_pty_is_launch_option() {
+    run_daemon_test(async {
+        let env = TestEnv::new("run-cwd-launch");
+        let repo = env.root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!(":run(cwd={}, pty=false) /bin/pwd", repo.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let (job_id, start_scope) = job_created_from_response(created);
+        let start_scope = start_scope.expect("run should return a start scope");
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let out = roundtrip(
+            &mut stream,
+            20,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.trim() == repo.display().to_string()
+        ));
+        assert_eq!(
+            scope_cwd_from_list(&mut stream, 21, &start_scope).await,
+            repo.display().to_string()
+        );
+
+        let env_resp = roundtrip(
+            &mut stream,
+            22,
+            RequestPayload::Eval {
+                input: ":env".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            env_resp,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text }) if !text.contains(&format!("cwd={}", repo.display()))
+        ));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_run_need_params_are_admitted_from_start_scope() {
+    run_daemon_test(async {
+        let env = TestEnv::new("run-need-scope");
+        let provider_script = env.root.join("gpu-provider.sh");
+        let request_log = env.root.join("reserve.jsonl");
+        let bin_dir = env.root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        write_executable_script(
+            &bin_dir.join("python"),
+            r#"#!/bin/sh
+printf '%s\n' "$GPU_TOKEN"
+"#,
+        );
+        std::fs::write(env.root.join("train.py"), "# fake training script\n")
+            .expect("write train.py");
+        write_executable_script(
+            &provider_script,
+            r#"#!/bin/sh
+command="$1"
+log="$2"
+case "$command" in
+  probe)
+    printf '{"units":[{"id":"gpu0","attrs":{}}]}'
+    ;;
+  reserve)
+    cat >> "$log"
+    printf '\n' >> "$log"
+    printf '{"ok":true,"grant_id":"gpu-grant","env":{"GPU_TOKEN":"reserved-from-scope"},"info":{}}'
+    ;;
+  release)
+    cat >/dev/null
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+        );
+        write_daemon_config(
+            &env,
+            &format!(
+                r#"
+[resources.cli.gpu]
+keys = ["gpu", "gpu_mem"]
+probe = ["{}", "probe", "{}"]
+reserve = ["{}", "reserve", "{}"]
+release = ["{}", "release", "{}"]
+timeout_ms = 5000
+"#,
+                provider_script.display(),
+                request_log.display(),
+                provider_script.display(),
+                request_log.display(),
+                provider_script.display(),
+                request_log.display(),
+            ),
+        );
+
+        let test_path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = env.spawn_daemon_with_env([("PATH", test_path)]);
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(need.gpu=1, need.gpu_mem=24GiB) python train.py".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let (job_id, start_scope) = job_created_from_response(created);
+        assert!(start_scope.is_some(), "resource run should return start scope");
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let out = roundtrip(
+            &mut stream,
+            20,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.contains("reserved-from-scope")
+        ));
+
+        let request_log = std::fs::read_to_string(&request_log).expect("read reserve log");
+        assert!(request_log.contains(r#""gpu":{"kind":"count","value":1}"#));
+        assert!(request_log.contains(r#""gpu_mem":{"kind":"bytes","value":25769803776}"#));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_run_overlay_tmpfs_mode_param_reaches_launch() {
+    run_daemon_test(async {
+        let env = TestEnv::new("run-overlay-tmpfs");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(sandbox=overlay, sandbox.upper=tmpfs) /bin/sh -c 'printf ok'".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let (job_id, start_scope) = job_created_from_response(created);
+        assert!(
+            start_scope.is_some(),
+            "sandbox run should return start scope"
+        );
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+
+        match status {
+            JobStatus::Done => {
+                let out = roundtrip(
+                    &mut stream,
+                    20,
+                    RequestPayload::Eval {
+                        input: format!(":out {job_id}"),
+                        mode: Mode::Job,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    out,
+                    ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.contains("ok")
+                ));
+            }
+            JobStatus::Failed => {
+                let err = roundtrip(
+                    &mut stream,
+                    21,
+                    RequestPayload::Eval {
+                        input: format!(":err {job_id}"),
+                        mode: Mode::Job,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    err,
+                    ResponsePayload::Ok(OkPayload::Output { ref data, .. })
+                        if data.contains("overlay sandbox")
+                            || data.contains("tmpfs")
+                            || data.contains("only supported on Linux")
+                            || data.contains("Operation not permitted")
+                            || data.contains("permission denied")
+                ));
+            }
+            other => panic!("sandbox job should be terminal, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_restart_restores_jobs_without_global_scope_head() {
     run_daemon_test(async {
         let env = TestEnv::new("persist");
         let persisted_cwd = env.root.join("persisted-cwd");
@@ -815,15 +1229,110 @@ async fn test_restart_restores_jobs_and_scope_head() {
         .await;
         match out_resp {
             ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
-                let actual = std::fs::canonicalize(data.trim()).expect("canonicalize restored cwd");
-                let expected =
-                    std::fs::canonicalize(&persisted_cwd).expect("canonicalize expected cwd");
+                let actual = std::fs::canonicalize(data.trim()).expect("canonicalize restart cwd");
+                let expected = std::fs::canonicalize(default_test_session_cwd(&env.socket))
+                    .expect("canonicalize expected session cwd");
                 assert_eq!(actual, expected);
+                assert_ne!(actual, std::fs::canonicalize(&persisted_cwd).unwrap());
             }
             other => panic!("expected Output, got {other:?}"),
         }
 
         shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sessions_keep_cwd_isolated_and_reconnect_by_id() {
+    run_daemon_test(async {
+        let env = TestEnv::new("session-cwd");
+        let alpha = env.root.join("alpha");
+        let beta = env.root.join("beta");
+        std::fs::create_dir_all(&alpha).expect("create alpha cwd");
+        std::fs::create_dir_all(&beta).expect("create beta cwd");
+
+        let mut child = env.spawn_daemon();
+        let mut session_a = wait_for_socket_with_session(
+            &env.socket,
+            &mut child,
+            "session-a",
+            &default_test_session_cwd(&env.socket),
+        )
+        .await;
+        let mut session_b = wait_for_socket_with_session(
+            &env.socket,
+            &mut child,
+            "session-b",
+            &default_test_session_cwd(&env.socket),
+        )
+        .await;
+
+        let cd_a = roundtrip(
+            &mut session_a,
+            1,
+            RequestPayload::Eval {
+                input: format!(":cd {}", alpha.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            cd_a,
+            ResponsePayload::Ok(OkPayload::ScopeCreated { .. })
+        ));
+
+        let mut a_request = 2;
+        let mut b_request = 1;
+        assert_eq!(
+            run_pwd_and_read(&mut session_a, &mut a_request).await,
+            std::fs::canonicalize(&alpha).expect("canonicalize alpha")
+        );
+        assert_eq!(
+            run_pwd_and_read(&mut session_b, &mut b_request).await,
+            std::fs::canonicalize(default_test_session_cwd(&env.socket))
+                .expect("canonicalize default cwd")
+        );
+
+        let cd_b = roundtrip(
+            &mut session_b,
+            b_request,
+            RequestPayload::Eval {
+                input: format!(":cd {}", beta.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        b_request += 1;
+        assert!(matches!(
+            cd_b,
+            ResponsePayload::Ok(OkPayload::ScopeCreated { .. })
+        ));
+        assert_eq!(
+            run_pwd_and_read(&mut session_b, &mut b_request).await,
+            std::fs::canonicalize(&beta).expect("canonicalize beta")
+        );
+        assert_eq!(
+            run_pwd_and_read(&mut session_a, &mut a_request).await,
+            std::fs::canonicalize(&alpha).expect("canonicalize alpha")
+        );
+
+        drop(session_a);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut session_a = wait_for_socket_with_session(
+            &env.socket,
+            &mut child,
+            "session-a",
+            &default_test_session_cwd(&env.socket),
+        )
+        .await;
+        let mut reconnect_request = 1;
+        assert_eq!(
+            run_pwd_and_read(&mut session_a, &mut reconnect_request).await,
+            std::fs::canonicalize(&alpha).expect("canonicalize alpha")
+        );
+
+        shutdown_daemon(&mut session_b, &mut child).await;
     })
     .await;
 }
@@ -1161,7 +1670,7 @@ async fn test_chain_parallel_operator_uses_triple_pipe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_job_local_cd_does_not_update_global_scope_by_default() {
+async fn test_job_local_cd_does_not_update_session_scope_by_default() {
     run_daemon_test(async {
         let env = TestEnv::new("job-local-cd");
         let job_cwd = env.root.join("job-cwd");
@@ -1236,8 +1745,8 @@ async fn test_job_local_cd_does_not_update_global_scope_by_default() {
         match pwd_out {
             ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
                 let actual = std::fs::canonicalize(data.trim()).expect("canonicalize global pwd");
-                let expected = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
-                    .expect("canonicalize initial cwd");
+                let expected = std::fs::canonicalize(default_test_session_cwd(&env.socket))
+                    .expect("canonicalize initial session cwd");
                 assert_eq!(actual, expected);
             }
             other => panic!("expected Output, got {other:?}"),
@@ -1752,6 +2261,91 @@ async fn test_cron_add_and_list() {
             }
             other => panic!("expected CronList, got {other:?}"),
         }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cron_cwd_mode_param_is_restored_scope_state() {
+    run_daemon_test(async {
+        let env = TestEnv::new("cron-cwd-scope");
+        let repo = env.root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!(":cron(cwd={}) every 1s /bin/pwd", repo.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(resp, ResponsePayload::Ok(OkPayload::CronAdded { .. })));
+
+        let initial = wait_for_done_job_matching(
+            &mut stream,
+            10,
+            &std::collections::HashSet::new(),
+            |job| job.pipeline == "/bin/pwd",
+        )
+        .await;
+        let out = roundtrip(
+            &mut stream,
+            30,
+            RequestPayload::Eval {
+                input: format!(":out {}", initial.id),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.trim() == repo.display().to_string()
+        ));
+
+        let before_restart = match roundtrip(
+            &mut stream,
+            31,
+            RequestPayload::Eval {
+                input: ":jobs".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::JobList(list)) => {
+                list.into_iter().map(|job| job.id).collect::<std::collections::HashSet<_>>()
+            }
+            other => panic!("expected JobList, got {other:?}"),
+        };
+
+        shutdown_daemon(&mut stream, &mut child).await;
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        let restored = wait_for_done_job_matching(&mut stream, 40, &before_restart, |job| {
+            job.pipeline == "/bin/pwd"
+        })
+        .await;
+        let out = roundtrip(
+            &mut stream,
+            60,
+            RequestPayload::Eval {
+                input: format!(":out {}", restored.id),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.trim() == repo.display().to_string()
+        ));
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
@@ -2506,7 +3100,7 @@ async fn test_scopes_returns_scope_list() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_config_show_returns_weft_info() {
+async fn test_config_show_returns_daemon_info() {
     run_daemon_test(async {
         let env = TestEnv::new("config-show");
         let mut child = env.spawn_daemon();
@@ -2525,8 +3119,8 @@ async fn test_config_show_returns_weft_info() {
         match resp {
             ResponsePayload::Ok(OkPayload::EvalText { text }) => {
                 assert!(
-                    text.contains("weft.socket_path"),
-                    "expected 'weft.socket_path' in config output, got: {text:?}"
+                    text.contains("retention.max_job_history"),
+                    "expected daemon config output, got: {text:?}"
                 );
             }
             other => panic!("expected EvalText config response, got {other:?}"),

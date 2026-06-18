@@ -38,6 +38,11 @@ pub fn pid_path() -> PathBuf {
     runtime_dir().join("cued.pid")
 }
 
+/// Runtime-owned sandbox work directory.
+pub(crate) fn runtime_sandbox_dir() -> PathBuf {
+    runtime_dir().join("sandbox")
+}
+
 // ── Data dir (SQLite + output logs) ──
 
 /// `$XDG_DATA_HOME/cue-shell/` (fallback `~/.local/share/cue-shell/`).
@@ -131,6 +136,7 @@ fn non_empty_env(value: Option<OsString>) -> Option<OsString> {
 pub fn ensure_dirs() -> Result<()> {
     let dirs = [
         runtime_dir(),
+        runtime_sandbox_dir(),
         data_dir()?,
         output_dir()?,
         state_dir()?,

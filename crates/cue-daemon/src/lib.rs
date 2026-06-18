@@ -14,6 +14,7 @@ mod pty;
 mod resource;
 mod ring_buffer;
 mod runtime_env;
+mod sandbox;
 mod service;
 mod storage;
 mod upgrade;

@@ -8,10 +8,10 @@ use crate::id::ScopeHash;
 /// Immutable, content-addressed environment snapshot.
 ///
 /// Scope ≈ git commit: immutable, content-addressed.
-/// `:env set` / `:cd` create a new Scope and move the HEAD pointer.
+/// `:env set` / `:cd` create a new Scope and move the owning session cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scope {
-    /// blake3(canonical_bytes(env + cwd + ...))
+    /// blake3(canonical_bytes(env + cwd))
     pub hash: ScopeHash,
     /// Parent in the delta chain (None for root scopes).
     pub parent: Option<ScopeHash>,
@@ -21,7 +21,7 @@ pub struct Scope {
     pub snapshot: Option<EnvSnapshot>,
 }
 
-/// Full environment state.
+/// Full scope state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSnapshot {
     pub env: BTreeMap<String, String>,
@@ -97,6 +97,7 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_json_snapshot;
 
     fn test_snapshot() -> EnvSnapshot {
         let mut env = BTreeMap::new();
@@ -121,6 +122,19 @@ mod tests {
         let mut b = test_snapshot();
         b.env.insert("FOO".into(), "bar".into());
         assert_ne!(a.compute_hash(), b.compute_hash());
+    }
+
+    #[test]
+    fn snapshot_json_contains_only_env_and_cwd() {
+        assert_json_snapshot!(test_snapshot(), @r###"
+        {
+          "env": {
+            "HOME": "/home/test",
+            "PATH": "/usr/bin"
+          },
+          "cwd": "/tmp"
+        }
+        "###);
     }
 
     #[test]
