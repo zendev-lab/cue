@@ -37,6 +37,7 @@ pub(crate) struct SandboxConfig {
 /// `<upper_root>/<job-id>/{upper,work}` pair, and `min_free_ratio` guards the
 /// backing filesystem (typically `/dev/shm`) against being exhausted by runaway
 /// writes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct SandboxDefaults {
     pub upper_root: PathBuf,

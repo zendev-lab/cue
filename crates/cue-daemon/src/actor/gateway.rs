@@ -14,8 +14,9 @@ use tracing::{debug, error, info, warn};
 use cue_core::EventChannel;
 use cue_core::command_spec::{command_names, command_spec, mode_param_specs_for_command};
 use cue_core::ipc::{
-    CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan, MAX_MESSAGE_SIZE,
-    Message, OkPayload, RequestPayload, ResponsePayload, encode_message, error_code,
+    CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan,
+    IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
+    current_protocol_capabilities, encode_message, error_code,
 };
 use cue_core::scope::EnvSnapshot;
 
@@ -685,6 +686,8 @@ async fn route_request(
                     request_id,
                     payload: ResponsePayload::Ok(OkPayload::Pong {
                         version: crate::version().to_string(),
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        capabilities: current_protocol_capabilities(),
                     }),
                 })
                 .await?;
@@ -939,6 +942,8 @@ mod tests {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::Pong {
                 version: "0.1.0".into(),
+                protocol_version: IPC_PROTOCOL_VERSION,
+                capabilities: current_protocol_capabilities(),
             }),
         };
         write_message(&mut a, &msg).await.unwrap();
@@ -947,7 +952,7 @@ mod tests {
             decoded,
             Message::Response {
                 id: 1,
-                payload: ResponsePayload::Ok(OkPayload::Pong { version }),
+                payload: ResponsePayload::Ok(OkPayload::Pong { version, .. }),
             } if version == "0.1.0"
         ));
     }

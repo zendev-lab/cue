@@ -338,6 +338,16 @@ where
     assert!(matches!(resp, ResponsePayload::Ok(OkPayload::Ack {})));
 }
 
+fn assert_missing_session_error(response: ResponsePayload) {
+    match response {
+        ResponsePayload::Err { code, message } => {
+            assert_eq!(code, "INVALID_REQUEST");
+            assert_eq!(message, "client session handshake required");
+        }
+        other => panic!("expected missing-session error before handshake, got {other:?}"),
+    }
+}
+
 /// Send a request and return the matching response payload.
 async fn roundtrip<S>(stream: &mut S, id: u32, payload: RequestPayload) -> ResponsePayload
 where
@@ -663,22 +673,27 @@ async fn test_unhandshaken_client_can_recover_by_handshaking_on_same_connection(
             },
         )
         .await;
-        match response {
-            ResponsePayload::Err { code, message } => {
-                assert_eq!(code, "INVALID_REQUEST");
-                assert_eq!(message, "client session handshake required");
-            }
-            other => panic!("expected missing-session error before handshake, got {other:?}"),
-        }
+        assert_missing_session_error(response);
+
+        let response = roundtrip(
+            &mut stream,
+            2,
+            RequestPayload::RunScript {
+                path: "recover.cue".into(),
+                input: "echo script".into(),
+            },
+        )
+        .await;
+        assert_missing_session_error(response);
 
         handshake(&mut stream, "recover-session", &env.root).await;
-        let response = roundtrip(&mut stream, 2, RequestPayload::Ping {}).await;
+        let response = roundtrip(&mut stream, 3, RequestPayload::Ping {}).await;
         assert!(
             matches!(response, ResponsePayload::Ok(OkPayload::Pong { .. })),
             "expected Pong after late handshake, got {response:?}"
         );
 
-        let _ = roundtrip(&mut stream, 3, RequestPayload::Shutdown {}).await;
+        let _ = roundtrip(&mut stream, 4, RequestPayload::Shutdown {}).await;
         let _ = child.wait().await;
     })
     .await;

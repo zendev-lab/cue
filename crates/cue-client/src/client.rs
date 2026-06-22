@@ -13,8 +13,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use cue_core::ipc::{
-    EventPayload, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
-    encode_message,
+    EventPayload, IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED, IPC_PROTOCOL_VERSION,
+    MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload, encode_message,
 };
 use cue_core::{EventChannel, Mode};
 
@@ -124,8 +124,28 @@ impl CuedClient {
         match self.recv().await? {
             Message::Response {
                 id,
-                payload: ResponsePayload::Ok(OkPayload::Pong { version }),
-            } if id == ping_id => Ok(version),
+                payload:
+                    ResponsePayload::Ok(OkPayload::Pong {
+                        version,
+                        protocol_version,
+                        capabilities,
+                    }),
+            } if id == ping_id => {
+                if protocol_version < IPC_PROTOCOL_VERSION {
+                    bail!(
+                        "daemon IPC protocol version {protocol_version} is older than required {IPC_PROTOCOL_VERSION}; upgrade/restart cued"
+                    );
+                }
+                if !capabilities
+                    .iter()
+                    .any(|capability| capability == IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED)
+                {
+                    bail!(
+                        "daemon IPC protocol is missing required capability {IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED}; upgrade/restart cued"
+                    );
+                }
+                Ok(version)
+            }
             message => bail!("unexpected message while validating daemon transport: {message:?}"),
         }
     }
@@ -972,13 +992,15 @@ mod tests {
                 id: request_id,
                 payload: ResponsePayload::Ok(OkPayload::Pong {
                     version: "0.1.0".into(),
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    capabilities: vec![IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED.into()],
                 }),
             },
         )
         .await;
 
         match response_task.await.unwrap().unwrap() {
-            ResponsePayload::Ok(OkPayload::Pong { version }) if version == "0.1.0" => {}
+            ResponsePayload::Ok(OkPayload::Pong { version, .. }) if version == "0.1.0" => {}
             other => panic!("unexpected response: {other:?}"),
         }
 

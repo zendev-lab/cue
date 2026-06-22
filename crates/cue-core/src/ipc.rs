@@ -13,6 +13,19 @@ use crate::event_channel::EventChannel;
 use crate::job::JobStatus;
 use crate::mode::Mode;
 
+/// IPC protocol version required by sessionized clients.
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
+/// Capability advertised by daemons that reject session-dependent requests before `Handshake`.
+pub const IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED: &str = "session-handshake-required";
+const IPC_CAPABILITIES: &[&str] = &[IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED];
+
+pub fn current_protocol_capabilities() -> Vec<String> {
+    IPC_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
+
 // ── Message Envelope ──
 
 /// Top-level message, length-prefixed JSON over Unix socket.
@@ -229,6 +242,10 @@ pub enum OkPayload {
     Pong {
         /// Daemon `cued` build version reported by the running daemon.
         version: String,
+        /// IPC protocol version implemented by the daemon.
+        protocol_version: u32,
+        /// Feature flags implemented by the daemon for explicit client gating.
+        capabilities: Vec<String>,
     },
 }
 
@@ -890,12 +907,44 @@ mod tests {
     }
 
     #[test]
+    fn pong_requires_protocol_version_field() {
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","capabilities":[]}}}"#;
+        let error = serde_json::from_str::<ResponsePayload>(json)
+            .expect_err("Pong must carry a protocol version");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `protocol_version`"),
+            "wrong error: {error}"
+        );
+    }
+
+    #[test]
+    fn pong_requires_capabilities_field() {
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2}}}"#;
+        let error = serde_json::from_str::<ResponsePayload>(json)
+            .expect_err("Pong must carry protocol capabilities");
+
+        assert!(
+            error.to_string().contains("missing field `capabilities`"),
+            "wrong error: {error}"
+        );
+    }
+
+    #[test]
     fn pong_decodes_versioned_payload() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0"}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2,"capabilities":["session-handshake-required"]}}}"#;
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
-            ResponsePayload::Ok(OkPayload::Pong { version }) => {
+            ResponsePayload::Ok(OkPayload::Pong {
+                version,
+                protocol_version,
+                capabilities,
+            }) => {
                 assert_eq!(version, "0.1.0");
+                assert_eq!(protocol_version, IPC_PROTOCOL_VERSION);
+                assert_eq!(capabilities, current_protocol_capabilities());
             }
             _ => panic!("wrong variant"),
         }
@@ -905,8 +954,13 @@ mod tests {
     fn pong_serializes_reported_version() {
         let payload = ResponsePayload::Ok(OkPayload::Pong {
             version: "0.1.0".into(),
+            protocol_version: IPC_PROTOCOL_VERSION,
+            capabilities: current_protocol_capabilities(),
         });
         let json = serde_json::to_string(&payload).unwrap();
-        assert_eq!(json, r#"{"Ok":{"Pong":{"version":"0.1.0"}}}"#);
+        assert_eq!(
+            json,
+            r#"{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2,"capabilities":["session-handshake-required"]}}}"#
+        );
     }
 }

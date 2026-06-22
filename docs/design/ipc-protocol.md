@@ -47,6 +47,9 @@ enum Message {
 // Response (success — Eval resolved to a serial chain)
 {"type": "response", "id": 1, "payload": {"Ok": {"ChainCreated": {"chain_id": "CH1", "job_ids": ["J1"], "chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Running", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": null, "start_scope": null, "end_scope": null, "open_hint": null}]}}}}}
 
+// Response (error — session-dependent request sent before Handshake)
+{"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_REQUEST", "message": "client session handshake required"}}}
+
 // Response (error)
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "cue chain operator `|?|` must be surrounded by whitespace"}}}
 
@@ -79,10 +82,11 @@ enum Message {
 
 Flow:
 
-1. Client connects to Unix socket
-2. Client sends `Subscribe` request to register interest channels
-3. cued responds with `Ok`
-4. Bidirectional: client sends Requests, cued sends Responses (matched by `id`) + Events (no `id`)
+1. Client connects to Unix socket or `cued gateway --stdio`
+2. Client sends `Handshake { session_id, cwd, env }`
+3. cued responds with `Ok`; session-dependent requests before this point return `INVALID_REQUEST: client session handshake required`
+4. Client sends `Subscribe` requests to register interest channels
+5. Bidirectional: client sends Requests, cued sends Responses (matched by `id`) + Events (no `id`)
 
 Client must be prepared to receive interleaved Response and Event messages.
 
@@ -234,7 +238,11 @@ enum OkPayload {
     HighlightResult { spans: Vec<HighlightSpan> },
 
     FgAttached { id: String },  // J<n> = live PTY attach
-    Pong { version: String },  // reports cued's build version
+    Pong {
+        version: String,           // reports cued's build version
+        protocol_version: u32,     // current sessionized IPC protocol version
+        capabilities: Vec<String>, // includes "session-handshake-required"
+    }
 }
 
 struct PageInfo {
@@ -263,6 +271,11 @@ struct HighlightSpan {
     kind: HighlightKind,    // CommandPrefix, CommandName, Operator, IdRef, Error, ...
 }
 ```
+
+`Ping`/`Pong` is also the feature gate for typed clients. Sessionized clients
+must require `protocol_version >= 2` and the `session-handshake-required`
+capability; older daemons that only report `Pong { version }` are stale and
+should be upgraded/restarted before jobs are submitted.
 
 ## 8. Event Types (cued → Client, pushed)
 

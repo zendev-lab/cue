@@ -1856,7 +1856,7 @@ impl AppState {
                                 );
                             }
                         }
-                        OkPayload::Pong { version } => {
+                        OkPayload::Pong { version, .. } => {
                             tracing::debug!(?version, "pong received");
                         }
                         OkPayload::Output {

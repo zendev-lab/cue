@@ -115,7 +115,10 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use cue_core::ipc::{Message, OkPayload, RequestPayload, ResponsePayload, encode_message};
+    use cue_core::ipc::{
+        IPC_PROTOCOL_VERSION, Message, OkPayload, RequestPayload, ResponsePayload,
+        current_protocol_capabilities, encode_message,
+    };
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
 
@@ -167,6 +170,8 @@ mod tests {
             id: 7,
             payload: ResponsePayload::Ok(OkPayload::Pong {
                 version: "0.1.0".into(),
+                protocol_version: IPC_PROTOCOL_VERSION,
+                capabilities: current_protocol_capabilities(),
             }),
         })
         .unwrap();
