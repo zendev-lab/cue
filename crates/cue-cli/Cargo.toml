@@ -11,28 +11,28 @@ license.workspace = true
 name = "cue"
 path = "src/main.rs"
 
-# Packaging-only wrappers: the implementation owners remain cue-client,
-# cue-tui, and cue-daemon; these targets are enabled only for the PyPI
-# `cue-shell` package because maturin packages binaries from one Cargo package.
+# First-party companion binaries are sourced from their owning crates. The
+# feature gates let package builders select exactly which command surfaces the
+# aggregate `cue-cli` package should expose.
 [[bin]]
 name = "cue-client"
-path = "src/bin/cue-client.rs"
-required-features = ["python-package"]
+path = "../cue-client/src/bin/cue-client.rs"
+required-features = ["cue-client"]
 
 [[bin]]
 name = "cue-tui"
-path = "src/bin/cue-tui.rs"
-required-features = ["python-package"]
+path = "../cue-tui/src/bin/cue-tui.rs"
+required-features = ["cue-tui"]
 
 [[bin]]
 name = "cue-daemon"
-path = "src/bin/cue-daemon.rs"
-required-features = ["python-package"]
+path = "../cue-daemon/src/bin/cue-daemon.rs"
+required-features = ["cue-daemon"]
 
 [[bin]]
 name = "cued"
-path = "src/bin/cued.rs"
-required-features = ["python-package"]
+path = "../cue-daemon/src/bin/cued.rs"
+required-features = ["cue-daemon"]
 
 [dependencies]
 anyhow.workspace = true
@@ -47,12 +47,7 @@ toml.workspace = true
 libc.workspace = true
 
 [features]
-# Enabled only by pyproject/maturin so the Python wheel exposes all first-party
-# command names while Rust workspace ownership remains split across crates.
-python-package = [
-  "dep:cue-daemon",
-  "dep:cue-tui",
-]
-# Deprecated compatibility features; `cue run`/`cue tui` now forward to companion binaries.
-script = []
-tui = []
+default = ["cue-client", "cue-daemon", "cue-tui"]
+cue-client = []
+cue-daemon = ["dep:cue-daemon"]
+cue-tui = ["dep:cue-tui"]

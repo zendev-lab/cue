@@ -28,5 +28,5 @@ tracing-subscriber.workspace = true
 insta.workspace = true
 
 [features]
-default = []
+default = ["gpu-nvidia"]
 gpu-nvidia = ["dep:nvml-wrapper"]

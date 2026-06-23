@@ -310,7 +310,7 @@ fails immediately because file-script execution needs a live daemon.
 | cue-client | ✅ Transport profiles / target JSON / script runner |
 | cue-daemon | ✅ Durable jobs / crons / scopes / PTY attach |
 | cue-tui | ✅ Interactive job+cron frontend / reconnect view |
-| cue-cli | ✅ Aggregator / extension dispatch / PyPI command wrappers |
+| cue-cli | ✅ Aggregator / extension dispatch / package feature gates for first-party commands |
 
 ## License
 
