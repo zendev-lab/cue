@@ -64,6 +64,10 @@ pub enum RequestPayload {
         session_id: String,
         cwd: String,
         env: BTreeMap<String, String>,
+        /// Explicitly replace an existing session cursor with this handshake snapshot.
+        /// Defaults to false so ordinary reconnects keep the existing session scope.
+        #[serde(default)]
+        refresh: bool,
     },
     Subscribe {
         channels: Vec<String>,

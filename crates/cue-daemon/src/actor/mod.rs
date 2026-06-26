@@ -77,6 +77,8 @@ pub(crate) enum SchedulerMsg {
         client_id: u64,
         session_id: String,
         snapshot: EnvSnapshot,
+        /// Explicitly refresh an existing session cursor from the handshake snapshot.
+        refresh: bool,
         reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
     /// Mark a transport client as disconnected and start session TTL handling.

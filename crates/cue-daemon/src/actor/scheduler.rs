@@ -343,8 +343,8 @@ pub(super) async fn spawn(
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
                     match msg {
-                        SchedulerMsg::Connect { client_id, session_id, snapshot, reply } => {
-                            let result = connect_session(client_id, session_id, snapshot, &mut state, &sys).await;
+                        SchedulerMsg::Connect { client_id, session_id, snapshot, refresh, reply } => {
+                            let result = connect_session(client_id, session_id, snapshot, refresh, &mut state, &sys).await;
                             let _ = reply.send(result);
                         }
 
@@ -901,23 +901,36 @@ async fn connect_session(
     client_id: u64,
     session_id: String,
     snapshot: EnvSnapshot,
+    refresh: bool,
     state: &mut SchedulerState,
     sys: &ActorSystem,
 ) -> anyhow::Result<ScopeHash> {
     let mut old_session_id = state.client_sessions.get(&client_id).cloned();
+    let mut same_client_session = old_session_id.as_deref() == Some(session_id.as_str());
 
-    if old_session_id.as_deref() == Some(session_id.as_str()) {
-        if let Some(session) = state.sessions.get_mut(&session_id) {
-            session.disconnected_at = None;
-            return Ok(session.scope);
-        }
+    if same_client_session && !state.sessions.contains_key(&session_id) {
         state.client_sessions.remove(&client_id);
         old_session_id = None;
+        same_client_session = false;
     }
 
-    if let Some(session) = state.sessions.get_mut(&session_id) {
-        session.connected_clients += 1;
+    if state.sessions.contains_key(&session_id) {
+        let refreshed_scope = if refresh {
+            Some(insert_scope(sys, Scope::root(snapshot)).await?)
+        } else {
+            None
+        };
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("session exists after contains_key");
+        if !same_client_session {
+            session.connected_clients += 1;
+        }
         session.disconnected_at = None;
+        if let Some(scope) = refreshed_scope {
+            session.scope = scope;
+        }
         let scope = session.scope;
         state.client_sessions.insert(client_id, session_id.clone());
         mark_replaced_session_disconnected(state, old_session_id, &session_id);
@@ -3872,6 +3885,34 @@ async fn handle_command_with_scope(
                         Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
                     }
                 }
+                Ok(EnvCommand::Unset { keys }) => {
+                    let delta = cue_core::scope::EnvDelta {
+                        set: std::collections::BTreeMap::new(),
+                        unset: keys,
+                        cwd: None,
+                    };
+                    let Some(base) = state.client_scope(client_id) else {
+                        return ResponsePayload::err(
+                            error_code::INVALID_REQUEST,
+                            "client session handshake required",
+                        );
+                    };
+                    match derive_scope(sys, base, delta).await {
+                        Ok(hash) => {
+                            if let Some(session) = state.session_for_client_mut(client_id) {
+                                session.scope = hash;
+                            }
+                            match get_scope_snapshot_by_hash(sys, hash).await {
+                                Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
+                                    hash: hash.to_string(),
+                                    summary: format_scope_change_summary(hash, &snapshot, &updated),
+                                }),
+                                Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
+                            }
+                        }
+                        Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
+                    }
+                }
                 Err(message) => ResponsePayload::err(error_code::INVALID_SYNTAX, message),
             }
         }
@@ -4348,6 +4389,7 @@ async fn remove_job_logs(job_id: JobId) {
 enum EnvCommand {
     Show,
     Set { assignments: Vec<String> },
+    Unset { keys: Vec<String> },
 }
 
 fn parse_env_command(subcommand: Option<&str>) -> Result<EnvCommand, String> {
@@ -4368,6 +4410,17 @@ fn parse_env_command(subcommand: Option<&str>) -> Result<EnvCommand, String> {
             }
             Ok(EnvCommand::Set {
                 assignments: rest.to_vec(),
+            })
+        }
+        "unset" => {
+            if rest.is_empty() {
+                return Err("`:env unset` expects at least one variable name".into());
+            }
+            if let Some(key) = rest.iter().find(|key| key.is_empty() || key.contains('=')) {
+                return Err(format!("`:env unset` expects variable names, got `{key}`"));
+            }
+            Ok(EnvCommand::Unset {
+                keys: rest.to_vec(),
             })
         }
         other => Err(format!("unsupported `:env` subcommand `{other}`")),
@@ -5361,6 +5414,7 @@ mod tests {
             client_id,
             format!("test-session-{client_id}"),
             snapshot,
+            false,
             state,
             sys,
         )
@@ -5375,6 +5429,16 @@ mod tests {
         }
     }
 
+    fn test_handshake_snapshot_with_env(pairs: &[(&str, &str)]) -> cue_core::scope::EnvSnapshot {
+        cue_core::scope::EnvSnapshot {
+            env: pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            cwd: std::env::current_dir().expect("current dir"),
+        }
+    }
+
     #[tokio::test]
     async fn failed_initial_session_connect_does_not_record_client_mapping() {
         let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
@@ -5385,6 +5449,7 @@ mod tests {
             7,
             "failed-session".into(),
             test_handshake_snapshot(),
+            false,
             &mut state,
             &sys,
         )
@@ -5406,6 +5471,7 @@ mod tests {
             7,
             "old-session".into(),
             test_handshake_snapshot(),
+            false,
             &mut state,
             &sys,
         )
@@ -5419,6 +5485,7 @@ mod tests {
             7,
             "new-session".into(),
             test_handshake_snapshot(),
+            false,
             &mut state,
             &broken_sys,
         )
@@ -5434,6 +5501,124 @@ mod tests {
         assert_eq!(state.sessions["old-session"].connected_clients, 1);
         assert!(state.sessions["old-session"].disconnected_at.is_none());
         assert!(!state.sessions.contains_key("new-session"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_without_refresh_keeps_existing_session_scope() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let mut state = SchedulerState::new();
+        let initial = connect_session(
+            7,
+            "sticky-session".into(),
+            test_handshake_snapshot_with_env(&[("NODE_VERSION", "24")]),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("initial session connects");
+
+        let reconnected = connect_session(
+            7,
+            "sticky-session".into(),
+            test_handshake_snapshot_with_env(&[("NODE_VERSION", "26")]),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("ordinary reconnect reuses session");
+
+        assert_eq!(reconnected, initial);
+        let snapshot = get_scope_snapshot_by_hash(&sys, reconnected)
+            .await
+            .expect("scope snapshot");
+        assert_eq!(
+            snapshot.env.get("NODE_VERSION").map(String::as_str),
+            Some("24")
+        );
+        assert_eq!(state.sessions["sticky-session"].connected_clients, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_replaces_existing_session_scope() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let mut state = SchedulerState::new();
+        let initial = connect_session(
+            7,
+            "refreshable-session".into(),
+            test_handshake_snapshot_with_env(&[("NODE_VERSION", "24")]),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("initial session connects");
+
+        let refreshed = connect_session(
+            7,
+            "refreshable-session".into(),
+            test_handshake_snapshot_with_env(&[("NODE_VERSION", "26")]),
+            true,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("explicit refresh replaces session scope");
+
+        assert_ne!(refreshed, initial);
+        assert_eq!(state.client_scope(7), Some(refreshed));
+        assert_eq!(state.sessions["refreshable-session"].connected_clients, 1);
+        let snapshot = get_scope_snapshot_by_hash(&sys, refreshed)
+            .await
+            .expect("refreshed scope snapshot");
+        assert_eq!(
+            snapshot.env.get("NODE_VERSION").map(String::as_str),
+            Some("26")
+        );
+    }
+
+    #[tokio::test]
+    async fn env_unset_moves_session_cursor_and_future_scope() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        connect_session(
+            7,
+            "env-session".into(),
+            test_handshake_snapshot_with_env(&[("REMOVE_ME", "1"), ("KEEP_ME", "yes")]),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("initial session connects");
+
+        let response = handle_command(
+            ResolvedCommand::Env {
+                subcommand: Some("unset REMOVE_ME".into()),
+            },
+            7,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            response,
+            ResponsePayload::Ok(OkPayload::ScopeCreated { .. })
+        ));
+        let scope = state.client_scope(7).expect("session scope after unset");
+        let snapshot = get_scope_snapshot_by_hash(&sys, scope)
+            .await
+            .expect("unset scope snapshot");
+        assert!(!snapshot.env.contains_key("REMOVE_ME"));
+        assert_eq!(snapshot.env.get("KEEP_ME").map(String::as_str), Some("yes"));
     }
 
     fn spawn_fake_process_mgr(mut rx: mpsc::Receiver<ProcessMgrMsg>) {

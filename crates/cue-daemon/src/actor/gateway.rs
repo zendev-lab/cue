@@ -280,6 +280,7 @@ async fn route_request(
             session_id,
             cwd,
             env,
+            refresh,
         } => {
             let snapshot = EnvSnapshot {
                 env,
@@ -291,6 +292,7 @@ async fn route_request(
                     client_id,
                     session_id,
                     snapshot,
+                    refresh,
                     reply,
                 })
                 .await

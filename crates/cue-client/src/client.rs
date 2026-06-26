@@ -59,6 +59,7 @@ impl CuedClient {
                 session_id,
                 cwd,
                 env,
+                refresh: false,
             })
             .await?;
         match self.recv().await? {

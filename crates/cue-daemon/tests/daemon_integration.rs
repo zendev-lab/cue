@@ -332,6 +332,7 @@ where
             session_id: session_id.to_string(),
             cwd: cwd.display().to_string(),
             env: BTreeMap::new(),
+            refresh: false,
         },
     )
     .await;
