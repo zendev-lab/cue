@@ -31,7 +31,10 @@ mod submission;
 mod target_config;
 mod target_settings;
 mod terminal;
+mod tui_debug;
 mod ui;
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use app::AppState;
@@ -53,6 +56,7 @@ pub struct RunOptions {
     client: Option<CuedClient>,
     session_profile_name: Option<String>,
     restart_handle: Option<RestartHandle>,
+    debug_socket: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -62,6 +66,7 @@ impl RunOptions {
             client: None,
             session_profile_name: None,
             restart_handle: None,
+            debug_socket: None,
         }
     }
 
@@ -84,6 +89,11 @@ impl RunOptions {
         self.restart_handle = restart_handle;
         self
     }
+
+    pub fn with_debug_socket(mut self, debug_socket: Option<PathBuf>) -> Self {
+        self.debug_socket = debug_socket;
+        self
+    }
 }
 
 /// Run the TUI application.
@@ -97,6 +107,7 @@ pub async fn run(options: RunOptions) -> Result<()> {
         client,
         session_profile_name,
         restart_handle,
+        debug_socket,
     } = options;
 
     // Split client into reader/writer handle if connected.
@@ -150,12 +161,37 @@ pub async fn run(options: RunOptions) -> Result<()> {
     }
 
     // Spawn event loop with the shared connector for auto-reconnect.
-    let (mut rx, connection_controller) = event::spawn_event_loop(socket_reader, client_connector)?;
+    let (mut rx, connection_controller, inject_tx) =
+        event::spawn_event_loop(socket_reader, client_connector)?;
     state.set_connection_controller(connection_controller);
+
+    let mut debug_server = None;
+    let debug_control = if let Some(socket_path) = debug_socket {
+        let snapshots = tui_debug::shared_debug_snapshots();
+        let control = tui_debug::DebugControl {
+            snapshots: snapshots.clone(),
+            inject_tx,
+        };
+        debug_server = Some(
+            tui_debug::spawn_debug_server(socket_path, control.clone())
+                .context("start debug control server")?,
+        );
+        tui_debug::update_state_snapshot(&control.snapshots, &state);
+        Some(control)
+    } else {
+        None
+    };
 
     // Main loop.
     let result = loop {
-        if let Err(e) = terminal.draw(|frame| ui::draw(frame, &state)) {
+        if let Some(control) = debug_control.as_ref() {
+            if let Err(e) = terminal.draw(|frame| {
+                ui::draw(frame, &state);
+                tui_debug::record_frame_snapshot(control, frame.buffer_mut());
+            }) {
+                break Err(e).context("draw frame");
+            }
+        } else if let Err(e) = terminal.draw(|frame| ui::draw(frame, &state)) {
             break Err(e).context("draw frame");
         }
 
@@ -166,7 +202,12 @@ pub async fn run(options: RunOptions) -> Result<()> {
                 });
                 break Err(anyhow::anyhow!(message));
             }
-            Some(msg) => state.update(msg),
+            Some(msg) => {
+                state.update(msg);
+                if let Some(control) = debug_control.as_ref() {
+                    tui_debug::update_state_snapshot(&control.snapshots, &state);
+                }
+            }
             None => break Ok(()),
         }
 
@@ -196,6 +237,10 @@ pub async fn run(options: RunOptions) -> Result<()> {
     };
 
     terminal_restore.restore()?;
+
+    if let Some(server) = debug_server {
+        server.shutdown().await;
+    }
 
     result
 }

@@ -1,3 +1,4 @@
+use cue_core::ipc::JobOpenHint;
 use cue_core::job::JobStatus;
 
 use crate::component::main_view::Card;
@@ -7,6 +8,7 @@ use crate::record_format;
 pub(crate) struct CardJob<'a> {
     pub(crate) id: &'a str,
     pub(crate) status: &'a JobStatus,
+    pub(crate) open_hint: JobOpenHint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,13 +24,13 @@ pub(crate) fn inspect_card_action(
     job: Option<CardJob<'_>>,
 ) -> CardAction {
     if let Some(job) = job {
-        if matches!(job.status, JobStatus::Running) {
+        if matches!(job.status, JobStatus::Running) && job.open_hint == JobOpenHint::Fg {
             return CardAction::Foreground {
                 job_id: job.id.to_string(),
             };
         }
 
-        if job.status.is_terminal() {
+        if matches!(job.status, JobStatus::Running) || job.status.is_terminal() {
             return CardAction::Tail {
                 job_id: job.id.to_string(),
             };
@@ -61,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_card_action_foregrounds_running_jobs() {
+    fn inspect_card_action_foregrounds_only_foreground_capable_running_jobs() {
         let card = card("vim notes.md");
 
         assert_eq!(
@@ -71,10 +73,25 @@ mod tests {
                 Some(CardJob {
                     id: "J7",
                     status: &JobStatus::Running,
+                    open_hint: JobOpenHint::Fg,
                 }),
             ),
             CardAction::Foreground {
                 job_id: "J7".into(),
+            },
+        );
+        assert_eq!(
+            inspect_card_action(
+                3,
+                &card,
+                Some(CardJob {
+                    id: "J8",
+                    status: &JobStatus::Running,
+                    open_hint: JobOpenHint::Stream,
+                }),
+            ),
+            CardAction::Tail {
+                job_id: "J8".into(),
             },
         );
     }
@@ -96,6 +113,7 @@ mod tests {
                     Some(CardJob {
                         id: "J9",
                         status: &status,
+                        open_hint: JobOpenHint::Stream,
                     }),
                 ),
                 CardAction::Tail {
@@ -117,6 +135,7 @@ mod tests {
                 Some(CardJob {
                     id: "J4",
                     status: &JobStatus::Pending,
+                    open_hint: JobOpenHint::Fg,
                 }),
             ),
             CardAction::Preview(DisplayPreview::new(

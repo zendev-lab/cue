@@ -93,6 +93,11 @@ F(σ)  =  { jobs whose scope_hash = σ }
 On a scope fork, **existing jobs stay in their spawn scope** — the set
 `F(σ)` does not “move” when a session cursor advances.
 
+This is an index, not an ownership/lifecycle edge. A session cursor may move or
+expire, and a scope may no longer be the current cursor of any live session, but
+running jobs are still daemon/process-manager owned until they reach a terminal
+state, are explicitly killed/cancelled, or the daemon itself shuts down.
+
 Why it matters:
 
 - **Isolation**: interactive `cd` / env changes do not retroactively affect

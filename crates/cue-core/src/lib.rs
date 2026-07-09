@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod process_status;
 pub mod resource;
 pub mod scope;
+pub mod tui_debug;
 
 // Re-export commonly used types at crate root.
 pub use event_channel::EventChannel;

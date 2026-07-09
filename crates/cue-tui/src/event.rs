@@ -29,8 +29,13 @@ use cue_core::ipc::Message;
 pub(crate) fn spawn_event_loop(
     socket_reader: Option<ClientReader>,
     connector: ClientConnector,
-) -> Result<(mpsc::UnboundedReceiver<AppMsg>, ConnectionController)> {
+) -> Result<(
+    mpsc::UnboundedReceiver<AppMsg>,
+    ConnectionController,
+    mpsc::UnboundedSender<AppMsg>,
+)> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let inject_tx = tx.clone();
 
     // 1. Terminal events (blocking thread)
     let tx_term = tx.clone();
@@ -96,7 +101,7 @@ pub(crate) fn spawn_event_loop(
         }
     });
 
-    Ok((rx, controller))
+    Ok((rx, controller, inject_tx))
 }
 
 fn terminal_event_msg(event: CtEvent) -> Option<AppMsg> {

@@ -16,6 +16,10 @@ check:
 test *ARGS:
     cargo test {{ARGS}}
 
+# Exercise cue-tui's first-party debug socket in a real PTY
+tui-debug-smoke:
+    uv run scripts/cue_tui_debug_smoke.py
+
 # Run tests with coverage (requires cargo-llvm-cov)
 cov:
     cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture

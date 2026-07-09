@@ -209,6 +209,14 @@ impl AppState {
         }
     }
 
+    pub(crate) fn debug_job_count(&self) -> usize {
+        self.jobs.len()
+    }
+
+    pub(crate) fn debug_cron_count(&self) -> usize {
+        self.crons.len()
+    }
+
     pub(crate) fn fg_active(&self) -> bool {
         self.fg_session.is_some()
     }
@@ -674,6 +682,7 @@ impl AppState {
         Some(CardJob {
             id: &job.id,
             status: &job.status,
+            open_hint: job.open_hint,
         })
     }
 
@@ -1335,6 +1344,7 @@ impl AppState {
                 self.update(AppMsg::Submit(sidebar_action::job_open_command(
                     &job.id,
                     &job.status,
+                    job.open_hint,
                 )));
             }
             Mode::Cron => {

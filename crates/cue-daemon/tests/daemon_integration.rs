@@ -1394,6 +1394,51 @@ async fn test_sessions_keep_cwd_isolated_and_reconnect_by_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_background_job_survives_client_disconnect() {
+    run_daemon_test(async {
+        let env = TestEnv::new("background-disconnect");
+        let mut child = env.spawn_daemon();
+        let cwd = default_test_session_cwd(&env.socket);
+        let mut owner =
+            wait_for_socket_with_session(&env.socket, &mut child, "bg-owner", &cwd).await;
+
+        let resp = roundtrip(
+            &mut owner,
+            1,
+            RequestPayload::Eval {
+                input: "/bin/sleep 1".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = job_id_from_created(resp);
+        let owner_view = wait_for_job_status(&mut owner, 2, &job_id, |job| {
+            matches!(job.status, JobStatus::Running | JobStatus::Done)
+        })
+        .await;
+        assert!(owner_view.start_scope.is_some());
+
+        drop(owner);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut observer =
+            wait_for_socket_with_session(&env.socket, &mut child, "bg-observer", &cwd).await;
+        let observer_view = wait_for_job_status(&mut observer, 1, &job_id, |job| {
+            matches!(job.status, JobStatus::Running | JobStatus::Done)
+        })
+        .await;
+        assert_eq!(observer_view.id, job_id);
+        assert!(observer_view.start_scope.is_some());
+
+        let status = wait_for_job_terminal(&mut observer, 100, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        shutdown_daemon(&mut observer, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_jobs_merge_ambient_path_into_restored_scope() {
     run_daemon_test(async {
         let env = TestEnv::new("ambient-path");
