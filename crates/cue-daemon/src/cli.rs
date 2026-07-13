@@ -13,6 +13,10 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd as _, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -584,25 +588,25 @@ fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
     Err(error).with_context(|| format!("lock daemon instance {}", lock_path.display()))
 }
 
-/// Kill any running daemon and wait for it to exit (used by `--force`).
+/// Stop any running daemon and wait for it to release the socket-specific lock.
 fn force_stop_if_running_with_pid_path(
     pid_path: &Path,
     socket_path: &Path,
     lock_path: &Path,
 ) -> Result<()> {
     let pid_state = inspect_pid_file(pid_path)?;
-    if !daemon_ready(socket_path) {
-        if let PidFileState::Running(pid) = pid_state {
-            anyhow::bail!(
-                "refusing --force: PID marker {} names live pid {pid}, but socket {} cannot be confirmed as cued",
-                pid_path.display(),
-                socket_path.display()
-            );
-        }
+    if daemon_ready(socket_path) {
+        request_confirmed_shutdown(socket_path)?;
+    } else if let PidFileState::Running(pid) = pid_state {
+        terminate_verified_unreachable_daemon(pid, pid_path, socket_path, lock_path)?;
+    } else {
         return Ok(());
     }
 
-    request_confirmed_shutdown(socket_path)?;
+    wait_for_daemon_release(socket_path, lock_path)
+}
+
+fn wait_for_daemon_release(socket_path: &Path, lock_path: &Path) -> Result<()> {
     for _ in 0..50 {
         if !daemon_ready(socket_path)
             && let Ok(lock) = acquire_instance_lock(lock_path)
@@ -618,6 +622,138 @@ fn force_stop_if_running_with_pid_path(
         "confirmed cued daemon on {} did not release its socket and lock within 5 s",
         socket_path.display()
     );
+}
+
+fn terminate_verified_unreachable_daemon(
+    pid: u32,
+    pid_path: &Path,
+    socket_path: &Path,
+    lock_path: &Path,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let refusal = || {
+            format!(
+                "refusing --force: PID marker {} names live pid {pid}, but socket {} cannot be confirmed as cued",
+                pid_path.display(),
+                socket_path.display()
+            )
+        };
+        let pidfd = open_pidfd(pid).with_context(refusal)?;
+        anyhow::ensure!(
+            process_executable_matches_current(pid).with_context(refusal)?,
+            "refusing --force: PID marker {} names live pid {pid}, but that process is not this cued executable",
+            pid_path.display()
+        );
+        anyhow::ensure!(
+            process_holds_daemon_lock(pid, lock_path).with_context(refusal)?,
+            "refusing --force: PID marker {} names live pid {pid}, but that process does not hold daemon lock {}",
+            pid_path.display(),
+            lock_path.display()
+        );
+
+        println!(
+            "cued: socket {} is unreachable; stopping verified cued pid {pid}",
+            socket_path.display()
+        );
+        send_pidfd_sigterm(&pidfd, pid)?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!(
+            "refusing --force: PID marker {} names live pid {pid}, but socket {} cannot be confirmed as cued",
+            pid_path.display(),
+            socket_path.display()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Result<OwnedFd> {
+    // SAFETY: pidfd_open does not dereference userspace pointers. The returned
+    // descriptor pins process identity so PID reuse cannot redirect SIGTERM.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open pidfd for pid {pid}"));
+    }
+    // SAFETY: a successful pidfd_open returns a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn send_pidfd_sigterm(pidfd: &OwnedFd, pid: u32) -> Result<()> {
+    // SAFETY: the pidfd is owned and valid, the signal is a standard POSIX
+    // value, and a null siginfo pointer is supported by pidfd_send_signal.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("send SIGTERM to verified cued pid {pid}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_matches_current(pid: u32) -> Result<bool> {
+    let running_exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .with_context(|| format!("inspect executable for pid {pid}"))?;
+    let current_exe = std::env::current_exe().context("resolve current cued executable")?;
+    Ok(normalize_proc_exe_path(&running_exe) == current_exe)
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_proc_exe_path(path: &Path) -> PathBuf {
+    const DELETED_SUFFIX: &str = " (deleted)";
+    path.to_str()
+        .and_then(|value| value.strip_suffix(DELETED_SUFFIX))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn process_holds_daemon_lock(pid: u32, lock_path: &Path) -> Result<bool> {
+    let lock_metadata = std::fs::metadata(lock_path)
+        .with_context(|| format!("inspect daemon lock {}", lock_path.display()))?;
+    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
+    let entries = std::fs::read_dir(&fd_dir)
+        .with_context(|| format!("inspect file descriptors for pid {pid}"))?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("inspect file descriptor for pid {pid}"))?;
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.dev() != lock_metadata.dev() || metadata.ino() != lock_metadata.ino() {
+            continue;
+        }
+
+        let fd_name = entry.file_name();
+        let fdinfo_path = PathBuf::from(format!("/proc/{pid}/fdinfo")).join(fd_name);
+        let fdinfo = std::fs::read_to_string(&fdinfo_path)
+            .with_context(|| format!("inspect daemon lock ownership for pid {pid}"))?;
+        let pid_text = pid.to_string();
+        if fdinfo.lines().any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            line.starts_with("lock:")
+                && fields
+                    .windows(2)
+                    .any(|pair| pair == ["WRITE", pid_text.as_str()])
+        }) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn request_confirmed_shutdown(socket_path: &Path) -> Result<()> {
@@ -1106,10 +1242,13 @@ mod tests {
         let pid_path = crate::dirs::pid_path_for_socket(&socket);
         let lock_path = crate::dirs::lock_path_for_socket(&socket);
         std::fs::write(&pid_path, std::process::id().to_string()).expect("write live PID marker");
+        std::fs::write(&lock_path, "").expect("write unlocked daemon marker");
 
         let error = force_stop_if_running_with_pid_path(&pid_path, &socket, &lock_path)
             .expect_err("unconfirmed live PID must never be signalled");
         assert!(format!("{error:#}").contains("refusing --force"));
+        #[cfg(target_os = "linux")]
+        assert!(format!("{error:#}").contains("does not hold daemon lock"));
         assert!(pid_path.exists(), "fail-closed force must preserve marker");
 
         std::fs::remove_dir_all(dir).expect("remove temp dir");

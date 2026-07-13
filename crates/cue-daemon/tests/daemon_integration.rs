@@ -671,6 +671,90 @@ async fn test_daemon_lifecycle() {
     .await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_restart_recovers_live_daemon_after_socket_is_unlinked() {
+    run_daemon_test(async {
+        let env = TestEnv::new("restart-unlinked-socket");
+        let mut old_daemon = env.spawn_daemon();
+        let stream = wait_for_socket(&env.socket, &mut old_daemon).await;
+        let old_pid = old_daemon.id().expect("old daemon pid");
+        drop(stream);
+
+        fs::remove_file(&env.socket).expect("unlink live daemon socket");
+        assert!(
+            old_daemon.try_wait().expect("poll old daemon").is_none(),
+            "old daemon should remain alive after its socket is unlinked"
+        );
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cued"))
+            .args(["restart", "--socket"])
+            .arg(&env.socket)
+            .env("XDG_RUNTIME_DIR", &env.root)
+            .env("XDG_DATA_HOME", env.root.join("data"))
+            .env("XDG_STATE_HOME", env.root.join("state"))
+            .env("XDG_CONFIG_HOME", env.root.join("config"))
+            .env("HOME", &env.root)
+            .output()
+            .await
+            .expect("run cued restart");
+        assert!(
+            output.status.success(),
+            "restart failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        timeout(Duration::from_secs(5), old_daemon.wait())
+            .await
+            .expect("old daemon did not exit after verified restart")
+            .expect("wait for old daemon");
+
+        let pid_path = env.root.join("cued.sock.cued.pid");
+        let (new_pid, mut stream) = timeout(Duration::from_secs(5), async {
+            loop {
+                let pid = fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if let Some(pid) = pid
+                    && pid != old_pid
+                    && let Ok(stream) = UnixStream::connect(&env.socket).await
+                {
+                    return (pid, stream);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("restarted daemon did not become reachable");
+
+        handshake(
+            &mut stream,
+            &default_test_session_id(&env.socket),
+            &default_test_session_cwd(&env.socket),
+        )
+        .await;
+        let response = roundtrip(&mut stream, 1, RequestPayload::Ping {}).await;
+        assert!(matches!(
+            response,
+            ResponsePayload::Ok(OkPayload::Pong { .. })
+        ));
+
+        let _ = roundtrip(&mut stream, 2, RequestPayload::Shutdown {}).await;
+        unsafe {
+            libc::kill(new_pid as i32, libc::SIGTERM);
+        }
+        for _ in 0..50 {
+            if unsafe { libc::kill(new_pid as i32, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("restarted daemon pid {new_pid} did not exit");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_foreground_starts_have_one_socket_owner() {
     run_daemon_test(async {
