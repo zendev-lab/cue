@@ -5,6 +5,7 @@ members = [
   "crates/cue-client",
   "crates/cue-core",
   "crates/cue-daemon",
+  "crates/cue-terminal",
   "crates/cue-tui",
 ]
 
@@ -30,6 +31,7 @@ crossterm = { version = "0.29", features = ["bracketed-paste", "events"] }
 # Snapshot tests
 insta = { version = "1", features = ["json"] }
 libc = "0.2"
+libghostty-vt = { version = "=0.2.1", default-features = false }
 owo-colors = "4"
 # TUI
 ratatui = "0.30"

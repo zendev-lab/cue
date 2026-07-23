@@ -1,0 +1,17 @@
+[package]
+name = "cue-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Ghostty-backed foreground terminal model for cue-shell"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+libghostty-vt.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ratatui.workspace = true
