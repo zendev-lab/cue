@@ -267,6 +267,13 @@ pub(crate) enum ProcessMgrMsg {
         rows: u16,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// A PTY writer observed a controller-generation fence without delivering
+    /// a partial item, so a new controller may now be acquired safely.
+    InputWriterFenceSettled {
+        job_id: cue_core::JobId,
+        writer_incarnation: u64,
+        generation: u64,
+    },
     /// Graceful shutdown.
     Shutdown,
 }

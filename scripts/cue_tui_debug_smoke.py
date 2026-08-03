@@ -42,37 +42,62 @@ def main() -> int:
             stderr=slave_fd,
             close_fds=True,
         )
-        drain_thread = threading.Thread(target=drain_pty, args=(master_fd,), daemon=True)
+        drain_thread = threading.Thread(
+            target=drain_pty, args=(master_fd,), daemon=True
+        )
         drain_thread.start()
         os.close(slave_fd)
         try:
             wait_for_socket(socket_path, proc)
             wait_for_capture(socket_path, "Command Log", timeout_s=8)
-            initial_state = request(socket_path, {"id": 1, "command": "state"})["ok"]["state"]
+            initial_state = request(socket_path, {"id": 1, "command": "state"})["ok"][
+                "state"
+            ]
 
             subscriber = subscribe(socket_path)
             subscribed_frame = read_frame_until(subscriber, "Command Log", timeout_s=8)
             subscriber[1].close()
             subscriber[0].close()
-            assert_contains(subscribed_frame["text"], "Command Log", "subscribed initial frame")
+            assert_contains(
+                subscribed_frame["text"], "Command Log", "subscribed initial frame"
+            )
 
             command_text = f":run echo cue-debug-smoke-{proc.pid}"
-            request(socket_path, {"id": 2, "command": "write-chars", "text": command_text})
+            request(
+                socket_path, {"id": 2, "command": "write-chars", "text": command_text}
+            )
             typed_state = wait_for_state_input(socket_path, command_text, timeout_s=4)
-            assert_contains(typed_state["input"], command_text, "debug state input after write-chars")
+            assert_contains(
+                typed_state["input"],
+                command_text,
+                "debug state input after write-chars",
+            )
             request(socket_path, {"id": 3, "command": "send-keys", "keys": ["enter"]})
-            command_frame = wait_for_job_frame(socket_path, "cue-debug-smoke", timeout_s=8)
+            command_frame = wait_for_job_frame(
+                socket_path, "cue-debug-smoke", timeout_s=8
+            )
             job_id = parse_job_id(command_frame["text"])
-            request(socket_path, {"id": 4, "command": "write-chars", "text": f":out {job_id}"})
+            request(
+                socket_path,
+                {"id": 4, "command": "write-chars", "text": f":out {job_id}"},
+            )
             request(socket_path, {"id": 5, "command": "send-keys", "keys": ["enter"]})
-            stdout_frame = wait_for_capture(socket_path, f"stdout {job_id}", timeout_s=8)
-            assert_contains(stdout_frame["text"], f"cue-debug-smoke-{proc.pid}", "stdout display content")
+            stdout_frame = wait_for_capture(
+                socket_path, f"stdout {job_id}", timeout_s=8
+            )
+            assert_contains(
+                stdout_frame["text"],
+                f"cue-debug-smoke-{proc.pid}",
+                "stdout display content",
+            )
 
             state = request(socket_path, {"id": 6, "command": "state"})["ok"]["state"]
             if state["connected"] is not True or state["mode"] != "JOB":
                 raise AssertionError(f"unexpected debug state: {state!r}")
             if state["active_display_tab"] == initial_state["active_display_tab"]:
-                raise AssertionError(f"active display tab did not change: before={initial_state!r} after={state!r}")
+                raise AssertionError(
+                    f"active display tab did not change: before={initial_state!r} after={state!r}"
+                )
             request(socket_path, {"id": 7, "command": "send-keys", "keys": ["ctrl+d"]})
             proc.wait(timeout=8)
             socket_removed = cleanup_socket(socket_path)
@@ -98,7 +123,9 @@ def main() -> int:
             except OSError:
                 pass
             if proc.poll() is None:
-                request_best_effort(socket_path, {"id": 99, "command": "send-keys", "keys": ["ctrl+d"]})
+                request_best_effort(
+                    socket_path, {"id": 99, "command": "send-keys", "keys": ["ctrl+d"]}
+                )
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
@@ -122,15 +149,23 @@ def set_pty_size(fd: int, *, rows: int, cols: int) -> None:
 
 def ensure_cue_tui_binary() -> Path:
     binary = ROOT / "target" / "debug" / "cue-tui"
-    subprocess.run(["cargo", "build", "-p", "cue-tui", "--bin", "cue-tui"], cwd=ROOT, check=True)  # noqa: S603,S607
+    subprocess.run(
+        ["cargo", "build", "--locked", "-p", "cue-tui", "--bin", "cue-tui"],
+        cwd=ROOT,
+        check=True,
+    )  # noqa: S603,S607
     return binary
 
 
-def wait_for_socket(socket_path: Path, proc: subprocess.Popen[Any], timeout_s: float = 12) -> None:
+def wait_for_socket(
+    socket_path: Path, proc: subprocess.Popen[Any], timeout_s: float = 12
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"cue-tui exited before debug socket appeared: {proc.returncode}")
+            raise RuntimeError(
+                f"cue-tui exited before debug socket appeared: {proc.returncode}"
+            )
         if socket_path.exists():
             return
         time.sleep(0.05)
@@ -170,9 +205,9 @@ def subscribe(socket_path: Path) -> tuple[socket.socket, TextIO]:
 
 
 def read_frame_until(
-  subscriber: tuple[socket.socket, TextIO],
-  needle: str,
-  timeout_s: float,
+    subscriber: tuple[socket.socket, TextIO],
+    needle: str,
+    timeout_s: float,
 ) -> dict[str, Any]:
     client, file = subscriber
     client.settimeout(timeout_s)
@@ -184,10 +219,14 @@ def read_frame_until(
         event = json.loads(line)
         if event.get("event") == "frame" and needle in event.get("text", ""):
             return event
-    raise AssertionError(f"timed out waiting for subscribed frame containing {needle!r}")
+    raise AssertionError(
+        f"timed out waiting for subscribed frame containing {needle!r}"
+    )
 
 
-def wait_for_state_input(socket_path: Path, needle: str, timeout_s: float) -> dict[str, Any]:
+def wait_for_state_input(
+    socket_path: Path, needle: str, timeout_s: float
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -196,14 +235,20 @@ def wait_for_state_input(socket_path: Path, needle: str, timeout_s: float) -> di
         if needle in state.get("input", ""):
             return state
         time.sleep(0.1)
-    raise AssertionError(f"timed out waiting for state input {needle!r}; last state: {last!r}")
+    raise AssertionError(
+        f"timed out waiting for state input {needle!r}; last state: {last!r}"
+    )
 
 
-def wait_for_capture(socket_path: Path, needle: str, timeout_s: float) -> dict[str, Any]:
+def wait_for_capture(
+    socket_path: Path, needle: str, timeout_s: float
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last = ""
     while time.monotonic() < deadline:
-        capture = request(socket_path, {"id": 20, "command": "capture"})["ok"]["capture"]
+        capture = request(socket_path, {"id": 20, "command": "capture"})["ok"][
+            "capture"
+        ]
         last = capture["text"]
         if needle in last:
             return capture
@@ -211,16 +256,22 @@ def wait_for_capture(socket_path: Path, needle: str, timeout_s: float) -> dict[s
     raise AssertionError(f"timed out waiting for {needle!r}; last frame:\n{last}")
 
 
-def wait_for_job_frame(socket_path: Path, needle: str, timeout_s: float) -> dict[str, Any]:
+def wait_for_job_frame(
+    socket_path: Path, needle: str, timeout_s: float
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last = ""
     while time.monotonic() < deadline:
-        capture = request(socket_path, {"id": 22, "command": "capture"})["ok"]["capture"]
+        capture = request(socket_path, {"id": 22, "command": "capture"})["ok"][
+            "capture"
+        ]
         last = capture["text"]
         if needle in last and JOB_RE.search(last):
             return capture
         time.sleep(0.1)
-    raise AssertionError(f"timed out waiting for command record {needle!r}; last frame:\n{last}")
+    raise AssertionError(
+        f"timed out waiting for command record {needle!r}; last frame:\n{last}"
+    )
 
 
 def parse_job_id(frame_text: str) -> str:

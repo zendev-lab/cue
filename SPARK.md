@@ -2,7 +2,7 @@
 description: cue-shell 是一个 bash-like 的 durable process substrate，把命名 session、job、scope、chain、cron 作为一等原语，让人和 agent 共享同一个稳定的进程层；可选的 cue-flow 客户端层把声明式 workflow plan 编译到这些原语，不引入第二个 daemon。
 owner: zrr1999
 created: 2026-04-26
-updated: 2026-07-22
+updated: 2026-07-23
 inspired_by:
   - cue-shell
   - bash
@@ -68,6 +68,7 @@ Session 是 daemon 拥有的一等协作边界：它有稳定身份和可读名�
 - **Daemon 决定 durability**：人、agent 和 TUI 都是客户端，session 与 job 的真相在 `cued` 里——socket + SQLite + 进程表。客户端崩溃不影响 session 或 job。
 - **Scope 不可变 + HEAD 指针**：env/cwd 用快照表达，fork 与 query 廉价；变更通过新建 scope + 移 HEAD 完成，不是就地 mutate。
 - **结构化 IPC 优先**：所有外部交互走 JSON IPC + event stream；TUI 是这套协议的一个客户端，没有特权通道。
+- **终端状态是客户端投影**：`cued` 拥有 PTY、原始字节历史和 controller lease；TUI 用唯一的 `libghostty-vt` 后端重建终端语义，不把 cell grid 或 renderer 状态写回 daemon。
 - **组合大于内置**：上层工具（warp、agent、workflow runner）是被 cue-shell 跑起来的普通可执行，不为它们加专用 builtin。
 - **小而稳的原语集合**：Session / Job / Pipeline / Chain / Scope / Cron 六个原语足够覆盖目标场景；新增原语需要先证伪「能不能用现有原语组合出来」。
 - **工具面与原子操作对齐**：每一条对外能力应尽量对应某一原语上的单一操作（起 job、观测、杀/取消、scope 读写、cron 启停），避免把编排策略塞回底座；形式化读本见 [`docs/design/conceptual-model.md`](docs/design/conceptual-model.md)。
@@ -83,7 +84,7 @@ Session 是 daemon 拥有的一等协作边界：它有稳定身份和可读名�
 - **Cron**：纯机械的 timer→command，把时间作为触发源接到 job 接口上；不承担任何 agent wake / escalation 语义。
 - **JSON IPC + event stream**：daemon 暴露的唯一对外契约——session create/list/attach/watch，以及 argv/cwd/env/stdin → job_id, exit code, stdout/stderr, structured events, scope hash；断线客户端能够恢复对同一现场的观察。
 - **Typed orchestration IPC**：在通用 `Eval` / `RunScript` 之外提供稳定的 `SubmitJob` / `SubmitChain`、`WaitExecution` 和 caller metadata 契约，让上层运行时不必拼接 cue-shell 源码字符串。
-- **TUI 客户端**：以 process runtime 客户端身份存在，提供命名 session 选择与 attach、模式切换、命令输入、job 列表、输出 tab 等，便于人类直接观察和操控。
+- **TUI 客户端**：以 process runtime 客户端身份存在，提供命名 session 选择与 attach、模式切换、命令输入、job 列表、输出 tab 等；前台 PTY 统一由 `cue-terminal` / `libghostty-vt` 解析、编码和渲染，不保留第二套 terminal backend。
 - **Daemon (`cued`)**：持久 Unix socket + SQLite，托管 session 元数据、job 历史、scope 表、cron 定义；客户端可自动重连并回到原 session。
 
 ## Nanoflow 迁移路线
@@ -101,6 +102,7 @@ workflow 可以在只运行一个 `cued` 的前提下完成 `plan`、`run`、观
 - agent 在一个命名 session 中启动 job 后，人可以直接 attach 并看到同一份输出与状态；人启动的进程也能被 agent 通过 IPC 无损接管或观察。
 - 所有客户端都离开后，session 与其中仍在运行的 job 继续存在；稍后按名称重新进入时，现场连续而不是新建一个近似副本。
 - 只读观察者不会因为客户端实现差异而意外写入 PTY；输入控制权的归属与交接对人和 agent 都清楚可见。
+- 断线历史 replay 不会触发 terminal query 副作用；只有 live controller 能把按键、粘贴、mouse report 或终端协议 reply 写回 PTY。
 - 上层 agent runtime 只通过 JSON IPC 与 cue-shell 对话就能完成所有「起进程、读输出、写 stdin、订阅事件、组 chain」的事，不需要 cue-shell 为它加任何 agent 专用接口。
 - 用户重启 TUI 之后能回到原来的命名 session，立刻看到正在跑的 job、它们的 scope、它们的事件流，没有「丢上下文」的感觉。
 - 任何 job 的「为什么会以这个 env / cwd 跑」都能被一个 scope hash 说清楚，能被 fork 出新 scope 重放。
@@ -118,9 +120,11 @@ cue-shell 在本地自动化栈里处于最底层：
 - **Nanoflow**：已归档的历史参考实现，不再是运行时依赖或待同步的第二套产品；其已验证用例作为 cue-flow 的兼容样本。
 - **loom**：durable workflow runtime + automation kernel。需要持久 workflow 状态、外部事件唤醒、补偿或跨机协调的流程留在 loom；loom 在需要「跑一个进程」的地方调用 cue-shell。
 - **agent runtime / control plane**：所有 agent 一等原语（AGENT mode、planner/executor、ACP backend lifecycle、agent transcript、agent wake/escalation、`:ask` / `:spawn` / `:agents` / `:confirm` / `:probe`）都属于上层运行时。上层可以把自己的 conversation / task 绑定到某个 cue-shell process session，但二者不是同一种 session，也不要求一一对应。
+- **Spark**：继续作为 coordination/control-plane 客户端，通过 typed JSON IPC 把 task 绑定到命名 process session，订阅结构化 job/session 事件并按需 attach/watch；Spark 不链接 `libghostty-vt`、不复制 PTY/terminal state，也不新增第二份 session 真相。TUI debug socket 只用于端到端产品验证，不是执行或持久化通道。
 - **warp**：项目执行基础层 CLI。对 cue-shell 来说，warp 是一个**普通可执行**——cue-shell 不为 warp 加专门的 builtin，也不感知它的项目模型。
 - **bash / zsh / fish 等传统 shell**：cue-shell 不替代它们做交互式通用 shell；它替代的是「把进程长期、可观察、可恢复地跑在某台机器上」这一段。
 - **tmux / zellij**：cue-shell 接管其中「命名、持久、可共享的进程 session」这层职责，让人和 agent attach 同一现场；TUI 仍只是 process runtime 的一个 view。pane/tab 几何、layout 语言、插件生态与浏览器终端不属于第一阶段替代范围。
+- **Ghostty / `libghostty-vt`**：只提供 TUI 前台 pane 的终端语义内核；不拥有 PTY、process session、daemon 状态或人/agent 协作策略。`ratatui-ghostty` 仅作为 ratatui 映射与输入转换参考，不引入它的 session wrapper。
 
 边界一句话：**cue-shell 只暴露命名 process session 与 process 层契约——attach/watch + argv/cwd/env/stdin → job_id, exit code, stdout/stderr, structured events, scope hash。再往上的 agent、workflow 与终端布局语义都属于上层运行时或客户端。**
 
@@ -135,6 +139,7 @@ cue-shell 在本地自动化栈里处于最底层：
 - **不做数据流式 shell**：nushell 那种把命令结果当结构化数据传递的语义不进入。
 - **不做远程多机集群调度**：当前定位是单机 daemon；多机由上层运行时通过多个 cue-shell 实例聚合。
 - **第一阶段不复制完整终端复用器**：不实现 pane/tab 几何管理、layout 语言、插件生态或 zellij 的全部交互界面；客户端可以自行组织视图。
+- **不引入 cmux 或双终端栈**：不 fork / 嵌入 cmux，不提供 `vt100` fallback、backend trait、Cargo feature 或运行时开关；终端正确性统一收敛到 `libghostty-vt`。
 - **第一阶段不提供 Web 终端分享面**：浏览器 attach、分享 token 与公网访问控制后置；远程场景继续通过现有 SSH gateway 或上层系统进入单机 daemon。
 - **不为特定上层项目加专用 builtin**：包括 warp、loom 或任何 agent runtime。
 - **不内置秘密/凭据管理**：scope 只携带 env，秘密策略由上层负责。
@@ -149,6 +154,7 @@ cue-shell 在本地自动化栈里处于最底层：
 - **把 cron 做成「agent wake / scheduler」**：会把策略再次塞回底层。最终选择把 cron 限定为 mechanical timer-to-command，agent wake / schedule 由 loom 负责。
 - **把 chain 扩展为完整 DAG runtime（含重试、补偿、状态机）**：与 loom 的定位严重重叠，且会把 cue-shell 的复杂度拉到不可控范围。chain 因此被刻意限制在最小依赖图。
 - **把 Nanoflow executor 原样并入 `cued`**：会复制 Python callable、workflow 状态、资源调度和服务生命周期；最终选择只迁移已验证的声明式能力，由 `cue-flow` 规划、`cued` 执行。
+- **继续维护 `vt100` + `tui-term` 和手写输入编码**：构建简单，但宽字符、现代键盘/鼠标协议、selection 与 query reply 会继续形成多处不一致。当前决策是硬切到一个 `libghostty-vt` 客户端内核，并用 replay/live 与 observer/controller 两道 reply gate 保持 daemon 权限边界。
 - **在 process_mgr 中引入 `sh -c` 作为 multi-segment pipeline 的兜底**：以 shell 黑盒替代 native pipe，表面上兼容性好，但实际上破坏了 job 的可观测性（每个 segment 不再是一等对象）和 wrapper/forbid/replace 的逐 segment 作用。当前决策：multi-segment pipeline 不做兜底，直接走 native pipe(2) spawn；不支持 pipe semantics 的 segment 应拒绝执行而非退化。
 - **multi-segment pipeline 在 `sh -c` 中执行并静默丢弃 segment 信息**：同上一项，已确定不采用。
 
@@ -163,7 +169,7 @@ cue-shell 在本地自动化栈里处于最底层：
 ## 开放问题
 
 - session 已确定采用保留身份与历史的可逆 archive/restore，并在有连接、非终态工作或 cron 时拒绝归档；尚待决定的仅是 hard deletion、自动 expiry 与历史 retention 策略，以及它们是否应该存在。<!-- 待确认 -->
-- 输出与终端状态需要保留到什么粒度，才能让断线客户端精确追平，同时避免把完整终端模拟器塞进 daemon？<!-- 待确认 -->
+- PTY 原始字节历史的 retention、截断标记与快照上限需要如何演进，才能让断线客户端尽量追平，同时继续避免把 terminal cell model 塞进 daemon？<!-- 待确认 -->
 - session 的默认上下文与不可变 scope / HEAD 指针如何关联：session 是持有一个可移动的 scope 引用，还是只记录 job 各自的 scope？<!-- 待确认 -->
 - JSON IPC 的事件 schema 在「agent 概念迁出 cue-shell」之后，是否需要一次破坏性重整？现有 event 名是否还有泄漏的 agent 语义？<!-- 待确认 -->
 - scope 在高频 fork、长生命周期下，SQLite + delta 链（见 daemon 设计文档中的 ScopeStore）是否够用；若出现明显放大，是否引入专用 scope GC/分层存储？<!-- 待确认 -->
@@ -175,6 +181,7 @@ cue-shell 在本地自动化栈里处于最底层：
 
 ## 修订记录
 
+- 2026-07-23：TUI 终端架构硬切为唯一 `cue-terminal` / `libghostty-vt` 后端；daemon 继续独占 PTY 与 controller lease，客户端以 replay/live reply gate 重建投影；明确不引入 cmux、第二后端或 ratatui-ghostty session owner。
 - 2026-07-19：归档 Nanoflow，将其已验证的 TOML / matrix / 分层依赖 / retry / resource workflow 能力收敛为同仓库 `cue-flow` 客户端路线；补充 pending-resource 唤醒与 typed orchestration IPC，保持唯一 `cued` daemon 和 process substrate 边界。
 - 2026-07-22：确认 session 清理第一阶段只提供可逆 archive/restore；归档必须无连接、无非终态工作且无自有 cron，不提供 force 或 deletion，hard deletion/expiry/retention 留作开放问题。
 - 2026-07-22：确认共享 PTY 采用多 observer、单 controller；只允许显式 release/claim，不强制抢占，客户端断开释放控制权但不终止 job。

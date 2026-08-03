@@ -4082,6 +4082,112 @@ async fn test_fg_attach_input_and_detach() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fg_detach_is_not_blocked_by_a_child_that_does_not_read_stdin() {
+    run_daemon_test(async {
+        let env = TestEnv::new("fg-blocked-stdin-detach");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let job_id = match roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "sleep 60".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+        wait_for_job_status(&mut stream, 2, &job_id, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+        match roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::FgAttach { id: job_id.clone() },
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::FgAttached(_)) => {}
+            other => panic!("expected FgAttached, got {other:?}"),
+        }
+
+        let input_response = timeout(
+            Duration::from_secs(2),
+            roundtrip(
+                &mut stream,
+                4,
+                RequestPayload::FgInput {
+                    data: vec![b'x'; 64 * 1024],
+                },
+            ),
+        )
+        .await
+        .expect("bounded input acceptance was blocked");
+        assert!(
+            matches!(input_response, ResponsePayload::Ok(OkPayload::Ack {})),
+            "FgInput Ack means bounded daemon acceptance, got {input_response:?}"
+        );
+
+        let (detach_response, detach_messages) = timeout(
+            Duration::from_secs(2),
+            roundtrip_with_messages(&mut stream, 5, RequestPayload::FgDetach {}),
+        )
+        .await
+        .expect("FgDetach was blocked by the per-job stdin writer");
+        assert!(
+            matches!(detach_response, ResponsePayload::Ok(OkPayload::Ack {})),
+            "expected detach Ack, got {detach_response:?}"
+        );
+        // Gateway responses and events use separate internal queues, so the
+        // lease-clearing Ack and its lifecycle event may reach the socket in
+        // either order. The event must still arrive promptly.
+        let exited_before_ack = detach_messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::FgExited { id, .. },
+                } if id == &job_id
+            )
+        });
+        if !exited_before_ack {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        recv(&mut stream).await,
+                        Message::Event {
+                            payload: EventPayload::FgExited { id, .. },
+                        } if id == job_id
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("matching FgExited did not follow detach Ack");
+        }
+
+        let ping_response = timeout(
+            Duration::from_secs(1),
+            roundtrip(&mut stream, 6, RequestPayload::Ping {}),
+        )
+        .await
+        .expect("process manager remained blocked after detach");
+        assert!(matches!(
+            ping_response,
+            ResponsePayload::Ok(OkPayload::Pong { .. })
+        ));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_named_session_shares_foreground_output_and_hands_off_control() {
     run_daemon_test(async {
         let env = TestEnv::new("named-session-shared-fg");

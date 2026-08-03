@@ -1,0 +1,44 @@
+diff --git a/build.zig b/build.zig
+index d907625..0a87ce2 100644
+--- a/build.zig
++++ b/build.zig
+@@ -52,6 +52,38 @@ pub fn build(b: *std.Build) !void {
+         &deps,
+     );
+-
++
++    // cue-shell embeds only libghostty-vt. Return before initializing the
++    // application, docs, webdata, and benchmark graphs so an offline VT build
++    // needs only the explicitly verified terminal-engine dependency closure.
++    if (config.emit_lib_vt and config.app_runtime == .none) {
++        if (config.target.result.cpu.arch.isWasm()) {
++            const libghostty_vt_wasm = try buildpkg.GhosttyLibVt.initWasm(
++                b,
++                &mod,
++            );
++            libghostty_vt_wasm.install(b.getInstallStep());
++            return;
++        }
++
++        const libghostty_vt_static = try buildpkg.GhosttyLibVt.initStatic(
++            b,
++            &mod,
++        );
++        libghostty_vt_static.install(b.getInstallStep());
++        if (!config.is_dep) {
++            const static_lib_name = if (config.target.result.os.tag == .windows)
++                "ghostty-vt-static.lib"
++            else
++                "libghostty-vt.a";
++            b.getInstallStep().dependOn(&b.addInstallLibFile(
++                libghostty_vt_static.output,
++                static_lib_name,
++            ).step);
++        }
++
++        return;
++    }
++
+     // All our steps which we'll hook up later. The steps are shown
+     // up here just so that they are more self-documenting.
+     const run_step = b.step("run", "Run the app");

@@ -6,6 +6,50 @@
 |------|------|
 | **架构模式** | TEA + Component 混合：全局 `AppState` + `Message` 枚举 + 纯函数 `update`，面板用独立 Widget trait 渲染 |
 | **渲染框架** | ratatui 0.30 + crossterm 0.29 |
+| **终端语义** | `cue-terminal` + `libghostty-vt`；不保留第二套 parser / input encoder |
+| **线程边界** | `block_on` 的 TUI future 留在调用线程；Ghostty 句柄不跨线程，socket/tick/debug 任务使用 Tokio worker |
+
+### 前台终端边界
+
+`cued` 继续拥有 PTY、子进程、终端历史字节、attachment generation 和
+controller lease；`cue-terminal` 只在客户端拥有一份可重建的终端投影：
+
+```text
+cued: PTY + process + controller lease
+       │ raw snapshot / live bytes
+       ▼
+cue-tui: attachment routing
+       ▼
+cue-terminal: libghostty-vt terminal + render state + input encoding
+       ▼
+ratatui buffer
+```
+
+这一边界只有一个正式后端，不提供 `vt100` / `tui-term` fallback、Cargo
+feature 或运行时选择。`cue-terminal` 的 ratatui 映射与 crossterm 输入转换
+参考 `ratatui-ghostty`，但不采用它的 PTY/session wrapper：PTY 生命周期和
+共享控制权已经由 `cued` 负责，客户端不能再创建第二个 session owner。
+
+历史 snapshot 以 replay 模式喂入终端，期间生成的 terminal query reply
+一律丢弃。只有 live attachment 的 controller 可以把 Ghostty 生成的 reply、
+按键、粘贴和 mouse report 作为 `FgInput` 发回 daemon；observer 只能在本地
+滚动、选择和复制。observer 的窗口变化只 resize 本地投影，controller 才
+发送 `FgResize`。这样 renderer 不会绕过 daemon 的单 controller 契约。
+
+`FgInput` 的 `Ack` 表示该输入已进入 daemon 为该 job 设置的有界队列，不表示
+子进程已经读取。单条事务上限为 64 KiB，每个 job 最多排队 16 条；客户端不会把
+escape sequence 或 bracketed paste 跨事务拆分。每个 job 使用独立 writer，慢或
+不读取 stdin 的进程不会阻塞其他 job 的 attach/detach、控制权切换和输入；每次
+控制权变更都会推进独立 generation，尚未写入的旧 generation 输入会被丢弃。如果
+一个输入只写入了一部分就发生控制权切换，daemon 会关闭该 foreground stream 并
+终止 job，避免把截断的 escape sequence 交给下一位 controller。
+
+`libghostty-vt` 的 Rust 句柄不是 `Send` / `Sync`。TUI 的根 future 由
+multi-thread Tokio runtime 的 `block_on` 固定在调用线程，`AppState` 与
+Ghostty 状态只在该线程更新和渲染；socket、tick 和 debug 任务运行在 worker
+线程并通过有界 `AppMsg` 队列投递，避免渲染阻塞 transport reader。同一批次内
+的 `FgOutput` 仍逐条、按原顺序更新并各自 drain terminal reply，不跨越
+response/control/lifecycle fence；但每批只触发一次完整绘制。
 
 ## 二、布局
 
@@ -178,6 +222,7 @@ footer 不再重复显示计数，而是显示**当前焦点相关的即时提�
 | 点击侧边栏条目选中并打开 | ✅ |
 | 点击 display tab 切换 / 关闭 | ✅ |
 | 点击命令卡片打开 inspect preview | ✅ |
+| 前台 PTY mouse report | ✅（仅 controller；observer 保留本地选择/滚动） |
 | 切换 mouse ui/text 模式 | ✅ |
 | 拖拽调整面板 | ❌（后续） |
 | 双击操作 | ❌（后续） |

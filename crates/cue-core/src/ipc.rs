@@ -33,6 +33,12 @@ pub const IPC_CAPABILITY_NAMED_SESSIONS: &str = "named-sessions";
 pub const IPC_CAPABILITY_FOREGROUND_OBSERVERS: &str = "foreground-observers";
 /// Safe, reversible archive/restore lifecycle for durable named sessions.
 pub const IPC_CAPABILITY_SESSION_ARCHIVE: &str = "session-archive";
+/// Maximum raw bytes accepted by one foreground-input request.
+///
+/// This bounds each daemon queue item. Clients must preserve terminal input
+/// transactions within one request instead of splitting escape sequences or a
+/// bracketed paste across controller-generation fences.
+pub const MAX_FOREGROUND_INPUT_BYTES: usize = 64 * 1024;
 const IPC_CAPABILITIES: &[&str] = &[
     IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
     IPC_CAPABILITY_SCRIPT_ITEM_CREATED,
@@ -163,6 +169,11 @@ pub enum RequestPayload {
     /// Release the controller lease while remaining an observer.
     FgReleaseControl {},
     FgDetach {},
+    /// Queue raw input for the attached PTY controller.
+    ///
+    /// An `Ack` confirms bounded daemon acceptance, not delivery to or
+    /// consumption by the child process. A controller lease transition fences
+    /// accepted input that has not yet been written.
     FgInput {
         #[serde(with = "serde_bytes_base64")]
         data: Vec<u8>,

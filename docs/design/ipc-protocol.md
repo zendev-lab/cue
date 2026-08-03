@@ -579,7 +579,13 @@ observers but exactly one controller lease:
 5. Only the controller may send `FgInput` or `FgResize`. An observer may call
    `FgClaimControl` only while `control_available` is true. The current
    controller calls `FgReleaseControl` to remain attached as an observer; there
-   is no implicit steal or force-takeover path.
+   is no implicit steal or force-takeover path. An `Ack` for `FgInput` confirms
+   bounded daemon acceptance, not consumption by the child: each input item is
+   limited to 64 KiB and each job accepts at most 16 queued items. Every
+   release, detach, or disconnect fences the controller generation and discards
+   old-generation input that has not been written. A partially written item
+   cannot be transferred to a new controller; that ambiguity fails the
+   foreground job closed.
 6. A successful claim/release returns `FgRoleChanged`; all observers receive
    `FgControlChanged` when lease availability changes. A TUI uses Ctrl+] for
    claim/release and shows failures in the foreground footer.

@@ -4,6 +4,7 @@ description = "Durable process substrate with a TUI for managing long-lived jobs
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
 authors = [{ name = "Zhan Rongrui" }]
 keywords = ["cli", "daemon", "shell", "terminal", "tui"]
 classifiers = [
@@ -29,18 +30,12 @@ Homepage = "https://github.com/zrr1999/cue-shell"
 Releases = "https://github.com/zrr1999/cue-shell/releases"
 Repository = "https://github.com/zrr1999/cue-shell"
 
-[project.scripts]
-cue-client = "cue_shell_tools:cue_client"
-cue-daemon = "cue_shell_tools:cue_daemon"
-cue-tui = "cue_shell_tools:cue_tui"
-
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin==1.13.3"]
 build-backend = "maturin"
 
 [tool.maturin]
 bindings = "bin"
 features = ["cue-client", "cue-daemon", "cue-tui"]
-include = [{ path = "LICENSE", format = "sdist" }]
 manifest-path = "crates/cue-cli/Cargo.toml"
 strip = true

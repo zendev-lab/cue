@@ -9,30 +9,56 @@ format:
 
 # Run all static checks (fmt check + clippy)
 check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
     cargo fmt --all -- --check
-    cargo clippy --all-targets -- -D warnings
+    scripts/verify-ghostty-deps.sh
+    scripts/verify-ghostty-fail-closed.sh
+    cargo clippy --locked --all-targets -- -D warnings
 
 # Run tests
 test *ARGS:
-    cargo test {{ARGS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
+    cargo test --locked {{ ARGS }}
 
 # Exercise cue-tui's first-party debug socket in a real PTY
 tui-debug-smoke:
-    uv run scripts/cue_tui_debug_smoke.py
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
+    python3 scripts/cue_tui_debug_smoke.py
 
 # Run tests with coverage (requires cargo-llvm-cov)
 cov:
-    cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
+    cargo llvm-cov test --locked --lcov --output-path lcov.info -- --no-capture
 
 # Open coverage HTML report
 cov-open:
-    cargo llvm-cov test --html -- --no-capture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
+    cargo llvm-cov test --locked --html -- --no-capture
     open target/llvm-cov/html/index.html || xdg-open target/llvm-cov/html/index.html
 
 # MSRV check. Cargo enforces workspace.package.rust-version (1.95), so this
 # works with both rustup-managed and standalone/Homebrew toolchains.
 msrv:
-    cargo check --workspace --all-targets
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
+    cargo check --locked --workspace --all-targets
+
+# Install or re-verify the pinned Zig/Ghostty build cache
+ghostty-prepare:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
 
 # Clean build artifacts
 clean:
@@ -44,6 +70,9 @@ ci: check test msrv
 
 # Run pre-commit on all files
 pre-commit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/prepare-ghostty.sh
     uvx prek run --all-files
 
 # Install local git hooks via prek

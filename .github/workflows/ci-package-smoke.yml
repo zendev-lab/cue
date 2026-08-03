@@ -17,6 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
   build-wheel:
@@ -31,7 +32,7 @@ jobs:
           - label: macos-x86_64
             runner: macos-15-intel
           - label: macos-arm64
-            runner: macos-14
+            runner: macos-15
     steps:
       - uses: actions/checkout@v6
         with:
@@ -46,6 +47,20 @@ jobs:
         with:
           toolchain: "1.95"
 
+      - name: Prepare pinned Ghostty toolchain
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          source scripts/prepare-ghostty.sh
+          dirname "$(command -v zig)" >> "$GITHUB_PATH"
+          printf 'GHOSTTY_SOURCE_DIR=%s\n' "$GHOSTTY_SOURCE_DIR" >> "$GITHUB_ENV"
+          printf 'GHOSTTY_ZIG_SYSTEM_DIR=%s\n' "$GHOSTTY_ZIG_SYSTEM_DIR" >> "$GITHUB_ENV"
+          if [[ -n "${CUE_ZIG_MACOS_SDK:-}" ]]; then
+            printf 'CUE_ZIG_MACOS_SDK=%s\n' "$CUE_ZIG_MACOS_SDK" >> "$GITHUB_ENV"
+            printf 'SDKROOT=%s\n' "$SDKROOT" >> "$GITHUB_ENV"
+            dirname "$(command -v xcrun)" >> "$GITHUB_PATH"
+          fi
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -53,7 +68,12 @@ jobs:
           rust-toolchain: "1.95"
           command: build
           manylinux: "2014"
+          before-script-linux: source scripts/prepare-ghostty.sh
           args: --release --locked --compatibility pypi --out dist
+
+      - name: Verify wheel binary contract
+        shell: bash
+        run: scripts/verify-wheel.sh dist/*.whl "${{ matrix.label }}"
 
       - name: Smoke-test built wheel
         shell: bash
@@ -75,49 +95,3 @@ jobs:
             exit 1
           fi
           uv tool run --from "$wheel_path" cued status
-
-  build-sdist:
-    name: sdist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.95"
-
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: v1.13.3
-          rust-toolchain: "1.95"
-          command: sdist
-          args: --out dist
-
-      - name: Smoke-test source distribution
-        shell: bash
-        run: |
-          repo_root="$PWD"
-          sdist_path="$repo_root/dist/$(basename dist/*.tar.gz)"
-          uv tool run --from "$sdist_path" cue --version
-          uv tool run --from "$sdist_path" cue --help
-          uv tool run --from "$sdist_path" cue-client --version
-          uv tool run --from "$sdist_path" cue-client target resolve --json
-          uv tool run --from "$sdist_path" cue-client target list --json
-          uv tool run --from "$sdist_path" cue-tui --version
-          uv tool run --from "$sdist_path" cue-daemon --version
-          uv tool run --from "$sdist_path" cued --version
-          uv tool run --from "$sdist_path" cue client target resolve --json
-          uv tool run --from "$sdist_path" cue daemon --version
-          if uv tool run --from "$sdist_path" cue target resolve --json; then
-            echo "cue target unexpectedly succeeded" >&2
-            exit 1
-          fi
-          uv tool run --from "$sdist_path" cued status

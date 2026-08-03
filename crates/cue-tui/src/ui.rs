@@ -18,7 +18,6 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use tui_term::widget::PseudoTerminal;
 
 use crate::ansi;
 use crate::app::AppState;
@@ -28,7 +27,7 @@ use crate::job_picker::job_picker_popup_rect;
 use crate::target_settings::{target_settings_modal_footer_text, target_settings_popup_rect};
 
 /// Render the entire TUI into the current frame.
-pub(crate) fn draw(frame: &mut Frame, state: &AppState) {
+pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
     if state.fg_active() {
         let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
@@ -40,8 +39,18 @@ pub(crate) fn draw(frame: &mut Frame, state: &AppState) {
             .title(state.fg_title());
         let inner = block.inner(body_area);
         frame.render_widget(block, body_area);
-        if let Some(screen) = state.fg_screen() {
-            frame.render_widget(PseudoTerminal::new(screen), inner);
+        match state.render_fg_terminal(inner, frame.buffer_mut()) {
+            Ok(cursor) => {
+                if let Some(position) = cursor.position {
+                    frame.set_cursor_position(position);
+                }
+            }
+            Err(message) => {
+                frame.render_widget(
+                    Paragraph::new(message).style(Style::default().fg(Color::Red)),
+                    inner,
+                );
+            }
         }
         let status = Paragraph::new(Line::from(state.fg_footer_text()))
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));

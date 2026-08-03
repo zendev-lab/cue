@@ -25,7 +25,23 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
+      - name: Prepare pinned Ghostty toolchain
+        shell: bash
+        run: |
+          source scripts/prepare-ghostty.sh
+          dirname "$(command -v zig)" >> "$GITHUB_PATH"
+          printf 'GHOSTTY_SOURCE_DIR=%s\n' "$GHOSTTY_SOURCE_DIR" >> "$GITHUB_ENV"
+          printf 'GHOSTTY_ZIG_SYSTEM_DIR=%s\n' "$GHOSTTY_ZIG_SYSTEM_DIR" >> "$GITHUB_ENV"
+          if [[ -n "${CUE_ZIG_MACOS_SDK:-}" ]]; then
+            printf 'CUE_ZIG_MACOS_SDK=%s\n' "$CUE_ZIG_MACOS_SDK" >> "$GITHUB_ENV"
+            printf 'SDKROOT=%s\n' "$SDKROOT" >> "$GITHUB_ENV"
+            dirname "$(command -v xcrun)" >> "$GITHUB_PATH"
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Verify Ghostty dependency contract
+        run: scripts/verify-ghostty-deps.sh
+      - name: Verify raw Cargo fails closed
+        run: scripts/verify-ghostty-fail-closed.sh
       - uses: j178/prek-action@v2
