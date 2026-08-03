@@ -9,16 +9,18 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use cue_core::ipc::{
-    EventPayload, ForegroundAttachmentInfo, ForegroundRole, Stream as OutputStream,
+    EventPayload, ForegroundAttachmentInfo, ForegroundRole, MAX_FOREGROUND_INPUT_BYTES,
+    Stream as OutputStream,
 };
 use cue_core::job::{EXIT_CODE_UNAVAILABLE, JobStatus};
 use cue_core::pipeline::{JobPlan, command_prefers_foreground};
@@ -52,8 +54,9 @@ struct ProcessEntry {
     ring_buffer: Arc<Mutex<RingBuffer>>,
     /// Separate stderr ring buffer.  `None` in PTY mode (streams are merged).
     stderr_ring: Option<Arc<Mutex<RingBuffer>>>,
-    /// Job stdin, either the PTY master or a pipe to the first process.
-    input: Option<JobInput>,
+    /// Bounded per-job stdin writer. The process manager retains lifecycle and
+    /// controller authority; the task owns only the ordered write mechanism.
+    input: Option<JobInputWriter>,
     /// PTY master fd used for resize ioctls.
     resize: Option<Arc<std::fs::File>>,
     /// Shared foreground observer set and exclusive controller lease.
@@ -69,6 +72,10 @@ struct ForegroundState {
     /// Client id to the epoch of its current attachment.
     observers: BTreeMap<u64, u64>,
     controller: Option<u64>,
+    /// Independent PTY input generation for the current controller. Attachment
+    /// epochs identify event streams; this generation fences queued input and
+    /// changes on every release/reclaim, even within one attachment.
+    controller_generation: Option<u64>,
     /// Last epoch allocated for this job. Zero is reserved for legacy IPC.
     last_attachment_id: u64,
     closed: bool,
@@ -160,58 +167,392 @@ impl ForegroundState {
         })
     }
 
-    fn claim_control(&mut self, client_id: u64) -> Result<bool, ()> {
-        if self.closed || !self.observers.contains_key(&client_id) {
-            return Err(());
-        }
-        match self.controller {
-            Some(controller) if controller != client_id => Err(()),
-            Some(_) => Ok(false),
-            None => {
-                self.controller = Some(client_id);
-                Ok(true)
-            }
-        }
-    }
-
-    fn release_control(&mut self, client_id: u64) -> Result<bool, ()> {
-        if self.closed || !self.observers.contains_key(&client_id) {
-            return Err(());
-        }
-        let released = self.controller == Some(client_id);
-        if released {
-            self.controller = None;
-        }
-        Ok(released)
-    }
-
     fn detach(&mut self, client_id: u64) -> Option<(u64, Option<Vec<ForegroundRecipient>>)> {
         let attachment_id = self.observers.remove(&client_id)?;
         let released_control = self.controller == Some(client_id);
         if released_control {
             self.controller = None;
+            self.controller_generation = None;
         }
         Some((attachment_id, released_control.then(|| self.recipients())))
     }
 }
 
-#[derive(Clone)]
-enum JobInput {
-    Pty(Arc<AsyncFd<std::fs::File>>),
-    Pipe(Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>),
+enum JobInputSink {
+    Pty(AsyncFd<std::fs::File>),
+    Pipe(tokio::process::ChildStdin),
 }
 
 const DEFAULT_PTY_COLS: u16 = 80;
 const DEFAULT_PTY_ROWS: u16 = 24;
+const JOB_INPUT_QUEUE_CAP: usize = 16;
 /// At most 512 KiB of 8 KiB chunks may wait per pipeline before readers apply
 /// backpressure to the child process pipes.
 const PIPELINE_CHUNK_CAP: usize = 64;
+
+static NEXT_INPUT_WRITER_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobInputKind {
+    Pty,
+    Pipe,
+}
+
+struct JobInputItem {
+    data: Vec<u8>,
+    generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveInput {
+    generation: u64,
+    written: usize,
+    total: usize,
+}
+
+#[derive(Debug)]
+struct InputFenceInner {
+    generation: u64,
+    settled_generation: u64,
+    active: Option<ActiveInput>,
+}
+
+struct InputFence {
+    inner: Mutex<InputFenceInner>,
+    poisoned: AtomicBool,
+    changed: watch::Sender<u64>,
+}
+
+impl InputFence {
+    fn new() -> Self {
+        let generation = 1;
+        let (changed, _) = watch::channel(generation);
+        Self {
+            inner: Mutex::new(InputFenceInner {
+                generation,
+                settled_generation: generation,
+                active: None,
+            }),
+            poisoned: AtomicBool::new(false),
+            changed,
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, InputFenceInner> {
+        match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(error) => {
+                let mut inner = error.into_inner();
+                self.poison_locked(&mut inner);
+                inner
+            }
+        }
+    }
+
+    fn controller_available(&self) -> bool {
+        if self.is_poisoned() {
+            return false;
+        }
+        let inner = self.lock_inner();
+        !self.is_poisoned() && inner.settled_generation == inner.generation
+    }
+
+    fn is_settled_generation(&self, generation: u64) -> bool {
+        if self.is_poisoned() {
+            return false;
+        }
+        let inner = self.lock_inner();
+        !self.is_poisoned()
+            && inner.generation == generation
+            && inner.settled_generation == generation
+    }
+
+    fn start_controller_generation(&self) -> Result<u64, InputEnqueueError> {
+        if self.is_poisoned() {
+            return Err(InputEnqueueError::Poisoned);
+        }
+        let mut inner = self.lock_inner();
+        if self.is_poisoned() {
+            return Err(InputEnqueueError::Poisoned);
+        }
+        if inner.settled_generation != inner.generation {
+            return Err(InputEnqueueError::FencePending);
+        }
+        let generation = inner
+            .generation
+            .checked_add(1)
+            .ok_or(InputEnqueueError::GenerationExhausted)?;
+        inner.generation = generation;
+        // There is no prior controller while this method is called and the
+        // preceding revoke is settled, so this generation is immediately safe.
+        inner.settled_generation = generation;
+        self.changed.send_replace(generation);
+        Ok(generation)
+    }
+
+    fn revoke_controller_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<InputFenceAdvance, InputEnqueueError> {
+        if self.is_poisoned() {
+            return Err(InputEnqueueError::Poisoned);
+        }
+        let mut inner = self.lock_inner();
+        if self.is_poisoned() {
+            return Err(InputEnqueueError::Poisoned);
+        }
+        if inner.generation != expected_generation {
+            return Err(InputEnqueueError::StaleGeneration);
+        }
+        let generation = inner
+            .generation
+            .checked_add(1)
+            .ok_or(InputEnqueueError::GenerationExhausted)?;
+        inner.generation = generation;
+        let pending = inner.active.is_some_and(|active| {
+            active.generation == expected_generation && active.written < active.total
+        });
+        if !pending {
+            inner.settled_generation = generation;
+        }
+        self.changed.send_replace(generation);
+        Ok(InputFenceAdvance { settled: !pending })
+    }
+
+    fn poison_locked(&self, inner: &mut InputFenceInner) {
+        let was_poisoned = self.poisoned.swap(true, Ordering::AcqRel);
+        if !was_poisoned {
+            if let Some(generation) = inner.generation.checked_add(1) {
+                inner.generation = generation;
+            }
+            self.changed.send_replace(inner.generation);
+        }
+        inner.active = None;
+    }
+
+    fn poison(&self) {
+        let mut inner = self.lock_inner();
+        if !self.is_poisoned() {
+            self.poison_locked(&mut inner);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InputFenceAdvance {
+    settled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputEnqueueError {
+    TooLarge { actual: usize },
+    Full,
+    Closed,
+    Poisoned,
+    FencePending,
+    StaleGeneration,
+    GenerationExhausted,
+}
+
+impl std::fmt::Display for InputEnqueueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { actual } => write!(
+                formatter,
+                "input is {actual} bytes, exceeding the {MAX_FOREGROUND_INPUT_BYTES}-byte limit"
+            ),
+            Self::Full => write!(
+                formatter,
+                "job input queue is full ({JOB_INPUT_QUEUE_CAP} items)"
+            ),
+            Self::Closed => formatter.write_str("job input writer is closed"),
+            Self::Poisoned => formatter.write_str("job input writer failed"),
+            Self::FencePending => {
+                formatter.write_str("foreground input lease transition is still settling")
+            }
+            Self::StaleGeneration => {
+                formatter.write_str("foreground input belongs to a stale controller generation")
+            }
+            Self::GenerationExhausted => {
+                formatter.write_str("foreground input generation space is exhausted")
+            }
+        }
+    }
+}
+
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct InputWriterTaskExitGuard {
+    job_id: JobId,
+    writer_incarnation: u64,
+    fence: Arc<InputFence>,
+    failures: mpsc::UnboundedSender<InputWriterFailure>,
+    armed: bool,
+}
+
+impl InputWriterTaskExitGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InputWriterTaskExitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.fence.poison();
+        let _ = self.failures.send(InputWriterFailure {
+            job_id: self.job_id,
+            writer_incarnation: self.writer_incarnation,
+            reason: "input writer task terminated unexpectedly".into(),
+        });
+    }
+}
+
+struct InputWriterFailure {
+    job_id: JobId,
+    writer_incarnation: u64,
+    reason: String,
+}
+
+struct JobInputWriter {
+    kind: JobInputKind,
+    incarnation: u64,
+    sender: mpsc::Sender<JobInputItem>,
+    fence: Arc<InputFence>,
+    _task: AbortTaskOnDrop,
+}
+
+impl JobInputWriter {
+    fn spawn(
+        job_id: JobId,
+        sink: JobInputSink,
+        process_mgr: mpsc::Sender<ProcessMgrMsg>,
+        failures: mpsc::UnboundedSender<InputWriterFailure>,
+    ) -> Self {
+        let kind = match &sink {
+            JobInputSink::Pty(_) => JobInputKind::Pty,
+            JobInputSink::Pipe(_) => JobInputKind::Pipe,
+        };
+        let incarnation = NEXT_INPUT_WRITER_INCARNATION.fetch_add(1, Ordering::Relaxed);
+        let fence = Arc::new(InputFence::new());
+        let (sender, receiver) = mpsc::channel(JOB_INPUT_QUEUE_CAP);
+        let task_fence = fence.clone();
+        let task = tokio::spawn(async move {
+            let mut exit_guard = InputWriterTaskExitGuard {
+                job_id,
+                writer_incarnation: incarnation,
+                fence: task_fence.clone(),
+                failures: failures.clone(),
+                armed: true,
+            };
+            job_input_writer_task(
+                job_id,
+                incarnation,
+                sink,
+                receiver,
+                task_fence,
+                process_mgr,
+                failures,
+            )
+            .await;
+            exit_guard.disarm();
+        });
+        Self {
+            kind,
+            incarnation,
+            sender,
+            fence,
+            _task: AbortTaskOnDrop(task),
+        }
+    }
+
+    fn is_pty(&self) -> bool {
+        self.kind == JobInputKind::Pty
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.fence.is_poisoned()
+    }
+
+    fn controller_available(&self) -> bool {
+        if self.sender.is_closed() {
+            self.fence.poison();
+            return false;
+        }
+        self.is_pty() && self.fence.controller_available()
+    }
+
+    fn start_controller_generation(&self) -> Result<u64, InputEnqueueError> {
+        if !self.is_pty() {
+            return Err(InputEnqueueError::Closed);
+        }
+        if self.sender.is_closed() {
+            self.fence.poison();
+            return Err(InputEnqueueError::Closed);
+        }
+        self.fence.start_controller_generation()
+    }
+
+    fn revoke_controller_generation(
+        &self,
+        generation: u64,
+    ) -> Result<InputFenceAdvance, InputEnqueueError> {
+        self.fence.revoke_controller_generation(generation)
+    }
+
+    fn try_enqueue(&self, data: Vec<u8>, generation: Option<u64>) -> Result<(), InputEnqueueError> {
+        if data.len() > MAX_FOREGROUND_INPUT_BYTES {
+            return Err(InputEnqueueError::TooLarge { actual: data.len() });
+        }
+        if self.is_poisoned() {
+            return Err(InputEnqueueError::Poisoned);
+        }
+
+        let fence_guard = self.fence.lock_inner();
+        if self.is_poisoned() {
+            return Err(InputEnqueueError::Poisoned);
+        }
+        if self.is_pty() {
+            let expected_generation = generation.ok_or(InputEnqueueError::StaleGeneration)?;
+            if fence_guard.generation != expected_generation {
+                return Err(InputEnqueueError::StaleGeneration);
+            }
+        }
+
+        let item = JobInputItem { data, generation };
+        match self.sender.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(InputEnqueueError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                drop(fence_guard);
+                self.fence.poison();
+                Err(InputEnqueueError::Closed)
+            }
+        }
+    }
+}
 
 // ── Actor entry point ──
 
 struct NativePipelineSpawn {
     children: Vec<tokio::process::Child>,
-    input: Option<JobInput>,
+    input: Option<JobInputSink>,
     stdout_sources: Vec<tokio::process::ChildStdout>,
     stderr_sources: Vec<tokio::process::ChildStderr>,
 }
@@ -362,6 +703,14 @@ fn attach_foreground(
             entry.job_id
         ));
     }
+    let input = entry
+        .input
+        .as_ref()
+        .filter(|input| input.is_pty())
+        .ok_or_else(|| format!("job {} foreground input is unavailable", entry.job_id))?;
+    if input.is_poisoned() {
+        return Err(format!("job {} foreground input failed", entry.job_id));
+    }
 
     let mut foreground = entry.foreground.lock().unwrap();
     let outcome = foreground
@@ -381,7 +730,19 @@ fn attach_foreground(
                 entry.job_id
             ),
         })?;
-    let control_available = foreground.control_available();
+    if requested_role == ForegroundRole::Controller {
+        match input.start_controller_generation() {
+            Ok(generation) => foreground.controller_generation = Some(generation),
+            Err(error) => {
+                foreground.detach(client_id);
+                return Err(format!(
+                    "job {} foreground control is unavailable: {error}",
+                    entry.job_id
+                ));
+            }
+        }
+    }
+    let control_available = foreground.control_available() && input.controller_available();
     let (snapshot, snapshot_truncated) = entry
         .ring_buffer
         .lock()
@@ -408,6 +769,21 @@ fn claim_foreground_control(
     Result<ForegroundRoleUpdate, String>,
     Option<Vec<ForegroundRecipient>>,
 ) {
+    let Some(input) = entry.input.as_ref().filter(|input| input.is_pty()) else {
+        return (
+            Err(format!(
+                "job {} foreground input is unavailable",
+                entry.job_id
+            )),
+            None,
+        );
+    };
+    if input.is_poisoned() {
+        return (
+            Err(format!("job {} foreground input failed", entry.job_id)),
+            None,
+        );
+    }
     let mut foreground = entry.foreground.lock().unwrap();
     let Some(&attachment_id) = foreground.observers.get(&client_id) else {
         return (Err("no foreground job observed".to_string()), None);
@@ -427,8 +803,8 @@ fn claim_foreground_control(
             None,
         );
     }
-    match foreground.claim_control(client_id) {
-        Ok(false) => (
+    if foreground.controller == Some(client_id) {
+        return (
             Ok(ForegroundRoleUpdate {
                 id: entry.job_id.to_string(),
                 attachment_id,
@@ -436,21 +812,32 @@ fn claim_foreground_control(
                 control_available: false,
             }),
             None,
-        ),
-        Ok(true) => {
-            let recipients = foreground.recipients();
-            (
-                Ok(ForegroundRoleUpdate {
-                    id: entry.job_id.to_string(),
-                    attachment_id,
-                    role: ForegroundRole::Controller,
-                    control_available: false,
-                }),
-                Some(recipients),
-            )
-        }
-        Err(()) => (Err("no foreground job observed".to_string()), None),
+        );
     }
+    let generation = match input.start_controller_generation() {
+        Ok(generation) => generation,
+        Err(error) => {
+            return (
+                Err(format!(
+                    "job {} foreground control is unavailable: {error}",
+                    entry.job_id
+                )),
+                None,
+            );
+        }
+    };
+    foreground.controller = Some(client_id);
+    foreground.controller_generation = Some(generation);
+    let recipients = foreground.recipients();
+    (
+        Ok(ForegroundRoleUpdate {
+            id: entry.job_id.to_string(),
+            attachment_id,
+            role: ForegroundRole::Controller,
+            control_available: false,
+        }),
+        Some(recipients),
+    )
 }
 
 fn release_foreground_control(
@@ -460,6 +847,15 @@ fn release_foreground_control(
     Result<ForegroundRoleUpdate, String>,
     Option<Vec<ForegroundRecipient>>,
 ) {
+    let Some(input) = entry.input.as_ref().filter(|input| input.is_pty()) else {
+        return (
+            Err(format!(
+                "job {} foreground input is unavailable",
+                entry.job_id
+            )),
+            None,
+        );
+    };
     let mut foreground = entry.foreground.lock().unwrap();
     let Some(&attachment_id) = foreground.observers.get(&client_id) else {
         return (Err("no foreground job observed".to_string()), None);
@@ -467,11 +863,40 @@ fn release_foreground_control(
     if foreground.closed {
         return (Err("no foreground job observed".to_string()), None);
     }
-    let released = foreground
-        .release_control(client_id)
-        .expect("observer presence checked above");
-    let control_available = foreground.control_available();
-    let recipients = released.then(|| foreground.recipients());
+    let released = foreground.controller == Some(client_id);
+    let fence = if released {
+        let Some(generation) = foreground.controller_generation else {
+            return (
+                Err(format!(
+                    "job {} foreground controller generation is missing",
+                    entry.job_id
+                )),
+                None,
+            );
+        };
+        match input.revoke_controller_generation(generation) {
+            Ok(fence) => Some(fence),
+            Err(error) => {
+                return (
+                    Err(format!(
+                        "job {} foreground control release failed: {error}",
+                        entry.job_id
+                    )),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    if released {
+        foreground.controller = None;
+        foreground.controller_generation = None;
+    }
+    let control_available = foreground.control_available()
+        && input.controller_available()
+        && fence.is_none_or(|fence| fence.settled);
+    let recipients = (released && control_available).then(|| foreground.recipients());
     (
         Ok(ForegroundRoleUpdate {
             id: entry.job_id.to_string(),
@@ -497,24 +922,247 @@ fn record_pty_output(
     }
 }
 
-fn client_may_write_job_input(
-    input: &JobInput,
-    foreground: &Arc<Mutex<ForegroundState>>,
-    client_id: u64,
-) -> bool {
-    job_input_kind_allows_client(
-        matches!(input, JobInput::Pty(_)),
-        foreground.lock().unwrap().controller,
-        client_id,
-    )
-}
-
+#[cfg(test)]
 fn job_input_kind_allows_client(
     requires_controller: bool,
     controller: Option<u64>,
     client_id: u64,
 ) -> bool {
     !requires_controller || controller == Some(client_id)
+}
+
+struct DetachedForeground {
+    job_id: JobId,
+    attachment_id: u64,
+    session_id: Option<String>,
+    control_recipients: Option<Vec<ForegroundRecipient>>,
+}
+
+struct FailedForeground {
+    recipients: Vec<ForegroundRecipient>,
+    job_id: JobId,
+    session_id: Option<String>,
+    reason: String,
+}
+
+enum InputRejection {
+    None,
+    Detached(DetachedForeground),
+    Failed(FailedForeground),
+}
+
+fn detach_foreground_entry(
+    entry: &ProcessEntry,
+    client_id: u64,
+) -> Result<Option<DetachedForeground>, String> {
+    let mut foreground = entry.foreground.lock().unwrap();
+    let Some(&attachment_id) = foreground.observers.get(&client_id) else {
+        return Ok(None);
+    };
+    let released_control = foreground.controller == Some(client_id);
+    let fence = if released_control {
+        let generation = foreground.controller_generation.ok_or_else(|| {
+            format!(
+                "job {} foreground controller generation is missing",
+                entry.job_id
+            )
+        })?;
+        let input = entry
+            .input
+            .as_ref()
+            .filter(|input| input.is_pty())
+            .ok_or_else(|| format!("job {} foreground input is unavailable", entry.job_id))?;
+        Some(
+            input
+                .revoke_controller_generation(generation)
+                .map_err(|error| {
+                    format!(
+                        "job {} foreground input fence failed: {error}",
+                        entry.job_id
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    foreground.observers.remove(&client_id);
+    if released_control {
+        foreground.controller = None;
+        foreground.controller_generation = None;
+    }
+    let control_available = released_control
+        && fence.is_some_and(|fence| fence.settled)
+        && entry
+            .input
+            .as_ref()
+            .is_some_and(JobInputWriter::controller_available);
+    let control_recipients = control_available.then(|| foreground.recipients());
+    Ok(Some(DetachedForeground {
+        job_id: entry.job_id,
+        attachment_id,
+        session_id: entry.session_id.clone(),
+        control_recipients,
+    }))
+}
+
+async fn emit_detached_foreground(
+    sys: &ActorSystem,
+    client_id: u64,
+    detached: DetachedForeground,
+    reason: &str,
+) {
+    send_actor_gateway_event(
+        "process_mgr",
+        sys,
+        client_id,
+        EventPayload::FgExited {
+            id: detached.job_id.to_string(),
+            attachment_id: detached.attachment_id,
+            reason: reason.to_string(),
+        },
+        detached.session_id.clone(),
+    )
+    .await;
+    if let Some(recipients) = detached.control_recipients {
+        emit_fg_control_changed(
+            sys,
+            recipients,
+            detached.job_id,
+            true,
+            detached.session_id.as_deref(),
+        )
+        .await;
+    }
+}
+
+fn close_foreground_state(foreground: &Arc<Mutex<ForegroundState>>) -> Vec<ForegroundRecipient> {
+    let mut foreground = foreground.lock().unwrap();
+    if foreground.closed {
+        return Vec::new();
+    }
+    foreground.closed = true;
+    foreground.controller = None;
+    foreground.controller_generation = None;
+    std::mem::take(&mut foreground.observers)
+        .into_iter()
+        .map(|(client_id, attachment_id)| ForegroundRecipient {
+            client_id,
+            attachment_id,
+        })
+        .collect()
+}
+
+fn request_input_failure_kill(entry: &ProcessEntry) {
+    match entry.kill_tx.try_send(()) {
+        Ok(()) => warn!(
+            job_id = %entry.job_id,
+            "process_mgr: terminating job after stdin writer failure"
+        ),
+        Err(mpsc::error::TrySendError::Full(_)) => debug!(
+            job_id = %entry.job_id,
+            "process_mgr: job kill already pending after stdin writer failure"
+        ),
+        Err(mpsc::error::TrySendError::Closed(_)) => debug!(
+            job_id = %entry.job_id,
+            "process_mgr: job already exiting after stdin writer failure"
+        ),
+    }
+}
+
+fn reject_controller_input(
+    entry: &ProcessEntry,
+    client_id: u64,
+    operation: &str,
+) -> InputRejection {
+    match detach_foreground_entry(entry, client_id) {
+        Ok(Some(detached)) => InputRejection::Detached(detached),
+        Ok(None) => InputRejection::None,
+        Err(error) => {
+            let recipients = close_foreground_state(&entry.foreground);
+            request_input_failure_kill(entry);
+            InputRejection::Failed(FailedForeground {
+                recipients,
+                job_id: entry.job_id,
+                session_id: entry.session_id.clone(),
+                reason: format!("{operation} failed closed: {error}"),
+            })
+        }
+    }
+}
+
+async fn emit_input_rejection(
+    sys: &ActorSystem,
+    client_id: u64,
+    rejection: InputRejection,
+    detach_reason: &str,
+) {
+    match rejection {
+        InputRejection::None => {}
+        InputRejection::Detached(detached) => {
+            emit_detached_foreground(sys, client_id, detached, detach_reason).await;
+        }
+        InputRejection::Failed(failed) => {
+            emit_fg_exit_recipients(
+                sys,
+                failed.recipients,
+                failed.job_id,
+                &failed.reason,
+                failed.session_id.as_deref(),
+            )
+            .await;
+        }
+    }
+}
+
+enum JobInputDispatchError {
+    Unauthorized(String),
+    Enqueue(InputEnqueueError),
+}
+
+impl std::fmt::Display for JobInputDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(message) => formatter.write_str(message),
+            Self::Enqueue(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn try_enqueue_job_input(
+    entry: &ProcessEntry,
+    client_id: u64,
+    data: Vec<u8>,
+) -> Result<(), JobInputDispatchError> {
+    let input = entry.input.as_ref().ok_or_else(|| {
+        JobInputDispatchError::Unauthorized(format!("job {} does not accept stdin", entry.job_id))
+    })?;
+    if input.is_pty() {
+        let foreground = entry.foreground.lock().unwrap();
+        if foreground.controller != Some(client_id) {
+            return Err(JobInputDispatchError::Unauthorized(format!(
+                "client does not control foreground job {}",
+                entry.job_id
+            )));
+        }
+        let generation = foreground.controller_generation.ok_or_else(|| {
+            JobInputDispatchError::Unauthorized(format!(
+                "job {} foreground controller generation is missing",
+                entry.job_id
+            ))
+        })?;
+        // A successful try_send is the ACK linearization point: it means the
+        // daemon accepted this item into the bounded per-job queue, not that
+        // the child process consumed it. Controller fences cancel old,
+        // not-yet-written generations before a later controller may proceed.
+        input
+            .try_enqueue(data, Some(generation))
+            .map_err(JobInputDispatchError::Enqueue)
+    } else {
+        input
+            .try_enqueue(data, None)
+            .map_err(JobInputDispatchError::Enqueue)
+    }
 }
 
 /// Spawn the ProcessManager actor task.
@@ -526,9 +1174,50 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
         // Internal channel for reader tasks to request cleanup.
         let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<JobId>(super::ACTOR_CHANNEL_CAP);
+        // Writer failures must bypass the bounded actor mailbox: a saturated
+        // client/control queue may not suppress fail-closed PTY teardown.
+        let (input_failure_tx, mut input_failure_rx) =
+            mpsc::unbounded_channel::<InputWriterFailure>();
 
         loop {
             tokio::select! {
+                biased;
+
+                Some(InputWriterFailure {
+                    job_id,
+                    writer_incarnation,
+                    reason,
+                }) = input_failure_rx.recv() => {
+                    let failure = children.get(&job_id.0).and_then(|entry| {
+                        let input = entry.input.as_ref()?;
+                        (input.incarnation == writer_incarnation).then(|| {
+                            let recipients = close_foreground_state(&entry.foreground);
+                            request_input_failure_kill(entry);
+                            (
+                                recipients,
+                                entry.session_id.clone(),
+                                format!("foreground input failed closed: {reason}"),
+                            )
+                        })
+                    });
+                    if let Some((recipients, session_id, reason)) = failure {
+                        emit_fg_exit_recipients(
+                            &sys,
+                            recipients,
+                            job_id,
+                            &reason,
+                            session_id.as_deref(),
+                        )
+                        .await;
+                    }
+                }
+
+                // Reader task finished; remove the stale entry.
+                Some(job_id) = cleanup_rx.recv() => {
+                    debug!(%job_id, "process_mgr: cleaning up finished child");
+                    children.remove(&job_id.0);
+                }
+
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break; };
                     match msg {
@@ -620,6 +1309,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         &effective_options,
                         sys.clone(),
                         cleanup_tx.clone(),
+                        input_failure_tx.clone(),
                     )
                     .await;
 
@@ -720,26 +1410,41 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                 }
 
                 ProcessMgrMsg::SendJobInput { client_id, job_id, data, reply } => {
-                    let input = children.get(&job_id.0).and_then(|entry| {
-                        let input = entry.input.clone()?;
-                        if client_may_write_job_input(&input, &entry.foreground, client_id) {
-                            Some(input)
-                        } else {
-                            None
-                        }
-                    });
-                    let handled = match input {
-                        Some(input) => write_job_input(&input, &data)
-                            .await
-                            .map_err(|error| format!("failed to write job input: {error}")),
-                        None if children.get(&job_id.0).is_some_and(|entry| {
-                            matches!(&entry.input, Some(JobInput::Pty(_)))
-                        }) => Err(format!(
-                            "client does not control foreground job {job_id}"
-                        )),
-                        None => Err(format!("job {job_id} does not accept stdin")),
+                    let (handled, rejection) = match children.get(&job_id.0) {
+                        Some(entry) => match try_enqueue_job_input(entry, client_id, data) {
+                            Ok(()) => (Ok(()), InputRejection::None),
+                            Err(error) => {
+                                let rejection = if matches!(
+                                    error,
+                                    JobInputDispatchError::Enqueue(_)
+                                ) && entry
+                                    .input
+                                    .as_ref()
+                                    .is_some_and(JobInputWriter::is_pty)
+                                {
+                                    reject_controller_input(entry, client_id, "job input rejection")
+                                } else {
+                                    InputRejection::None
+                                };
+                                (
+                                    Err(format!("failed to enqueue job input: {error}")),
+                                    rejection,
+                                )
+                            }
+                        },
+                        None => (
+                            Err(format!("job {job_id} does not accept stdin")),
+                            InputRejection::None,
+                        ),
                     };
                     let _ = reply.send(handled);
+                    emit_input_rejection(
+                        &sys,
+                        client_id,
+                        rejection,
+                        "job input rejected; controller detached",
+                    )
+                    .await;
                 }
 
                 ProcessMgrMsg::AttachFg { client_id, job_id, role, reply } => {
@@ -850,42 +1555,34 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                 ProcessMgrMsg::DetachFg { client_id, reason, reply } => {
                     let mut detached_jobs = Vec::new();
+                    let mut failed_fences = Vec::new();
                     for entry in children.values() {
-                        let mut foreground = entry.foreground.lock().unwrap();
-                        if let Some((attachment_id, control_recipients)) =
-                            foreground.detach(client_id)
-                        {
-                            detached_jobs.push((
-                                entry.job_id,
-                                attachment_id,
-                                entry.session_id.clone(),
-                                control_recipients,
-                            ));
+                        match detach_foreground_entry(entry, client_id) {
+                            Ok(Some(detached)) => detached_jobs.push(detached),
+                            Ok(None) => {}
+                            Err(error) => {
+                                request_input_failure_kill(entry);
+                                failed_fences.push((
+                                    entry.foreground.clone(),
+                                    entry.job_id,
+                                    entry.session_id.clone(),
+                                    format!("foreground detach failed closed: {error}"),
+                                ));
+                            }
                         }
                     }
-                    for (job_id, attachment_id, session_id, control_recipients) in detached_jobs {
-                        send_actor_gateway_event(
-                            "process_mgr",
+                    for detached in detached_jobs {
+                        emit_detached_foreground(&sys, client_id, detached, &reason).await;
+                    }
+                    for (foreground, job_id, session_id, failure_reason) in failed_fences {
+                        emit_fg_exit(
                             &sys,
-                            client_id,
-                            EventPayload::FgExited {
-                                id: job_id.to_string(),
-                                attachment_id,
-                                reason: reason.clone(),
-                            },
-                            session_id.clone(),
+                            &foreground,
+                            job_id,
+                            &failure_reason,
+                            session_id.as_deref(),
                         )
                         .await;
-                        if let Some(recipients) = control_recipients {
-                            emit_fg_control_changed(
-                                &sys,
-                                recipients,
-                                job_id,
-                                true,
-                                session_id.as_deref(),
-                            )
-                            .await;
-                        }
                     }
                     if let Some(reply) = reply {
                         let _ = reply.send(());
@@ -893,21 +1590,47 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                 }
 
                 ProcessMgrMsg::FgInput { client_id, data, reply } => {
-                    let input = children
+                    let entry = children
                         .values()
                         .find(|entry| {
                             entry.foreground.lock().unwrap().controller == Some(client_id)
-                        })
-                        .and_then(|entry| entry.input.clone());
-                    let handled = if let Some(input) = input {
-                        match write_job_input(&input, &data).await {
-                            Ok(()) => Ok(()),
-                            Err(error) => Err(format!("failed to write fg input: {error}")),
+                        });
+                    let (handled, rejection) = if let Some(entry) = entry {
+                        match try_enqueue_job_input(entry, client_id, data) {
+                            Ok(()) => (Ok(()), InputRejection::None),
+                            Err(error) => {
+                                let rejection = if matches!(
+                                    error,
+                                    JobInputDispatchError::Enqueue(_)
+                                ) {
+                                    reject_controller_input(
+                                        entry,
+                                        client_id,
+                                        "foreground input rejection",
+                                    )
+                                } else {
+                                    InputRejection::None
+                                };
+                                (
+                                    Err(format!("failed to enqueue fg input: {error}")),
+                                    rejection,
+                                )
+                            }
                         }
                     } else {
-                        Err("no foreground session attached".to_string())
+                        (
+                            Err("no foreground session attached".to_string()),
+                            InputRejection::None,
+                        )
                     };
                     let _ = reply.send(handled);
+                    emit_input_rejection(
+                        &sys,
+                        client_id,
+                        rejection,
+                        "foreground input rejected; controller detached",
+                    )
+                    .await;
                 }
 
                 ProcessMgrMsg::FgResize { client_id, cols, rows, reply } => {
@@ -923,6 +1646,34 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     } else {
                         Err("no foreground session attached".into())
                     });
+                }
+
+                ProcessMgrMsg::InputWriterFenceSettled {
+                    job_id,
+                    writer_incarnation,
+                    generation,
+                } => {
+                    let settled = children.get(&job_id.0).and_then(|entry| {
+                        let input = entry.input.as_ref()?;
+                        if input.incarnation != writer_incarnation
+                            || !input.fence.is_settled_generation(generation)
+                        {
+                            return None;
+                        }
+                        let foreground = entry.foreground.lock().unwrap();
+                        (foreground.controller.is_none() && !foreground.closed)
+                            .then(|| (foreground.recipients(), entry.session_id.clone()))
+                    });
+                    if let Some((recipients, session_id)) = settled {
+                        emit_fg_control_changed(
+                            &sys,
+                            recipients,
+                            job_id,
+                            true,
+                            session_id.as_deref(),
+                        )
+                        .await;
+                    }
                 }
 
                 ProcessMgrMsg::Shutdown => {
@@ -949,11 +1700,6 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
                 }
 
-                // Reader task finished; remove the stale entry.
-                Some(job_id) = cleanup_rx.recv() => {
-                    debug!(%job_id, "process_mgr: cleaning up finished child");
-                    children.remove(&job_id.0);
-                }
             }
         }
 
@@ -1002,32 +1748,338 @@ async fn read_pty(fd: &AsyncFd<std::fs::File>, buf: &mut [u8]) -> std::io::Resul
     }
 }
 
-async fn write_pty(fd: &AsyncFd<std::fs::File>, data: &[u8]) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        let mut guard = fd.writable().await?;
-        match guard.try_io(|inner| inner.get_ref().write(&data[written..])) {
-            Ok(Ok(0)) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "pty write returned 0 bytes",
-                ));
-            }
-            Ok(Ok(n)) => written += n,
-            Ok(Err(error)) => return Err(error),
-            Err(_would_block) => continue,
-        }
-    }
-    Ok(())
+enum PtyItemOutcome {
+    Written { settled_generation: Option<u64> },
+    Discarded { settled_generation: Option<u64> },
+    Failed(String),
 }
 
-async fn write_job_input(input: &JobInput, data: &[u8]) -> std::io::Result<()> {
-    match input {
-        JobInput::Pty(fd) => write_pty(fd, data).await,
-        JobInput::Pipe(stdin) => {
-            let mut stdin = stdin.lock().await;
-            stdin.write_all(data).await?;
-            stdin.flush().await
+fn settle_idle_fence(fence: &InputFence) -> Option<u64> {
+    let mut inner = fence.lock_inner();
+    if fence.is_poisoned() {
+        return None;
+    }
+    if inner.active.is_none() && inner.settled_generation != inner.generation {
+        inner.settled_generation = inner.generation;
+        Some(inner.generation)
+    } else {
+        None
+    }
+}
+
+fn cancel_active_pty_item(fence: &InputFence, generation: u64) -> PtyItemOutcome {
+    let mut inner = fence.lock_inner();
+    if fence.is_poisoned() {
+        return PtyItemOutcome::Failed("PTY input fence is poisoned".into());
+    }
+    if inner.generation == generation {
+        return PtyItemOutcome::Discarded {
+            settled_generation: None,
+        };
+    }
+    let Some(active) = inner.active.take() else {
+        let settled_generation = (inner.settled_generation != inner.generation).then(|| {
+            inner.settled_generation = inner.generation;
+            inner.generation
+        });
+        return PtyItemOutcome::Discarded { settled_generation };
+    };
+    if active.written == active.total {
+        let settled_generation = (inner.settled_generation != inner.generation).then(|| {
+            inner.settled_generation = inner.generation;
+            inner.generation
+        });
+        return PtyItemOutcome::Written { settled_generation };
+    }
+    if active.written == 0 {
+        let settled_generation = (inner.settled_generation != inner.generation).then(|| {
+            inner.settled_generation = inner.generation;
+            inner.generation
+        });
+        return PtyItemOutcome::Discarded { settled_generation };
+    }
+
+    let reason = format!(
+        "controller generation changed after delivering {} of {} input bytes",
+        active.written, active.total
+    );
+    fence.poison_locked(&mut inner);
+    PtyItemOutcome::Failed(reason)
+}
+
+fn poison_active_pty_item(fence: &InputFence, detail: &str) -> PtyItemOutcome {
+    let mut inner = fence.lock_inner();
+    let active = inner.active.take();
+    let (written, total) = active.map_or((0, 0), |active| (active.written, active.total));
+    let reason = format!("{detail}; delivered {written} of {total} input bytes");
+    fence.poison_locked(&mut inner);
+    PtyItemOutcome::Failed(reason)
+}
+
+async fn write_pty_item(
+    fd: &AsyncFd<std::fs::File>,
+    item: &JobInputItem,
+    fence: &InputFence,
+    fence_changes: &mut watch::Receiver<u64>,
+) -> PtyItemOutcome {
+    let Some(generation) = item.generation else {
+        return PtyItemOutcome::Failed("PTY input item has no controller generation".into());
+    };
+    if item.data.is_empty() {
+        return PtyItemOutcome::Written {
+            settled_generation: None,
+        };
+    }
+
+    {
+        let mut inner = fence.lock_inner();
+        if fence.is_poisoned() {
+            return PtyItemOutcome::Failed("PTY input writer is poisoned".into());
+        }
+        if inner.generation != generation {
+            let settled_generation = (inner.settled_generation != inner.generation).then(|| {
+                inner.settled_generation = inner.generation;
+                inner.generation
+            });
+            return PtyItemOutcome::Discarded { settled_generation };
+        }
+        inner.active = Some(ActiveInput {
+            generation,
+            written: 0,
+            total: item.data.len(),
+        });
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = fence_changes.changed() => {
+                if changed.is_err() {
+                    return poison_active_pty_item(fence, "PTY input fence closed");
+                }
+                let outcome = cancel_active_pty_item(fence, generation);
+                if !matches!(
+                    outcome,
+                    PtyItemOutcome::Discarded {
+                        settled_generation: None,
+                    }
+                ) {
+                    return outcome;
+                }
+            }
+
+            writable = fd.writable() => {
+                let mut guard = match writable {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        return poison_active_pty_item(
+                            fence,
+                            &format!("wait for PTY writable failed: {error}"),
+                        );
+                    }
+                };
+                let mut inner = fence.lock_inner();
+                if fence.is_poisoned() {
+                    return PtyItemOutcome::Failed("PTY input writer is poisoned".into());
+                }
+                if inner.generation != generation {
+                    drop(inner);
+                    return cancel_active_pty_item(fence, generation);
+                }
+                let written = inner
+                    .active
+                    .as_ref()
+                    .map(|active| active.written)
+                    .unwrap_or(0);
+                match guard.try_io(|inner_fd| {
+                    inner_fd.get_ref().write(&item.data[written..])
+                }) {
+                    Ok(Ok(0)) => {
+                        fence.poison_locked(&mut inner);
+                        return PtyItemOutcome::Failed(format!(
+                            "PTY write returned 0 bytes; delivered {written} of {} input bytes",
+                            item.data.len()
+                        ));
+                    }
+                    Ok(Ok(count)) => {
+                        let active = inner
+                            .active
+                            .as_mut()
+                            .expect("PTY item remains active while its generation is current");
+                        active.written += count;
+                        if active.written == active.total {
+                            inner.active = None;
+                            return PtyItemOutcome::Written {
+                                settled_generation: None,
+                            };
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        fence.poison_locked(&mut inner);
+                        return PtyItemOutcome::Failed(format!(
+                            "PTY write failed: {error}; delivered {written} of {} input bytes",
+                            item.data.len()
+                        ));
+                    }
+                    Err(_would_block) => {}
+                }
+            }
+        }
+    }
+}
+
+fn notify_input_writer_failure(
+    failures: &mpsc::UnboundedSender<InputWriterFailure>,
+    job_id: JobId,
+    writer_incarnation: u64,
+    reason: String,
+) {
+    let _ = failures.send(InputWriterFailure {
+        job_id,
+        writer_incarnation,
+        reason,
+    });
+}
+
+async fn notify_input_fence_settled(
+    process_mgr: &mpsc::Sender<ProcessMgrMsg>,
+    job_id: JobId,
+    writer_incarnation: u64,
+    generation: u64,
+) {
+    let _ = process_mgr
+        .send(ProcessMgrMsg::InputWriterFenceSettled {
+            job_id,
+            writer_incarnation,
+            generation,
+        })
+        .await;
+}
+
+async fn job_input_writer_task(
+    job_id: JobId,
+    writer_incarnation: u64,
+    mut sink: JobInputSink,
+    mut receiver: mpsc::Receiver<JobInputItem>,
+    fence: Arc<InputFence>,
+    process_mgr: mpsc::Sender<ProcessMgrMsg>,
+    failures: mpsc::UnboundedSender<InputWriterFailure>,
+) {
+    match &mut sink {
+        JobInputSink::Pty(fd) => {
+            let mut fence_changes = fence.subscribe();
+            loop {
+                tokio::select! {
+                    biased;
+
+                    changed = fence_changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        if let Some(generation) = settle_idle_fence(&fence) {
+                            notify_input_fence_settled(
+                                &process_mgr,
+                                job_id,
+                                writer_incarnation,
+                                generation,
+                            )
+                            .await;
+                        }
+                    }
+
+                    item = receiver.recv() => {
+                        let Some(item) = item else {
+                            return;
+                        };
+                        match write_pty_item(fd, &item, &fence, &mut fence_changes).await {
+                            PtyItemOutcome::Written { settled_generation }
+                            | PtyItemOutcome::Discarded { settled_generation } => {
+                                if let Some(generation) = settled_generation {
+                                    notify_input_fence_settled(
+                                        &process_mgr,
+                                        job_id,
+                                        writer_incarnation,
+                                        generation,
+                                    )
+                                    .await;
+                                }
+                            }
+                            PtyItemOutcome::Failed(reason) => {
+                                if !fence.is_poisoned() {
+                                    let mut inner = fence.lock_inner();
+                                    fence.poison_locked(&mut inner);
+                                }
+                                notify_input_writer_failure(
+                                    &failures,
+                                    job_id,
+                                    writer_incarnation,
+                                    reason,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        JobInputSink::Pipe(stdin) => {
+            while let Some(item) = receiver.recv().await {
+                let mut written = 0;
+                while written < item.data.len() {
+                    match stdin.write(&item.data[written..]).await {
+                        Ok(0) => {
+                            {
+                                let mut inner = fence.lock_inner();
+                                fence.poison_locked(&mut inner);
+                            }
+                            notify_input_writer_failure(
+                                &failures,
+                                job_id,
+                                writer_incarnation,
+                                format!(
+                                    "stdin write returned 0 bytes; delivered {written} of {} input bytes",
+                                    item.data.len()
+                                ),
+                            );
+                            return;
+                        }
+                        Ok(count) => written += count,
+                        Err(error) => {
+                            {
+                                let mut inner = fence.lock_inner();
+                                fence.poison_locked(&mut inner);
+                            }
+                            notify_input_writer_failure(
+                                &failures,
+                                job_id,
+                                writer_incarnation,
+                                format!(
+                                    "stdin write failed: {error}; delivered {written} of {} input bytes",
+                                    item.data.len()
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
+                if let Err(error) = stdin.flush().await {
+                    {
+                        let mut inner = fence.lock_inner();
+                        fence.poison_locked(&mut inner);
+                    }
+                    notify_input_writer_failure(
+                        &failures,
+                        job_id,
+                        writer_incarnation,
+                        format!(
+                            "stdin flush failed after delivering {} input bytes: {error}",
+                            item.data.len()
+                        ),
+                    );
+                    return;
+                }
+            }
         }
     }
 }
@@ -1153,6 +2205,7 @@ async fn spawn_job_plan(
     options: &ProcessJobOptions,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
+    input_failure_tx: mpsc::UnboundedSender<InputWriterFailure>,
 ) -> Result<ProcessEntry, ()> {
     match plan {
         JobPlan::Pipeline(pipeline) if pipeline_has_job_local_builtin(pipeline) => {
@@ -1167,14 +2220,32 @@ async fn spawn_job_plan(
             .await
         }
         JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 && options.pty_enabled => {
-            spawn_single_pty_job(job_id, pipeline, snapshot, options, sys, cleanup_tx).await
+            spawn_single_pty_job(
+                job_id,
+                pipeline,
+                snapshot,
+                options,
+                sys,
+                cleanup_tx,
+                input_failure_tx,
+            )
+            .await
         }
         // Single-segment without PTY → spawn with pipes.
         JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 => {
             spawn_single_pipe_job(job_id, pipeline, snapshot, options, sys, cleanup_tx).await
         }
         JobPlan::Pipeline(pipeline) => {
-            spawn_native_pipeline_job(job_id, pipeline, snapshot, options, sys, cleanup_tx).await
+            spawn_native_pipeline_job(
+                job_id,
+                pipeline,
+                snapshot,
+                options,
+                sys,
+                cleanup_tx,
+                input_failure_tx,
+            )
+            .await
         }
         JobPlan::And { .. } | JobPlan::Or { .. } => {
             spawn_logical_job(
@@ -1483,6 +2554,7 @@ async fn spawn_single_pty_job(
     options: &ProcessJobOptions,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
+    input_failure_tx: mpsc::UnboundedSender<InputWriterFailure>,
 ) -> Result<ProcessEntry, ()> {
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let segment = &segments[0];
@@ -1573,7 +2645,7 @@ async fn spawn_single_pty_job(
 
     let log_file = open_output_log(job_id).await;
     let input = match AsyncFd::new(input_file) {
-        Ok(file) => Arc::new(file),
+        Ok(file) => file,
         Err(error) => {
             error!(%job_id, err = %error, "process_mgr: async pty input failed");
             request_child_kill(job_id, &mut child, "async pty input setup failed");
@@ -1620,7 +2692,12 @@ async fn spawn_single_pty_job(
         kill_tx,
         ring_buffer,
         stderr_ring: None,
-        input: Some(JobInput::Pty(input)),
+        input: Some(JobInputWriter::spawn(
+            job_id,
+            JobInputSink::Pty(input),
+            sys.process_mgr.clone(),
+            input_failure_tx,
+        )),
         resize: Some(resize_file),
         foreground,
     })
@@ -1656,6 +2733,7 @@ async fn spawn_native_pipeline_job(
     options: &ProcessJobOptions,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
+    input_failure_tx: mpsc::UnboundedSender<InputWriterFailure>,
 ) -> Result<ProcessEntry, ()> {
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
@@ -1709,6 +2787,9 @@ async fn spawn_native_pipeline_job(
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
+    let input = input.map(|input| {
+        JobInputWriter::spawn(job_id, input, sys.process_mgr.clone(), input_failure_tx)
+    });
 
     Ok(ProcessEntry {
         job_id,
@@ -1855,10 +2936,7 @@ fn spawn_native_pipeline(
             );
         })?;
         if idx == 0 && options.capture_stdin {
-            input = child
-                .stdin
-                .take()
-                .map(|stdin| JobInput::Pipe(Arc::new(tokio::sync::Mutex::new(stdin))));
+            input = child.stdin.take().map(JobInputSink::Pipe);
         }
         if let Some(stdout) = child.stdout.take() {
             stdout_sources.push(stdout);
@@ -2980,23 +4058,25 @@ async fn emit_fg_exit(
     reason: &str,
     session_id: Option<&str>,
 ) {
-    let recipients = {
-        let mut foreground = foreground.lock().unwrap();
-        if foreground.closed {
-            return;
-        }
-        foreground.closed = true;
-        foreground.controller = None;
-        std::mem::take(&mut foreground.observers)
-    };
-    for (client_id, attachment_id) in recipients {
+    let recipients = close_foreground_state(foreground);
+    emit_fg_exit_recipients(sys, recipients, job_id, reason, session_id).await;
+}
+
+async fn emit_fg_exit_recipients(
+    sys: &ActorSystem,
+    recipients: Vec<ForegroundRecipient>,
+    job_id: JobId,
+    reason: &str,
+    session_id: Option<&str>,
+) {
+    for recipient in recipients {
         send_actor_gateway_event(
             "process_mgr",
             sys,
-            client_id,
+            recipient.client_id,
             EventPayload::FgExited {
                 id: job_id.to_string(),
-                attachment_id,
+                attachment_id: recipient.attachment_id,
                 reason: reason.to_string(),
             },
             session_id.map(str::to_owned),
@@ -3418,6 +4498,7 @@ mod tests {
         let foreground = Arc::new(Mutex::new(ForegroundState {
             observers: BTreeMap::from([(42, 7), (43, 9)]),
             controller: Some(42),
+            controller_generation: Some(1),
             last_attachment_id: 9,
             closed: false,
         }));
@@ -3505,6 +4586,13 @@ mod tests {
         ring_buffer.lock().unwrap().push(b"before");
         let foreground = Arc::new(Mutex::new(ForegroundState::default()));
         let (kill_tx, _kill_rx) = mpsc::channel(1);
+        let pty = crate::pty::open_pty().expect("test PTY");
+        let _slave = pty.slave;
+        let master = std::fs::File::from(pty.master);
+        set_nonblocking(master.as_raw_fd()).expect("nonblocking test PTY");
+        let input = AsyncFd::new(master).expect("async test PTY");
+        let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (input_failures, _input_failure_rx) = mpsc::unbounded_channel();
         let entry = ProcessEntry {
             job_id: JobId(9),
             session_id: Some("SS-shared".into()),
@@ -3513,7 +4601,12 @@ mod tests {
             kill_tx,
             ring_buffer: ring_buffer.clone(),
             stderr_ring: None,
-            input: None,
+            input: Some(JobInputWriter::spawn(
+                JobId(9),
+                JobInputSink::Pty(input),
+                process_mgr,
+                input_failures,
+            )),
             resize: Some(Arc::new(std::fs::File::open("/dev/null").unwrap())),
             foreground: foreground.clone(),
         };
@@ -3616,6 +4709,430 @@ mod tests {
         assert!(!job_input_kind_allows_client(true, None, 42));
         assert!(!job_input_kind_allows_client(true, Some(7), 42));
         assert!(job_input_kind_allows_client(true, Some(42), 42));
+    }
+
+    #[tokio::test]
+    async fn unexpected_input_writer_exit_survives_saturated_mailbox_and_poisoned_mutex() {
+        let (main_mailbox, _main_rx) = mpsc::channel(1);
+        main_mailbox
+            .try_send(ProcessMgrMsg::Shutdown)
+            .expect("saturate main actor mailbox");
+        assert_eq!(main_mailbox.capacity(), 0);
+
+        let fence = Arc::new(InputFence::new());
+        let poisoned_fence = fence.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_fence.inner.lock().unwrap();
+                panic!("poison input fence mutex");
+            })
+            .join()
+            .is_err()
+        );
+        let (failures, mut failure_rx) = mpsc::unbounded_channel();
+        let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(InputWriterTaskExitGuard {
+                job_id: JobId(9),
+                writer_incarnation: 17,
+                fence: fence.clone(),
+                failures,
+                armed: true,
+            });
+        }));
+
+        assert!(exit.is_ok(), "exit fencing must never double-panic");
+        assert!(fence.is_poisoned());
+        let InputWriterFailure {
+            job_id,
+            writer_incarnation,
+            reason,
+        } = failure_rx
+            .recv()
+            .await
+            .expect("writer failure notification");
+        assert_eq!(job_id, JobId(9));
+        assert_eq!(writer_incarnation, 17);
+        assert!(reason.contains("terminated unexpectedly"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn input_writer_queue_is_bounded_and_drop_aborts_its_task() {
+        struct DropSignal(Option<oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (sender, receiver) = mpsc::channel(JOB_INPUT_QUEUE_CAP);
+        let fence = Arc::new(InputFence::new());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("writer task started");
+        let writer = JobInputWriter {
+            kind: JobInputKind::Pipe,
+            incarnation: 7,
+            sender,
+            fence,
+            _task: AbortTaskOnDrop(task),
+        };
+
+        assert_eq!(
+            writer.try_enqueue(vec![0; MAX_FOREGROUND_INPUT_BYTES + 1], None),
+            Err(InputEnqueueError::TooLarge {
+                actual: MAX_FOREGROUND_INPUT_BYTES + 1,
+            })
+        );
+        for _ in 0..JOB_INPUT_QUEUE_CAP {
+            writer
+                .try_enqueue(vec![b'x'], None)
+                .expect("bounded queue slot");
+        }
+        assert_eq!(
+            writer.try_enqueue(vec![b'x'], None),
+            Err(InputEnqueueError::Full)
+        );
+        drop(receiver);
+        assert_eq!(
+            writer.try_enqueue(vec![b'x'], None),
+            Err(InputEnqueueError::Closed)
+        );
+
+        drop(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("writer abort timed out")
+            .expect("writer drop signal");
+    }
+
+    #[tokio::test]
+    async fn full_and_oversize_pty_input_synchronously_detach_with_fg_exited() {
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+
+        let (sender, _receiver) = mpsc::channel(JOB_INPUT_QUEUE_CAP);
+        let fence = Arc::new(InputFence::new());
+        let generation = fence
+            .start_controller_generation()
+            .expect("controller generation");
+        let writer = JobInputWriter {
+            kind: JobInputKind::Pty,
+            incarnation: 21,
+            sender,
+            fence,
+            _task: AbortTaskOnDrop(tokio::spawn(std::future::pending())),
+        };
+        let foreground = Arc::new(Mutex::new(ForegroundState {
+            observers: BTreeMap::from([(42, 1)]),
+            controller: Some(42),
+            controller_generation: Some(generation),
+            last_attachment_id: 1,
+            closed: false,
+        }));
+        let (kill_tx, mut kill_rx) = mpsc::channel(1);
+        let entry = ProcessEntry {
+            job_id: JobId(9),
+            session_id: Some("SS-input-limit".into()),
+            status: JobStatus::Running,
+            reader_handle: tokio::spawn(async {}),
+            kill_tx,
+            ring_buffer: Arc::new(Mutex::new(RingBuffer::default())),
+            stderr_ring: None,
+            input: Some(writer),
+            resize: Some(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            foreground: foreground.clone(),
+        };
+
+        for _ in 0..JOB_INPUT_QUEUE_CAP {
+            assert!(
+                try_enqueue_job_input(&entry, 42, vec![b'x']).is_ok(),
+                "fill bounded foreground queue"
+            );
+        }
+        assert!(matches!(
+            try_enqueue_job_input(&entry, 42, vec![b'x']),
+            Err(JobInputDispatchError::Enqueue(InputEnqueueError::Full))
+        ));
+        let rejection = reject_controller_input(&entry, 42, "foreground input rejection");
+        assert!(matches!(rejection, InputRejection::Detached(_)));
+        emit_input_rejection(
+            &sys,
+            42,
+            rejection,
+            "foreground input rejected; controller detached",
+        )
+        .await;
+        match gateway_rx.recv().await.expect("queue-full FgExited") {
+            GatewayMsg::SendEvent {
+                client_id,
+                payload:
+                    EventPayload::FgExited {
+                        id, attachment_id, ..
+                    },
+                ..
+            } => {
+                assert_eq!(client_id, 42);
+                assert_eq!(id, "J9");
+                assert_eq!(attachment_id, 1);
+            }
+            _ => panic!("expected queue-full FgExited"),
+        }
+
+        let (attached, _) = attach_foreground(&entry, 43, ForegroundRole::Controller)
+            .expect("attach after settled queue-full fence");
+        assert!(matches!(
+            try_enqueue_job_input(&entry, 43, vec![b'x'; MAX_FOREGROUND_INPUT_BYTES + 1],),
+            Err(JobInputDispatchError::Enqueue(
+                InputEnqueueError::TooLarge { .. }
+            ))
+        ));
+        let rejection = reject_controller_input(&entry, 43, "foreground input rejection");
+        assert!(matches!(rejection, InputRejection::Detached(_)));
+        emit_input_rejection(
+            &sys,
+            43,
+            rejection,
+            "foreground input rejected; controller detached",
+        )
+        .await;
+        match gateway_rx.recv().await.expect("oversize FgExited") {
+            GatewayMsg::SendEvent {
+                client_id,
+                payload:
+                    EventPayload::FgExited {
+                        id, attachment_id, ..
+                    },
+                ..
+            } => {
+                assert_eq!(client_id, 43);
+                assert_eq!(id, "J9");
+                assert_eq!(attachment_id, attached.attachment_id);
+            }
+            _ => panic!("expected oversize FgExited"),
+        }
+        assert!(matches!(
+            kill_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(foreground.lock().unwrap().observers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_pty_writer_synchronously_poisons_kills_and_exits_all_observers() {
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+
+        let (sender, receiver) = mpsc::channel(JOB_INPUT_QUEUE_CAP);
+        drop(receiver);
+        let fence = Arc::new(InputFence::new());
+        let generation = fence
+            .start_controller_generation()
+            .expect("controller generation");
+        let writer = JobInputWriter {
+            kind: JobInputKind::Pty,
+            incarnation: 22,
+            sender,
+            fence: fence.clone(),
+            _task: AbortTaskOnDrop(tokio::spawn(std::future::pending())),
+        };
+        let foreground = Arc::new(Mutex::new(ForegroundState {
+            observers: BTreeMap::from([(42, 1), (43, 2)]),
+            controller: Some(42),
+            controller_generation: Some(generation),
+            last_attachment_id: 2,
+            closed: false,
+        }));
+        let (kill_tx, mut kill_rx) = mpsc::channel(1);
+        let entry = ProcessEntry {
+            job_id: JobId(9),
+            session_id: Some("SS-closed-input".into()),
+            status: JobStatus::Running,
+            reader_handle: tokio::spawn(async {}),
+            kill_tx,
+            ring_buffer: Arc::new(Mutex::new(RingBuffer::default())),
+            stderr_ring: None,
+            input: Some(writer),
+            resize: Some(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            foreground: foreground.clone(),
+        };
+
+        assert!(matches!(
+            try_enqueue_job_input(&entry, 42, vec![b'x']),
+            Err(JobInputDispatchError::Enqueue(InputEnqueueError::Closed))
+        ));
+        assert!(fence.is_poisoned());
+        let rejection = reject_controller_input(&entry, 42, "foreground input rejection");
+        assert!(matches!(rejection, InputRejection::Failed(_)));
+        emit_input_rejection(
+            &sys,
+            42,
+            rejection,
+            "foreground input rejected; controller detached",
+        )
+        .await;
+
+        for (expected_client, expected_attachment) in [(42, 1), (43, 2)] {
+            match gateway_rx.recv().await.expect("closed-writer FgExited") {
+                GatewayMsg::SendEvent {
+                    client_id,
+                    payload:
+                        EventPayload::FgExited {
+                            id, attachment_id, ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(client_id, expected_client);
+                    assert_eq!(id, "J9");
+                    assert_eq!(attachment_id, expected_attachment);
+                }
+                _ => panic!("expected closed-writer FgExited"),
+            }
+        }
+        kill_rx.try_recv().expect("closed writer must request kill");
+        let foreground = foreground.lock().unwrap();
+        assert!(foreground.closed);
+        assert!(foreground.observers.is_empty());
+        assert_eq!(foreground.controller, None);
+    }
+
+    #[tokio::test]
+    async fn stale_controller_generation_is_discarded_without_writing() {
+        let pty = crate::pty::open_pty().expect("test PTY");
+        let master = std::fs::File::from(pty.master);
+        let mut slave = std::fs::File::from(pty.slave);
+        set_nonblocking(master.as_raw_fd()).expect("nonblocking PTY master");
+        set_nonblocking(slave.as_raw_fd()).expect("nonblocking PTY slave");
+        let master = AsyncFd::new(master).expect("async PTY master");
+        let fence = InputFence::new();
+        let generation = fence
+            .start_controller_generation()
+            .expect("controller generation");
+        assert!(
+            fence
+                .revoke_controller_generation(generation)
+                .expect("revoke generation")
+                .settled
+        );
+        let item = JobInputItem {
+            data: b"must-not-cross-lease".to_vec(),
+            generation: Some(generation),
+        };
+        let mut changes = fence.subscribe();
+
+        assert!(matches!(
+            write_pty_item(&master, &item, &fence, &mut changes).await,
+            PtyItemOutcome::Discarded { .. }
+        ));
+        let mut byte = [0_u8; 1];
+        let error = slave
+            .read(&mut byte)
+            .expect_err("stale generation must not reach the slave PTY");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!fence.is_poisoned());
+    }
+
+    #[test]
+    fn partial_controller_fence_poisons_the_writer() {
+        let fence = InputFence::new();
+        let generation = fence
+            .start_controller_generation()
+            .expect("controller generation");
+        {
+            let mut inner = fence.lock_inner();
+            inner.active = Some(ActiveInput {
+                generation,
+                written: 3,
+                total: 10,
+            });
+        }
+        assert!(
+            !fence
+                .revoke_controller_generation(generation)
+                .expect("revoke partial generation")
+                .settled
+        );
+
+        match cancel_active_pty_item(&fence, generation) {
+            PtyItemOutcome::Failed(reason) => {
+                assert!(reason.contains("delivering 3 of 10"), "{reason}");
+            }
+            _ => panic!("partial cancellation must fail closed"),
+        }
+        assert!(fence.is_poisoned());
+        assert!(!fence.controller_available());
+        assert_eq!(
+            fence.start_controller_generation(),
+            Err(InputEnqueueError::Poisoned)
+        );
+    }
+
+    #[test]
+    fn zero_byte_controller_fence_settles_before_reclaiming_a_new_generation() {
+        let fence = InputFence::new();
+        let first_generation = fence
+            .start_controller_generation()
+            .expect("first controller generation");
+        {
+            let mut inner = fence.lock_inner();
+            inner.active = Some(ActiveInput {
+                generation: first_generation,
+                written: 0,
+                total: 10,
+            });
+        }
+        assert!(
+            !fence
+                .revoke_controller_generation(first_generation)
+                .expect("revoke blocked generation")
+                .settled
+        );
+        assert!(matches!(
+            cancel_active_pty_item(&fence, first_generation),
+            PtyItemOutcome::Discarded {
+                settled_generation: Some(_)
+            }
+        ));
+        assert!(fence.controller_available());
+
+        let second_generation = fence
+            .start_controller_generation()
+            .expect("reclaimed controller generation");
+        assert_ne!(second_generation, first_generation);
+        let inner = fence.lock_inner();
+        assert_eq!(inner.generation, second_generation);
+        assert_eq!(inner.settled_generation, second_generation);
+        assert!(inner.active.is_none());
     }
 
     #[test]

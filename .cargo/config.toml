@@ -1,0 +1,7 @@
+[env]
+# libghostty-vt-sys clones/fetches when these variables are absent. Point raw
+# Cargo invocations at explicit nonexistent sentinels so they fail before any
+# network access. scripts/prepare-ghostty.sh exports verified absolute paths and
+# overrides these defaults.
+GHOSTTY_SOURCE_DIR = { value = ".ghostty-source-not-prepared", relative = true }
+GHOSTTY_ZIG_SYSTEM_DIR = { value = ".ghostty-zig-system-not-prepared", relative = true }

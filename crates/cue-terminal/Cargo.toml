@@ -10,6 +10,9 @@ license.workspace = true
 [dependencies]
 crossterm.workspace = true
 libghostty-vt.workspace = true
+# Pin the sys crate independently: libghostty-vt's dependency is a caret range,
+# while our verified source/toolchain closure is specific to sys 0.2.1.
+libghostty-vt-sys.workspace = true
 ratatui.workspace = true
 thiserror.workspace = true
 

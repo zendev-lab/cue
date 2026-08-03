@@ -19,6 +19,13 @@ use crate::client::{
 use crate::message::AppMsg;
 use cue_core::ipc::Message;
 
+/// Bound all app events awaiting the synchronous TEA/render loop.
+///
+/// Socket events apply async backpressure, terminal events block their
+/// dedicated reader thread, and the timer keeps at most one tick waiting for
+/// capacity so retry work cannot be starved by sustained output.
+const APP_EVENT_CAPACITY: usize = 64;
+
 /// Spawn the event-producing tasks and return a receiver of [`AppMsg`] and a
 /// controller for the connection manager.
 ///
@@ -30,11 +37,11 @@ pub(crate) fn spawn_event_loop(
     socket_reader: Option<ClientReader>,
     connector: ClientConnector,
 ) -> Result<(
-    mpsc::UnboundedReceiver<AppMsg>,
+    mpsc::Receiver<AppMsg>,
     ConnectionController,
-    mpsc::UnboundedSender<AppMsg>,
+    mpsc::Sender<AppMsg>,
 )> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(APP_EVENT_CAPACITY);
     let inject_tx = tx.clone();
 
     // 1. Terminal events (blocking thread)
@@ -49,18 +56,18 @@ pub(crate) fn spawn_event_loop(
                             let Some(msg) = terminal_event_msg(ev) else {
                                 continue;
                             };
-                            if tx_term.send(msg).is_err() {
+                            if tx_term.blocking_send(msg).is_err() {
                                 break;
                             }
                         }
                         Err(error) => {
-                            let _ = tx_term.send(terminal_event_error("read", error));
+                            let _ = tx_term.blocking_send(terminal_event_error("read", error));
                             break;
                         }
                     },
                     Ok(false) => continue,
                     Err(error) => {
-                        let _ = tx_term.send(terminal_event_error("poll", error));
+                        let _ = tx_term.blocking_send(terminal_event_error("poll", error));
                         break;
                     }
                 }
@@ -83,7 +90,7 @@ pub(crate) fn spawn_event_loop(
                 ConnectionEvent::ReconnectFailed { message } => AppMsg::ReconnectFailed { message },
                 ConnectionEvent::Reconnected { writer } => AppMsg::Reconnected { writer },
             };
-            if tx_sock.send(msg).is_err() {
+            if tx_sock.send(msg).await.is_err() {
                 break;
             }
         }
@@ -91,17 +98,20 @@ pub(crate) fn spawn_event_loop(
 
     // 3. Tick timer
     let tx_tick = tx;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            if tx_tick.send(AppMsg::Tick).is_err() {
-                break;
-            }
-        }
-    });
+    tokio::spawn(forward_ticks(tx_tick, Duration::from_secs(1)));
 
     Ok((rx, controller, inject_tx))
+}
+
+async fn forward_ticks(tx: mpsc::Sender<AppMsg>, period: Duration) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if tx.send(AppMsg::Tick).await.is_err() {
+            break;
+        }
+    }
 }
 
 fn terminal_event_msg(event: CtEvent) -> Option<AppMsg> {
@@ -156,5 +166,25 @@ mod tests {
             }
             _ => panic!("expected fatal error"),
         }
+    }
+
+    #[tokio::test]
+    async fn full_event_queue_delivers_waiting_tick_after_capacity_opens() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(AppMsg::Resize(120, 40))
+            .await
+            .expect("fill event queue");
+        let tick_task = tokio::spawn(forward_ticks(tx, Duration::from_secs(60)));
+
+        tokio::task::yield_now().await;
+        assert_eq!(rx.len(), 1, "the waiting tick must not grow the queue");
+        assert!(matches!(rx.recv().await, Some(AppMsg::Resize(120, 40))));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv()).await,
+            Ok(Some(AppMsg::Tick))
+        ));
+
+        tick_task.abort();
+        let _ = tick_task.await;
     }
 }

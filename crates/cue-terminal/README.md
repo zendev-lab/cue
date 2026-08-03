@@ -9,6 +9,12 @@ The model is built on `libghostty-vt` 0.2.1 with its default Kitty graphics
 feature disabled. `libghostty-vt` is not thread-safe, so a
 `ForegroundTerminal` must remain on the TUI thread that created it.
 
+The published `ratatui-ghostty` 0.2.0 crate is intentionally not a runtime
+dependency: it pins the older `libghostty-vt` 0.1.1 API, and its session layer
+owns a PTY and worker thread. cue-shell instead keeps the useful Ratatui
+projection ideas behind this crate while preserving `cued` as the only PTY and
+controller-lease owner.
+
 ## Attribution
 
 The Ratatui projection and tracked-selection implementation were informed by

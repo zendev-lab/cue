@@ -18,6 +18,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 - **`:` prefix commands**: Vim-style builtin access (`:run`, `:kill`, `:jobs`, `:cron`, ...)
 - **`.cue` file scripts**: `cue run <file.cue>` submits one `R<n>` script with fail-fast execution
 - **Shared foreground PTY attach**: `:fg J<n>` claims the single controller lease; `:watch J<n>` observes the same terminal read-only
+- **Ghostty terminal semantics**: the TUI renders foreground PTYs through one `libghostty-vt` backend, including modern key, paste, mouse, selection, and scrollback behavior
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
 - **Chain syntax**: `->` serial · `~>` ignore-failure · `|||` parallel · `|?|` any-success; `&&` / `||` stay inside one job
@@ -41,11 +42,12 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 
 ```
 crates/
-├── cue-core/   — Core types and logic: Session, Job, Scope, Chain, Cron
-├── cue-client/ — Client connection stack and `cue-client` CLI for session/target/run commands
-├── cue-daemon/ — Background daemon library plus `cue-daemon` / `cued` CLIs
-├── cue-tui/    — Interactive TUI frontend plus `cue-tui` CLI
-├── cue-cli/    — `cue` aggregator entrypoint for explicit namespaces and extensions
+├── cue-core/     — Core types and logic: Session, Job, Scope, Chain, Cron
+├── cue-client/   — Client connection stack and `cue-client` CLI for session/target/run commands
+├── cue-daemon/   — Background daemon library plus `cue-daemon` / `cued` CLIs
+├── cue-terminal/ — Client-side Ghostty terminal model, input encoding, and ratatui rendering
+├── cue-tui/      — Interactive TUI frontend plus `cue-tui` CLI
+├── cue-cli/      — `cue` aggregator entrypoint for explicit namespaces and extensions
 ```
 
 ## Installation
@@ -56,13 +58,21 @@ crates/
 uv tool install cue-shell
 ```
 
+Releases currently publish wheels with Ghostty statically embedded for
+manylinux2014 x86_64 and macOS 13+ on x86_64/arm64. Source distributions are
+intentionally not published: building the pinned Ghostty backend requires a
+verified Zig source closure, so unsupported platforms do not silently fall
+back to an unaudited network build.
+
 ## Development
 
 ```bash
-# Prerequisites: Rust 1.95+, just
+# Prerequisites: Rust 1.95+, Python 3.9+, just, curl, tar, and patch
+# This verifies and exports the pinned Zig/Ghostty offline build closure.
+source scripts/prepare-ghostty.sh
 
 # Build
-cargo build
+cargo build --locked
 
 # Start daemon in foreground
 cued -f
@@ -96,6 +106,9 @@ just test
 
 # Full CI locally
 just ci
+
+# Prepare or re-verify the Ghostty toolchain without building
+just ghostty-prepare
 
 # Install pre-commit hooks
 just pre-commit-install
@@ -384,7 +397,8 @@ fails immediately because file-script execution needs a live daemon.
 | cue-core | ✅ Core types / IPC / parser in place |
 | cue-client | ✅ Named sessions / transport profiles / target JSON / script runner |
 | cue-daemon | ✅ Durable sessions / jobs / crons / scopes / PTY attach |
-| cue-tui | ✅ Session attach / interactive job+cron frontend / reconnect view |
+| cue-terminal | ✅ Single Ghostty terminal backend for foreground PTY clients |
+| cue-tui | ✅ Session attach / Ghostty foreground terminal / interactive job+cron frontend / reconnect view |
 | cue-cli | ✅ Aggregator / extension dispatch / package feature gates for first-party commands |
 
 ## License

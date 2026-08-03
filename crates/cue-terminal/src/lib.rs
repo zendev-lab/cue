@@ -17,6 +17,4 @@ mod terminal;
 pub use error::{Error, Result};
 pub use render::{CursorState, CursorStyle};
 pub use selection::SelectionRange;
-pub use terminal::{
-    EffectMode, ForegroundTerminal, ReplyAuthority, TerminalEffect, ViewportScroll,
-};
+pub use terminal::{FeedMode, ForegroundTerminal, ReplyAuthority, ViewportScroll};

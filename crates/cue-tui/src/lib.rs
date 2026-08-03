@@ -17,7 +17,6 @@ mod display;
 mod event;
 mod focus;
 mod footer;
-mod foreground;
 mod geometry;
 mod history;
 mod job_picker;
@@ -46,6 +45,8 @@ use crossterm::event::{
 use cue_client::{ClientConnector, CuedClient, RestartHandle};
 use message::AppMsg;
 use terminal::{PanicHookGuard, TerminalRestoreGuard, initial_terminal_size};
+
+const MAX_READY_EVENTS_PER_FRAME: usize = 64;
 
 /// Entry point used by the thin `src/main.rs` binary.
 pub fn run_cli() -> anyhow::Result<()> {
@@ -120,6 +121,59 @@ impl RunOptions {
         self.debug_socket = debug_socket;
         self
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EventBatchStats {
+    received: usize,
+    applied: usize,
+}
+
+fn apply_app_message(state: &mut AppState, message: AppMsg) -> Result<(), String> {
+    if let AppMsg::FatalError { message } = message {
+        state.update(AppMsg::FatalError {
+            message: message.clone(),
+        });
+        return Err(message);
+    }
+    state.update(message);
+    Ok(())
+}
+
+/// Apply one ready batch between two draw calls.
+///
+/// Messages retain their exact order and update boundary, including terminal
+/// reply drains and attachment fences, but a burst causes only one full frame.
+fn apply_ready_event_batch(
+    state: &mut AppState,
+    rx: &mut tokio::sync::mpsc::Receiver<AppMsg>,
+    first: AppMsg,
+) -> Result<EventBatchStats, String> {
+    let mut stats = EventBatchStats {
+        received: 1,
+        applied: 0,
+    };
+    apply_app_message(state, first)?;
+    stats.applied = 1;
+    if state.should_quit {
+        return Ok(stats);
+    }
+
+    while stats.received < MAX_READY_EVENTS_PER_FRAME {
+        let message = match rx.try_recv() {
+            Ok(message) => message,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        };
+        stats.received += 1;
+        apply_app_message(state, message)?;
+        stats.applied += 1;
+        if state.should_quit {
+            break;
+        }
+    }
+
+    Ok(stats)
 }
 
 /// Run the TUI application.
@@ -205,7 +259,7 @@ pub async fn run(options: RunOptions) -> Result<()> {
         }
     }
 
-    if state.mouse_mode.capture_enabled() {
+    if state.mouse_capture_enabled() {
         crossterm::execute!(std::io::stdout(), EnableMouseCapture)
             .context("enable initial mouse capture")?;
         mouse_capture_enabled = true;
@@ -237,29 +291,23 @@ pub async fn run(options: RunOptions) -> Result<()> {
     let result = loop {
         if let Some(control) = debug_control.as_ref() {
             if let Err(e) = terminal.draw(|frame| {
-                ui::draw(frame, &state);
+                ui::draw(frame, &mut state);
                 tui_debug::record_frame_snapshot(control, frame.buffer_mut());
             }) {
                 break Err(e).context("draw frame");
             }
-        } else if let Err(e) = terminal.draw(|frame| ui::draw(frame, &state)) {
+        } else if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut state)) {
             break Err(e).context("draw frame");
         }
 
-        match rx.recv().await {
-            Some(AppMsg::FatalError { message }) => {
-                state.update(AppMsg::FatalError {
-                    message: message.clone(),
-                });
-                break Err(anyhow::anyhow!(message));
-            }
-            Some(msg) => {
-                state.update(msg);
-                if let Some(control) = debug_control.as_ref() {
-                    tui_debug::update_state_snapshot(&control.snapshots, &state);
-                }
-            }
-            None => break Ok(()),
+        let Some(first) = rx.recv().await else {
+            break Ok(());
+        };
+        if let Err(message) = apply_ready_event_batch(&mut state, &mut rx, first) {
+            break Err(anyhow::anyhow!(message));
+        }
+        if let Some(control) = debug_control.as_ref() {
+            tui_debug::update_state_snapshot(&control.snapshots, &state);
         }
 
         if state.input.history != persisted_history {
@@ -270,7 +318,7 @@ pub async fn run(options: RunOptions) -> Result<()> {
             }
         }
 
-        let desired_mouse_capture = state.mouse_mode.capture_enabled();
+        let desired_mouse_capture = state.mouse_capture_enabled();
         if desired_mouse_capture != mouse_capture_enabled {
             if desired_mouse_capture {
                 crossterm::execute!(std::io::stdout(), EnableMouseCapture)
@@ -294,4 +342,77 @@ pub async fn run(options: RunOptions) -> Result<()> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cue_core::ipc::EventPayload;
+
+    fn fg_output(attachment_id: u64, data: &[u8]) -> AppMsg {
+        AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J1".to_string(),
+            attachment_id,
+            data: data.to_vec(),
+        })
+    }
+
+    #[tokio::test]
+    async fn ready_foreground_chunks_batch_within_one_frame_boundary() {
+        let mut state = AppState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(fg_output(7, b"one")).expect("first output");
+        tx.try_send(fg_output(7, b"two")).expect("second output");
+        tx.try_send(fg_output(7, b"three")).expect("third output");
+
+        let first = rx.recv().await.expect("first ready event");
+        let stats =
+            apply_ready_event_batch(&mut state, &mut rx, first).expect("apply ready event batch");
+
+        assert_eq!(
+            stats,
+            EventBatchStats {
+                received: 3,
+                applied: 3,
+            }
+        );
+        assert!(rx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreground_batch_preserves_attachment_event_boundaries() {
+        let mut state = AppState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(fg_output(7, b"old")).expect("old output");
+        tx.try_send(fg_output(8, b"new")).expect("new output");
+
+        let first = rx.recv().await.expect("first ready event");
+        let stats =
+            apply_ready_event_batch(&mut state, &mut rx, first).expect("apply ready event batch");
+
+        assert_eq!(
+            stats,
+            EventBatchStats {
+                received: 2,
+                applied: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_batch_has_a_fixed_work_bound() {
+        let mut state = AppState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(MAX_READY_EVENTS_PER_FRAME + 8);
+        for _ in 0..(MAX_READY_EVENTS_PER_FRAME + 6) {
+            tx.try_send(AppMsg::Tick).expect("queue tick");
+        }
+
+        let first = rx.recv().await.expect("first ready event");
+        let stats =
+            apply_ready_event_batch(&mut state, &mut rx, first).expect("apply ready event batch");
+
+        assert_eq!(stats.received, MAX_READY_EVENTS_PER_FRAME);
+        assert_eq!(stats.applied, MAX_READY_EVENTS_PER_FRAME);
+        assert_eq!(rx.len(), 6);
+    }
 }

@@ -327,7 +327,7 @@ fn mouse_button(button: MouseButton) -> mouse::Button {
     }
 }
 
-fn button_bit(button: mouse::Button) -> u16 {
+pub(crate) fn button_bit(button: mouse::Button) -> u16 {
     match button {
         mouse::Button::Left => 1 << 0,
         mouse::Button::Right => 1 << 1,
@@ -342,6 +342,10 @@ fn button_bit(button: mouse::Button) -> u16 {
         mouse::Button::Eleven => 1 << 10,
         _ => 1 << 15,
     }
+}
+
+pub(crate) fn mouse_button_bit(button: MouseButton) -> u16 {
+    button_bit(mouse_button(button))
 }
 
 #[cfg(test)]

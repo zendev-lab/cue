@@ -14,6 +14,14 @@ pub enum Error {
     #[error("terminal input is too large to encode")]
     InputTooLarge,
 
+    /// Ghostty could not be initialized with cue-shell's silent logger policy.
+    #[error("failed to initialize Ghostty: {0}")]
+    Initialization(String),
+
+    /// A single terminal update generated an unreasonable amount of PTY input.
+    #[error("terminal reply batch exceeded the {limit}-byte safety limit")]
+    ReplyOverflow { limit: usize },
+
     /// Ghostty formatted terminal content that was not valid UTF-8.
     #[error("Ghostty returned invalid UTF-8 while formatting terminal content")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),

@@ -145,7 +145,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
-                ui::draw(frame, &state);
+                ui::draw(frame, &mut state);
                 update_frame_snapshot(&snapshots, frame_text_from_buffer(frame.buffer_mut()));
             })
             .expect("draw");

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ -n "${CUE_ZIG_MACOS_SDK:-}" ]]; then
+  case "$*" in
+    "--show-sdk-path" | "--sdk macosx --show-sdk-path")
+      printf '%s\n' "${CUE_ZIG_MACOS_SDK}"
+      exit 0
+      ;;
+    "--show-sdk-version" | "--sdk macosx --show-sdk-version")
+      cue_sdk_name="$(basename "${CUE_ZIG_MACOS_SDK}")"
+      cue_sdk_version="${cue_sdk_name#MacOSX}"
+      printf '%s\n' "${cue_sdk_version%.sdk}"
+      exit 0
+      ;;
+  esac
+fi
+
+exec /usr/bin/xcrun "$@"

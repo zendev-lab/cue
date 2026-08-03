@@ -23,7 +23,7 @@ use super::snapshot::{
 #[derive(Clone)]
 pub(crate) struct DebugControl {
     pub snapshots: SharedDebugSnapshots,
-    pub inject_tx: mpsc::UnboundedSender<AppMsg>,
+    pub inject_tx: mpsc::Sender<AppMsg>,
 }
 
 pub(crate) struct DebugServerHandle {
@@ -125,10 +125,10 @@ fn dispatch_request(request: TuiDebugRequest, control: &DebugControl) -> TuiDebu
         TuiDebugRequestBody::SendKeys { keys } => match parse_key_tokens(&keys) {
             Ok(events) => {
                 for event in events {
-                    if control.inject_tx.send(AppMsg::KeyEvent(event)).is_err() {
+                    if control.inject_tx.try_send(AppMsg::KeyEvent(event)).is_err() {
                         return TuiDebugResponse::err(
                             request.id,
-                            TuiDebugError::unavailable("cue-tui event loop is not running"),
+                            TuiDebugError::unavailable("cue-tui event loop is unavailable or busy"),
                         );
                     }
                 }
@@ -140,10 +140,10 @@ fn dispatch_request(request: TuiDebugRequest, control: &DebugControl) -> TuiDebu
         },
         TuiDebugRequestBody::WriteChars { text } => {
             for event in char_key_events(&text) {
-                if control.inject_tx.send(AppMsg::KeyEvent(event)).is_err() {
+                if control.inject_tx.try_send(AppMsg::KeyEvent(event)).is_err() {
                     return TuiDebugResponse::err(
                         request.id,
-                        TuiDebugError::unavailable("cue-tui event loop is not running"),
+                        TuiDebugError::unavailable("cue-tui event loop is unavailable or busy"),
                     );
                 }
             }

@@ -122,16 +122,21 @@ impl SelectionState {
 }
 
 pub(crate) fn copy_screen(terminal: &Terminal<'_, '_>) -> Result<String> {
+    let bytes = format_screen(terminal, Format::Plain)?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+pub(crate) fn format_screen(terminal: &Terminal<'_, '_>, format: Format) -> Result<Vec<u8>> {
     let mut formatter = Formatter::new(
         terminal,
         FormatterOptions::new()
-            .with_format(Format::Plain)
+            .with_format(format)
             .with_trim(true)
             .with_unwrap(true)
             .with_cursor(false),
     )?;
     let bytes = formatter.format_alloc(None)?;
-    Ok(String::from_utf8(bytes.as_ref().to_vec())?)
+    Ok(bytes.as_ref().to_vec())
 }
 
 fn viewport_point(row: u16, col: u16) -> Point {

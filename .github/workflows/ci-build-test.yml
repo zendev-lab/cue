@@ -31,16 +31,28 @@ jobs:
         with:
           toolchain: "1.95"
           components: llvm-tools
+      - name: Prepare pinned Ghostty toolchain
+        shell: bash
+        run: |
+          source scripts/prepare-ghostty.sh
+          dirname "$(command -v zig)" >> "$GITHUB_PATH"
+          printf 'GHOSTTY_SOURCE_DIR=%s\n' "$GHOSTTY_SOURCE_DIR" >> "$GITHUB_ENV"
+          printf 'GHOSTTY_ZIG_SYSTEM_DIR=%s\n' "$GHOSTTY_ZIG_SYSTEM_DIR" >> "$GITHUB_ENV"
+          if [[ -n "${CUE_ZIG_MACOS_SDK:-}" ]]; then
+            printf 'CUE_ZIG_MACOS_SDK=%s\n' "$CUE_ZIG_MACOS_SDK" >> "$GITHUB_ENV"
+            printf 'SDKROOT=%s\n' "$SDKROOT" >> "$GITHUB_ENV"
+            dirname "$(command -v xcrun)" >> "$GITHUB_PATH"
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run tests with coverage
-        run: cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
+        run: cargo llvm-cov test --locked --lcov --output-path lcov.info -- --no-capture
 
       - name: Run doc tests
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5

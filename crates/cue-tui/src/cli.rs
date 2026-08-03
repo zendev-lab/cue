@@ -276,6 +276,8 @@ fn run_interactive(
         .with_writer(std::io::stderr)
         .init();
 
+    // `Runtime::block_on` keeps the non-Send Ghostty-backed app future on this
+    // calling thread while socket, timer, and debug tasks use worker threads.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -403,7 +405,34 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
+
+    #[test]
+    fn multi_thread_runtime_block_on_keeps_non_send_future_on_caller() {
+        let caller = std::thread::current().id();
+        let local = Rc::new(());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+
+        let (polled_before_yield, polled_after_yield, strong_count) =
+            runtime.block_on(async move {
+                let polled_before_yield = std::thread::current().id();
+                tokio::task::yield_now().await;
+                (
+                    polled_before_yield,
+                    std::thread::current().id(),
+                    Rc::strong_count(&local),
+                )
+            });
+
+        assert_eq!(polled_before_yield, caller);
+        assert_eq!(polled_after_yield, caller);
+        assert_eq!(strong_count, 1);
+    }
 
     #[test]
     fn ssh_transport_without_ssh_shows_install_hint() {

@@ -6,20 +6,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
-#[cfg(test)]
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
+use cue_client::WriterSendError;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, ForegroundAttachmentInfo, ForegroundRole, JobInfo, JobOpenHint,
-    OkPayload, RequestPayload, ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus,
-    Stream,
+    MAX_FOREGROUND_INPUT_BYTES, OkPayload, RequestPayload, ResponsePayload, ScriptItemInfo,
+    ScriptItemResult, ScriptRunStatus, Stream,
 };
 use cue_core::job::JobStatus;
 use cue_core::{EventChannel, Mode};
-use ratatui::layout::Rect;
-use tui_term::vt100;
+use cue_terminal::{CursorState, FeedMode, ForegroundTerminal, ReplyAuthority, ViewportScroll};
+use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::card_action::{self, CardAction, CardJob};
 use crate::client::{ConnectionController, RestartHandle, WriterHandle};
@@ -38,7 +39,6 @@ use crate::display::{
 };
 use crate::focus::{FocusArea, is_mode_switch_key};
 use crate::footer::{self, FooterContext};
-use crate::foreground;
 use crate::geometry::{UiRegions, contains};
 use crate::job_picker::{
     CronPickerRecord, JobPickerItem, JobPickerRecord, JobPickerState, job_picker_content_rect,
@@ -82,13 +82,6 @@ struct CronRow {
     status: CronStatus,
 }
 
-enum FgSessionKind {
-    Job {
-        card_index: Option<usize>,
-        parser: Box<vt100::Parser>,
-    },
-}
-
 struct FgSession {
     id: String,
     attachment_id: u64,
@@ -96,8 +89,15 @@ struct FgSession {
     control_available: bool,
     snapshot_truncated: bool,
     role_error: Option<String>,
-    kind: FgSessionKind,
+    card_index: Option<usize>,
+    mouse_tracking: bool,
+    terminal: Option<ForegroundTerminal>,
+    terminal_error: Option<String>,
+    detach_pending: bool,
+    detach_retry: bool,
 }
+
+const FG_SCROLLBACK_ROWS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FgRoleRequestKind {
@@ -265,24 +265,36 @@ impl AppState {
         self.fg_session.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn fg_id(&self) -> Option<&str> {
         self.fg_session.as_ref().map(|session| session.id.as_str())
     }
 
     fn fg_is_controller(&self) -> bool {
-        self.fg_session
-            .as_ref()
-            .is_some_and(|session| session.role == ForegroundRole::Controller)
+        self.fg_session.as_ref().is_some_and(|session| {
+            session.role == ForegroundRole::Controller
+                && session.terminal.is_some()
+                && session.terminal_error.is_none()
+                && !session.detach_pending
+        })
     }
 
     pub(crate) fn fg_title(&self) -> String {
         let Some(session) = self.fg_session.as_ref() else {
             return " FG ".to_string();
         };
-        let status = match session.role {
-            ForegroundRole::Controller => "CONTROL",
-            ForegroundRole::Observer if session.control_available => "WATCH · control available",
-            ForegroundRole::Observer => "WATCH · control busy",
+        let status = if session.terminal_error.is_some() {
+            "FAILED · detaching"
+        } else if session.detach_pending {
+            "DETACHING"
+        } else {
+            match session.role {
+                ForegroundRole::Controller => "CONTROL",
+                ForegroundRole::Observer if session.control_available => {
+                    "WATCH · control available"
+                }
+                ForegroundRole::Observer => "WATCH · control busy",
+            }
         };
         let truncated = if session.snapshot_truncated {
             " · partial history"
@@ -301,16 +313,22 @@ impl AppState {
         let Some(session) = self.fg_session.as_ref() else {
             return String::new();
         };
-        let role_hint = match self.pending_fg_role_kind(&session.id, session.attachment_id) {
-            Some(FgRoleRequestKind::Claim) => "[watch · claiming control…]",
-            Some(FgRoleRequestKind::Release) => "[control · releasing control…]",
-            None => match session.role {
-                ForegroundRole::Controller => "[control] Ctrl+] release control",
-                ForegroundRole::Observer if session.control_available => {
-                    "[watch · control available] Ctrl+] take control"
-                }
-                ForegroundRole::Observer => "[watch · control busy]",
-            },
+        let role_hint = if session.terminal_error.is_some() {
+            "[terminal failed · detaching…]"
+        } else if session.detach_pending {
+            "[detaching…]"
+        } else {
+            match self.pending_fg_role_kind(&session.id, session.attachment_id) {
+                Some(FgRoleRequestKind::Claim) => "[watch · claiming control…]",
+                Some(FgRoleRequestKind::Release) => "[control · releasing control…]",
+                None => match session.role {
+                    ForegroundRole::Controller => "[control] Ctrl+] release control",
+                    ForegroundRole::Observer if session.control_available => {
+                        "[watch · control available] Ctrl+] take control"
+                    }
+                    ForegroundRole::Observer => "[watch · control busy]",
+                },
+            }
         };
         let truncated = if session.snapshot_truncated {
             "  ·  history truncated"
@@ -318,17 +336,12 @@ impl AppState {
             ""
         };
         let error = session
-            .role_error
+            .terminal_error
             .as_deref()
+            .or(session.role_error.as_deref())
             .map(|error| format!("  ·  {error}"))
             .unwrap_or_default();
         format!(" {role_hint}  ·  Ctrl+Y copy  ·  Ctrl+Z detach{truncated}{error} ")
-    }
-
-    pub(crate) fn fg_screen(&self) -> Option<&vt100::Screen> {
-        let session = self.fg_session.as_ref()?;
-        let FgSessionKind::Job { parser, .. } = &session.kind;
-        Some(parser.screen())
     }
 
     pub(crate) fn display_pane_title(&self) -> String {
@@ -387,14 +400,27 @@ impl AppState {
         self.display.active()
     }
 
-    fn copy_target(&self) -> Option<CopyTarget> {
-        let foreground_target = self
-            .fg_id()
-            .filter(|_| self.fg_active())
-            .zip(self.fg_screen())
-            .map(|(job_id, screen)| {
-                CopyTarget::new(format!("fg {job_id}"), screen.contents().to_string())
-            });
+    fn copy_target(&mut self) -> Option<CopyTarget> {
+        let foreground_target = self.fg_session.as_mut().and_then(|session| {
+            if session.terminal_error.is_some() {
+                return None;
+            }
+            session
+                .terminal
+                .as_mut()
+                .and_then(|terminal| match terminal.copy_text() {
+                    Ok(content) => Some(CopyTarget::new(format!("fg {}", session.id), content)),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            job_id = %session.id,
+                            attachment_id = session.attachment_id,
+                            "failed to copy foreground terminal content"
+                        );
+                        None
+                    }
+                })
+        });
         let target_settings = self
             .target_settings_open()
             .then(|| self.render_target_settings_content())
@@ -460,23 +486,56 @@ impl AppState {
         self.render_target_settings_content()
     }
 
-    fn fg_application_cursor(&self) -> bool {
-        self.fg_screen()
-            .is_some_and(vt100::Screen::application_cursor)
+    pub(crate) fn mouse_capture_enabled(&self) -> bool {
+        self.mouse_mode.capture_enabled()
+            || self.fg_session.as_ref().is_some_and(|session| {
+                session.role == ForegroundRole::Controller
+                    && session.mouse_tracking
+                    && session.terminal_error.is_none()
+                    && !session.detach_pending
+            })
     }
 
-    fn fg_bracketed_paste(&self) -> bool {
-        self.fg_screen().is_some_and(vt100::Screen::bracketed_paste)
-    }
-
-    fn resize_fg_session(&mut self, cols: u16, rows: u16) {
-        if let Some(FgSession {
-            kind: FgSessionKind::Job { parser, .. },
-            ..
-        }) = self.fg_session.as_mut()
+    pub(crate) fn render_fg_terminal(
+        &mut self,
+        area: Rect,
+        buffer: &mut Buffer,
+    ) -> Result<CursorState, String> {
+        if let Some(error) = self
+            .fg_session
+            .as_ref()
+            .and_then(|session| session.terminal_error.clone())
         {
-            parser.screen_mut().set_size(rows, cols);
+            return Err(error);
         }
+        let result = self
+            .fg_session
+            .as_mut()
+            .ok_or_else(|| "foreground terminal is not active".to_string())
+            .and_then(|session| {
+                session
+                    .terminal
+                    .as_mut()
+                    .ok_or_else(|| "foreground terminal is unavailable".to_string())?
+                    .render_into(area, buffer, true)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(cursor) => Ok(cursor),
+            Err(error) => {
+                let message = self.fail_fg_terminal("render", &error);
+                Err(message)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn fg_plain_text(&self) -> Option<String> {
+        self.fg_session
+            .as_ref()
+            .filter(|session| session.terminal_error.is_none())
+            .and_then(|session| session.terminal.as_ref())
+            .and_then(|terminal| terminal.copy_screen().ok())
     }
 
     fn pending_fg_role_kind(&self, job_id: &str, attachment_id: u64) -> Option<FgRoleRequestKind> {
@@ -542,7 +601,15 @@ impl AppState {
     }
 
     fn fg_terminal_size(&self) -> (u16, u16) {
-        foreground::terminal_size(self.terminal_width, self.terminal_height)
+        (
+            self.terminal_width.saturating_sub(2).max(1),
+            self.terminal_height.saturating_sub(3).max(1),
+        )
+    }
+
+    fn fg_viewport(&self) -> Rect {
+        let (cols, rows) = self.fg_terminal_size();
+        Rect::new(1, 1, cols, rows)
     }
 
     fn show_submission_result(
@@ -1170,15 +1237,44 @@ impl AppState {
         &mut self,
         attachment: ForegroundAttachmentInfo,
         card_index: Option<usize>,
-    ) {
+    ) -> bool {
         if attachment.id.starts_with('A') {
-            return;
+            return false;
         }
 
         let (cols, rows) = self.fg_terminal_size();
-        let mut parser = Box::new(vt100::Parser::new(rows, cols, 0));
-        parser.process(&attachment.snapshot);
+        let terminal =
+            ForegroundTerminal::new(cols, rows, FG_SCROLLBACK_ROWS).and_then(|mut terminal| {
+                terminal.feed(&attachment.snapshot, FeedMode::Replay)?;
+                let _ = terminal.drain_replies(ReplyAuthority::Observer);
+                let mouse_tracking = terminal.mouse_tracking_enabled()?;
+                Ok((terminal, mouse_tracking))
+            });
         self.pending_fg_role_requests.clear();
+        let terminal = match terminal {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let message = format!("foreground terminal initialization failed: {error}");
+                let job_id = attachment.id.clone();
+                self.fg_session = Some(FgSession {
+                    id: attachment.id,
+                    attachment_id: attachment.attachment_id,
+                    role: attachment.role,
+                    control_available: attachment.control_available,
+                    snapshot_truncated: attachment.snapshot_truncated,
+                    role_error: None,
+                    card_index,
+                    mouse_tracking: false,
+                    terminal: None,
+                    terminal_error: Some(message.clone()),
+                    detach_pending: true,
+                    detach_retry: true,
+                });
+                self.record_fg_terminal_error(&job_id, card_index, message);
+                self.drive_fg_detach();
+                return false;
+            }
+        };
         self.fg_session = Some(FgSession {
             id: attachment.id,
             attachment_id: attachment.attachment_id,
@@ -1186,25 +1282,63 @@ impl AppState {
             control_available: attachment.control_available,
             snapshot_truncated: attachment.snapshot_truncated,
             role_error: None,
-            kind: FgSessionKind::Job { card_index, parser },
+            card_index,
+            mouse_tracking: terminal.1,
+            terminal: Some(terminal.0),
+            terminal_error: None,
+            detach_pending: false,
+            detach_retry: false,
         });
+        true
     }
 
     fn append_fg_output(&mut self, id: &str, attachment_id: u64, data: &[u8]) {
-        let Some(FgSession {
-            id: attached_id,
-            attachment_id: active_attachment_id,
-            kind: FgSessionKind::Job { parser, .. },
-            ..
-        }) = self.fg_session.as_mut()
-        else {
+        let Some(session) = self.fg_session.as_ref() else {
             return;
         };
-        if !foreground_event_matches(attached_id, *active_attachment_id, id, attachment_id) {
-            tracing::debug!(event_job_id = %id, event_attachment_id = attachment_id, %attached_id, active_attachment_id = *active_attachment_id, "ignoring foreign foreground output");
+        if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
+            tracing::debug!(event_job_id = %id, event_attachment_id = attachment_id, attached_id = %session.id, active_attachment_id = session.attachment_id, "ignoring foreign foreground output");
             return;
         }
-        parser.process(data);
+
+        let result = {
+            let session = self
+                .fg_session
+                .as_mut()
+                .expect("foreground session checked above");
+            if session.terminal_error.is_some() {
+                return;
+            }
+            let authority = if session.detach_pending {
+                ReplyAuthority::Observer
+            } else {
+                reply_authority(session.role)
+            };
+            let tracking_before = session.mouse_tracking;
+            let Some(terminal) = session.terminal.as_mut() else {
+                return;
+            };
+            terminal
+                .feed(data, FeedMode::Live(authority))
+                .and_then(|()| {
+                    session.mouse_tracking = terminal.mouse_tracking_enabled()?;
+                    if tracking_before && !session.mouse_tracking {
+                        terminal.reset_pointer_state();
+                    }
+                    Ok(terminal.drain_replies(authority))
+                })
+                .map_err(|error| error.to_string())
+        };
+        match result {
+            Ok(reply) => {
+                if let Err(error) = self.send_fg_input(reply) {
+                    self.fail_fg_terminal("forward terminal reply", &error.to_string());
+                }
+            }
+            Err(error) => {
+                self.fail_fg_terminal("process output", &error);
+            }
+        }
     }
 
     fn update_fg_control_available(
@@ -1229,20 +1363,38 @@ impl AppState {
         role: ForegroundRole,
         control_available: bool,
     ) {
-        let Some(session) = self.fg_session.as_mut() else {
-            return;
-        };
-        if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
-            tracing::debug!(response_job_id = %id, response_attachment_id = attachment_id, attached_job_id = %session.id, active_attachment_id = session.attachment_id, "ignoring stale foreground role response");
-            return;
+        {
+            let Some(session) = self.fg_session.as_mut() else {
+                return;
+            };
+            if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
+                tracing::debug!(response_job_id = %id, response_attachment_id = attachment_id, attached_job_id = %session.id, active_attachment_id = session.attachment_id, "ignoring stale foreground role response");
+                return;
+            }
+            if session.role == ForegroundRole::Observer
+                && role == ForegroundRole::Controller
+                && let Some(terminal) = session.terminal.as_mut()
+            {
+                let _ = terminal.drain_replies(ReplyAuthority::Observer);
+            }
+            if session.role == ForegroundRole::Controller
+                && role == ForegroundRole::Observer
+                && let Some(terminal) = session.terminal.as_mut()
+            {
+                terminal.reset_pointer_state();
+            }
+            session.role = role;
+            session.control_available = control_available;
+            session.role_error = None;
         }
-        session.role = role;
-        session.control_available = control_available;
-        session.role_error = None;
 
         if role == ForegroundRole::Controller {
             let (cols, rows) = self.fg_terminal_size();
-            self.send_fg_resize(cols, rows);
+            self.resize_fg_session(cols, rows);
+        } else if let Some(session) = self.fg_session.as_mut()
+            && let Some(terminal) = session.terminal.as_mut()
+        {
+            let _ = terminal.drain_replies(ReplyAuthority::Observer);
         }
     }
 
@@ -1260,63 +1412,341 @@ impl AppState {
     }
 
     fn finish_fg_session(&mut self, id: &str, attachment_id: u64, reason: &str) {
-        let Some(session) = self.fg_session.take() else {
+        let Some(mut session) = self.fg_session.take() else {
             return;
         };
         if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
             self.fg_session = Some(session);
             return;
         }
+        if let Some(terminal) = session.terminal.as_mut() {
+            terminal.reset_pointer_state();
+        }
 
         self.pending_fg_role_requests.retain(|_, request| {
             request.job_id != session.id || request.attachment_id != session.attachment_id
         });
 
-        let FgSessionKind::Job { card_index, parser } = session.kind;
-        if let Some(card_index) = card_index {
+        if session.terminal_error.is_some() {
+            return;
+        }
+
+        if let Some(card_index) = session.card_index {
             let status = if reason == "done" || reason == "detached" {
                 CardStatus::Success
             } else {
                 CardStatus::Error
             };
-            self.main_view.set_card_status(card_index, status);
-            let rendered =
-                String::from_utf8_lossy(&parser.screen().contents_formatted()).into_owned();
-            if !rendered.is_empty() {
-                self.main_view.set_card_output(card_index, rendered);
+            let Some(terminal) = session.terminal.as_ref() else {
+                self.record_fg_terminal_error(
+                    &session.id,
+                    Some(card_index),
+                    "foreground terminal was unavailable at exit".to_string(),
+                );
+                return;
+            };
+            match terminal.formatted_text() {
+                Ok(rendered) => {
+                    self.main_view.set_card_status(card_index, status);
+                    let rendered = String::from_utf8_lossy(&rendered).into_owned();
+                    if !rendered.is_empty() {
+                        self.main_view.set_card_output(card_index, rendered);
+                    }
+                }
+                Err(error) => {
+                    self.main_view
+                        .set_card_status(card_index, CardStatus::Error);
+                    self.main_view.set_card_output(
+                        card_index,
+                        format!("foreground terminal formatting failed: {error}"),
+                    );
+                }
             }
         }
     }
 
     fn detach_fg_session(&mut self) {
-        let is_job = self
+        let Some(session) = self.fg_session.as_mut() else {
+            self.sync_mode_views();
+            return;
+        };
+        if session.detach_pending && !session.detach_retry {
+            return;
+        }
+        if let Some(terminal) = session.terminal.as_mut() {
+            terminal.reset_pointer_state();
+        }
+        session.detach_pending = true;
+        session.detach_retry = true;
+        self.drive_fg_detach();
+    }
+
+    fn drive_fg_detach(&mut self) {
+        let should_retry = self
             .fg_session
             .as_ref()
-            .is_some_and(|session| matches!(session.kind, FgSessionKind::Job { .. }));
-        if is_job {
-            self.send_fg_detach();
-        } else {
-            self.fg_session = None;
-            self.sync_mode_views();
+            .is_some_and(|session| session.detach_pending && session.detach_retry);
+        if !should_retry {
+            return;
+        }
+
+        match self.send_fg_detach() {
+            Ok(()) => {
+                if let Some(session) = self.fg_session.as_mut() {
+                    session.detach_retry = false;
+                    session.role_error = None;
+                }
+            }
+            Err(WriterSendError::Full) => {
+                if let Some(session) = self.fg_session.as_mut() {
+                    session.detach_retry = true;
+                    session.role_error =
+                        Some("foreground detach pending: writer queue is full".to_string());
+                }
+            }
+            Err(
+                error @ (WriterSendError::Closed | WriterSendError::UnsupportedCapability { .. }),
+            ) => {
+                if let Some(session) = self.fg_session.as_mut() {
+                    session.detach_retry = true;
+                    session.role_error =
+                        Some(format!("foreground detach failed: {error}; disconnecting"));
+                }
+                // A closed or incompatible writer cannot prove detach delivery.
+                // Leaving the TUI drops the connection, and cued's disconnect
+                // cleanup is the authoritative controller-lease release path.
+                self.should_quit = true;
+            }
         }
     }
 
-    fn send_fg_detach(&self) {
-        self.send_foreground_request(RequestPayload::FgDetach {}, "foreground detach");
+    fn send_fg_detach(&self) -> Result<(), WriterSendError> {
+        self.send_foreground_request(RequestPayload::FgDetach {}, "foreground detach")
+            .map(|_| ())
     }
 
-    fn send_fg_input(&self, data: Vec<u8>) {
+    fn send_fg_input(&self, data: Vec<u8>) -> Result<(), String> {
+        if data.is_empty() || !self.fg_is_controller() {
+            return Ok(());
+        }
+        if data.len() > MAX_FOREGROUND_INPUT_BYTES {
+            return Err(format!(
+                "input is {} bytes, exceeding the {}-byte foreground transaction limit",
+                data.len(),
+                MAX_FOREGROUND_INPUT_BYTES
+            ));
+        }
+        self.send_foreground_request(RequestPayload::FgInput { data }, "foreground input")
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn send_fg_resize(&self, cols: u16, rows: u16) -> Result<(), WriterSendError> {
+        if !self.fg_is_controller() {
+            return Ok(());
+        }
+        self.send_foreground_request(RequestPayload::FgResize { cols, rows }, "foreground resize")
+            .map(|_| ())
+    }
+
+    fn encode_and_send_fg_key(&mut self, key: KeyEvent) {
         if !self.fg_is_controller() {
             return;
         }
-        self.send_foreground_request(RequestPayload::FgInput { data }, "foreground input");
+        let result = self
+            .fg_session
+            .as_mut()
+            .expect("controller role requires foreground session")
+            .terminal
+            .as_mut()
+            .expect("controller role requires a ready foreground terminal")
+            .encode_key(key)
+            .map_err(|error| error.to_string());
+        match result {
+            Ok(data) => {
+                if let Err(error) = self.send_fg_input(data) {
+                    self.fail_fg_terminal("send key input", &error.to_string());
+                }
+            }
+            Err(error) => {
+                self.fail_fg_terminal("encode key", &error);
+            }
+        }
     }
 
-    fn send_fg_resize(&self, cols: u16, rows: u16) {
+    fn encode_and_send_fg_paste(&mut self, text: &str) {
         if !self.fg_is_controller() {
             return;
         }
-        self.send_foreground_request(RequestPayload::FgResize { cols, rows }, "foreground resize");
+        let result = self
+            .fg_session
+            .as_mut()
+            .expect("controller role requires foreground session")
+            .terminal
+            .as_mut()
+            .expect("controller role requires a ready foreground terminal")
+            .encode_paste(text)
+            .map_err(|error| error.to_string());
+        match result {
+            Ok(data) => {
+                if let Err(error) = self.send_fg_input(data) {
+                    self.fail_fg_terminal("send paste input", &error.to_string());
+                }
+            }
+            Err(error) => {
+                self.fail_fg_terminal("encode paste", &error);
+            }
+        }
+    }
+
+    fn handle_fg_mouse(&mut self, mouse: MouseEvent) {
+        if self.fg_session.as_ref().is_none_or(|session| {
+            session.terminal.is_none() || session.terminal_error.is_some() || session.detach_pending
+        }) {
+            return;
+        }
+        let viewport = self.fg_viewport();
+        let tracking = self
+            .fg_session
+            .as_ref()
+            .expect("active foreground mouse event requires session")
+            .mouse_tracking;
+
+        if self.fg_is_controller() && tracking {
+            let result = self
+                .fg_session
+                .as_mut()
+                .expect("controller role requires foreground session")
+                .terminal
+                .as_mut()
+                .expect("controller role requires a ready foreground terminal")
+                .encode_mouse(mouse, viewport)
+                .map_err(|error| error.to_string());
+            match result {
+                Ok(data) => {
+                    if let Err(error) = self.send_fg_input(data) {
+                        self.fail_fg_terminal("send mouse input", &error.to_string());
+                    }
+                }
+                Err(error) => {
+                    self.fail_fg_terminal("encode mouse", &error);
+                }
+            }
+            return;
+        }
+
+        let point = Rect::new(mouse.column, mouse.row, 1, 1);
+        if !contains(viewport, point) {
+            return;
+        }
+        let row = mouse.row.saturating_sub(viewport.y);
+        let col = mouse.column.saturating_sub(viewport.x);
+        let rectangular = mouse.modifiers.contains(KeyModifiers::ALT);
+        let result = {
+            let terminal = &mut self
+                .fg_session
+                .as_mut()
+                .expect("active foreground mouse event requires session")
+                .terminal
+                .as_mut()
+                .expect("active foreground mouse event requires terminal");
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => terminal.begin_selection(row, col),
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    terminal.update_selection(row, col, rectangular)
+                }
+                MouseEventKind::ScrollUp => terminal.scroll(ViewportScroll::Lines(-3)),
+                MouseEventKind::ScrollDown => terminal.scroll(ViewportScroll::Lines(3)),
+                _ => Ok(()),
+            }
+        };
+        if let Err(error) = result {
+            self.fail_fg_terminal("handle local mouse", &error.to_string());
+        }
+    }
+
+    fn resize_fg_session(&mut self, cols: u16, rows: u16) {
+        let result = {
+            let Some(session) = self.fg_session.as_mut() else {
+                return;
+            };
+            if session.terminal_error.is_some() || session.detach_pending {
+                return;
+            }
+            let authority = reply_authority(session.role);
+            let controller = session.role == ForegroundRole::Controller;
+            let Some(terminal) = session.terminal.as_mut() else {
+                return;
+            };
+            terminal
+                .resize_with_mode(cols, rows, FeedMode::Live(authority))
+                .map(|()| (controller, terminal.drain_replies(authority)))
+                .map_err(|error| error.to_string())
+        };
+        match result {
+            Ok((true, reply)) => {
+                if let Err(error) = self.send_fg_resize(cols, rows) {
+                    self.fail_fg_terminal("synchronize resize", &error.to_string());
+                } else if let Err(error) = self.send_fg_input(reply) {
+                    self.fail_fg_terminal("forward resize reply", &error.to_string());
+                }
+            }
+            Ok((false, _)) => {}
+            Err(error) => {
+                self.fail_fg_terminal("resize", &error);
+            }
+        }
+    }
+
+    fn record_fg_terminal_error(
+        &mut self,
+        job_id: &str,
+        card_index: Option<usize>,
+        message: String,
+    ) {
+        let card_index =
+            card_index.unwrap_or_else(|| self.ensure_job_card(job_id, format!(":fg {job_id}")));
+        self.main_view
+            .set_card_label(card_index, job_id.to_string());
+        self.main_view.set_card_output(card_index, message);
+        self.main_view
+            .set_card_status(card_index, CardStatus::Error);
+    }
+
+    fn fail_fg_terminal(&mut self, operation: &str, error: &str) -> String {
+        let message = format!("foreground terminal {operation} failed: {error}");
+        let Some(session) = self.fg_session.as_ref() else {
+            return message;
+        };
+        if let Some(existing) = session.terminal_error.clone() {
+            self.drive_fg_detach();
+            return existing;
+        }
+
+        let (job_id, attachment_id, card_index) = {
+            let session = self
+                .fg_session
+                .as_mut()
+                .expect("foreground session checked above");
+            if let Some(terminal) = session.terminal.as_mut() {
+                terminal.reset_pointer_state();
+            }
+            session.mouse_tracking = false;
+            session.terminal_error = Some(message.clone());
+            session.detach_pending = true;
+            session.detach_retry = true;
+            (
+                session.id.clone(),
+                session.attachment_id,
+                session.card_index,
+            )
+        };
+        self.pending_fg_role_requests.retain(|_, request| {
+            request.job_id != job_id || request.attachment_id != attachment_id
+        });
+        self.record_fg_terminal_error(&job_id, card_index, message.clone());
+        self.drive_fg_detach();
+        message
     }
 
     fn toggle_fg_control(&mut self) {
@@ -1374,15 +1804,21 @@ impl AppState {
         }
     }
 
-    fn send_foreground_request(&self, payload: RequestPayload, description: &str) {
-        if let Some(writer) = &self.writer
-            && let Err(error) = writer.send(payload)
-        {
+    fn send_foreground_request(
+        &self,
+        payload: RequestPayload,
+        description: &str,
+    ) -> Result<u32, WriterSendError> {
+        let Some(writer) = &self.writer else {
+            tracing::warn!("failed to send {description}: writer is closed");
+            return Err(WriterSendError::Closed);
+        };
+        writer.send(payload).inspect_err(|error| {
             tracing::warn!("failed to send {description}: {error}");
-        }
+        })
     }
 
-    fn copy_focus(&self) {
+    fn copy_focus(&mut self) {
         let Some(target) = self.copy_target() else {
             return;
         };
@@ -1730,12 +2166,12 @@ impl AppState {
                 if self.fg_active() {
                     let (cols, rows) = self.fg_terminal_size();
                     self.resize_fg_session(cols, rows);
-                    self.send_fg_resize(cols, rows);
                 }
             }
 
             AppMsg::Tick => {
                 // Status bar re-renders on every draw, clock updates automatically.
+                self.drive_fg_detach();
             }
 
             AppMsg::ModeSwitch => {
@@ -1789,7 +2225,7 @@ impl AppState {
 
             AppMsg::Paste(text) => {
                 if self.fg_active() {
-                    self.send_fg_input(foreground::paste_bytes(&text, self.fg_bracketed_paste()));
+                    self.encode_and_send_fg_paste(&text);
                     return;
                 }
                 if self.job_picker_open() {
@@ -2108,9 +2544,10 @@ impl AppState {
                             } else {
                                 None
                             };
-                            self.start_fg_session(attachment, card_index);
-                            let (cols, rows) = self.fg_terminal_size();
-                            self.send_fg_resize(cols, rows);
+                            if self.start_fg_session(attachment, card_index) {
+                                let (cols, rows) = self.fg_terminal_size();
+                                self.resize_fg_session(cols, rows);
+                            }
                         }
                         OkPayload::FgRoleChanged {
                             id,
@@ -2406,31 +2843,28 @@ impl AppState {
             },
 
             AppMsg::KeyEvent(key) => {
-                if self.fg_active() && key.kind == KeyEventKind::Press {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('z'))
-                    {
-                        self.detach_fg_session();
-                        return;
+                if self.fg_active() {
+                    if key.kind == KeyEventKind::Press {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('z'))
+                        {
+                            self.detach_fg_session();
+                            return;
+                        }
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('y'))
+                        {
+                            self.copy_focus();
+                            return;
+                        }
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char(']'))
+                        {
+                            self.toggle_fg_control();
+                            return;
+                        }
                     }
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('y'))
-                    {
-                        self.copy_focus();
-                        return;
-                    }
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char(']'))
-                    {
-                        self.toggle_fg_control();
-                        return;
-                    }
-                    if self.fg_is_controller()
-                        && let Some(bytes) =
-                            foreground::key_bytes(key, self.fg_application_cursor())
-                    {
-                        self.send_fg_input(bytes);
-                    }
+                    self.encode_and_send_fg_key(key);
                     return;
                 }
 
@@ -2570,6 +3004,7 @@ impl AppState {
 
             AppMsg::MouseEvent(mouse) => {
                 if self.fg_active() {
+                    self.handle_fg_mouse(mouse);
                     return;
                 }
                 let regions = self.layout_regions();
@@ -2753,6 +3188,13 @@ fn job_picker_record(job: &JobRow) -> JobPickerRecord<'_> {
     }
 }
 
+fn reply_authority(role: ForegroundRole) -> ReplyAuthority {
+    match role {
+        ForegroundRole::Observer => ReplyAuthority::Observer,
+        ForegroundRole::Controller => ReplyAuthority::Controller,
+    }
+}
+
 fn foreground_event_matches(
     active_job_id: &str,
     active_attachment_id: u64,
@@ -2828,6 +3270,19 @@ mod tests {
         state.writer = Some(writer);
         state.connected = true;
         server_stream
+    }
+
+    fn fill_test_writer_queue(state: &AppState) {
+        let writer = state.writer.as_ref().expect("test writer");
+        for index in 0..64 {
+            writer
+                .try_send(RequestPayload::Ping {})
+                .unwrap_or_else(|error| panic!("fill writer queue at {index}: {error}"));
+        }
+        assert_eq!(
+            writer.try_send(RequestPayload::Ping {}),
+            Err(WriterSendError::Full)
+        );
     }
 
     async fn read_test_message(stream: &mut tokio::io::DuplexStream) -> Message {
@@ -4418,9 +4873,10 @@ destination = "devbox"
         assert_eq!(state.focus, FocusArea::MainView);
     }
 
-    #[test]
-    fn fg_attach_without_precreated_card_opens_display_and_session() {
+    #[tokio::test]
+    async fn fg_attach_without_precreated_card_opens_display_and_session() {
         let mut state = AppState::new();
+        let _server_stream = attach_test_writer(&mut state);
         queue_pending(
             &mut state,
             1,
@@ -4486,7 +4942,7 @@ destination = "devbox"
             None,
         );
 
-        assert!(state.fg_screen().unwrap().contents().contains("snapshot"));
+        assert!(state.fg_plain_text().unwrap().contains("snapshot"));
         assert!(state.fg_title().contains("WATCH · control available"));
         assert!(state.fg_title().contains("partial history"));
         assert!(state.fg_footer_text().contains("history truncated"));
@@ -4496,7 +4952,7 @@ destination = "devbox"
             attachment_id: 11,
             data: b"foreign\r\n".to_vec(),
         }));
-        assert!(!state.fg_screen().unwrap().contents().contains("foreign"));
+        assert!(!state.fg_plain_text().unwrap().contains("foreign"));
 
         state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
             id: String::new(),
@@ -4508,9 +4964,135 @@ destination = "devbox"
             attachment_id: 11,
             data: b"live\r\n".to_vec(),
         }));
-        let contents = state.fg_screen().unwrap().contents();
+        let contents = state.fg_plain_text().unwrap();
         assert!(!contents.contains("legacy"));
         assert!(contents.contains("live"));
+    }
+
+    #[tokio::test]
+    async fn fg_snapshot_replay_discards_terminal_replies() {
+        let mut state = AppState::new();
+        let mut server_stream = attach_test_writer(&mut state);
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 12,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: b"snapshot\x1b[5n".to_vec(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+
+        assert!(state.fg_plain_text().unwrap().contains("snapshot"));
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "snapshot replay must not escape a terminal reply"
+        );
+    }
+
+    #[test]
+    fn foreground_draw_projects_ghostty_buffer_and_absolute_cursor() {
+        let mut state = AppState::new();
+        state.terminal_width = 20;
+        state.terminal_height = 6;
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 15,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: b"hi".to_vec(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let backend = ratatui::backend::TestBackend::new(20, 6);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut state))
+            .expect("draw foreground");
+
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "h");
+        assert_eq!(terminal.backend().buffer()[(2, 1)].symbol(), "i");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(3, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_foreground_output_is_gated_before_terminal_feed() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 13,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: b"baseline".to_vec(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J1".into(),
+            attachment_id: 12,
+            data: b"stale\x1b[5n".to_vec(),
+        }));
+
+        let contents = state.fg_plain_text().unwrap();
+        assert!(contents.contains("baseline"));
+        assert!(!contents.contains("stale"));
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "stale output must not produce terminal replies"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_live_output_forwards_terminal_reply_as_fg_input() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 14,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J1".into(),
+            attachment_id: 14,
+            data: b"\x1b[5n".to_vec(),
+        }));
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgInput { data },
+                ..
+            } => assert_eq!(data, b"\x1b[0n"),
+            other => panic!("controller terminal reply was not forwarded: {other:?}"),
+        }
     }
 
     #[test]
@@ -4576,7 +5158,7 @@ destination = "devbox"
             data: b"wrong generation\r\n".to_vec(),
         }));
 
-        let contents = state.fg_screen().unwrap().contents();
+        let contents = state.fg_plain_text().unwrap();
         assert!(contents.contains("legacy"));
         assert!(!contents.contains("wrong generation"));
     }
@@ -4690,6 +5272,11 @@ destination = "devbox"
         );
         let mut server_stream = attach_shared_foreground_test_writer(&mut state);
 
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J7".into(),
+            attachment_id: 7,
+            data: b"\x1b[5n".to_vec(),
+        }));
         state.update(AppMsg::KeyEvent(KeyEvent::new(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
@@ -4741,6 +5328,361 @@ destination = "devbox"
             } => assert_eq!(data, b"owned"),
             other => panic!("controller paste was not forwarded: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_detaches_once_and_stops_foreground_writes() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J8".into(),
+                attachment_id: 8,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+
+        state.fail_fg_terminal("test", "forced failure");
+        state.fail_fg_terminal("test", "duplicate failure");
+        state.update(AppMsg::Paste("must stay local".into()));
+        state.update(AppMsg::Resize(100, 30));
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgDetach {},
+                ..
+            } => {}
+            other => panic!("terminal failure did not detach: {other:?}"),
+        }
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "terminal failure must detach exactly once and suppress later input/resize"
+        );
+        let failed = state
+            .fg_session
+            .as_ref()
+            .expect("attachment remains visible until daemon exit confirmation");
+        assert!(failed.terminal_error.is_some());
+        assert!(failed.detach_pending);
+        assert!(!failed.detach_retry);
+        let card = state.main_view.cards.last().expect("terminal error card");
+        assert_eq!(card.status, CardStatus::Error);
+        assert!(card.output.contains("foreground terminal test failed"));
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgExited {
+            id: "J8".into(),
+            attachment_id: 8,
+            reason: "detached".into(),
+        }));
+        assert!(!state.fg_active());
+    }
+
+    #[tokio::test]
+    async fn oversized_paste_fails_closed_without_splitting_the_terminal_transaction() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J8".into(),
+                attachment_id: 81,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+
+        state.update(AppMsg::Paste("x".repeat(MAX_FOREGROUND_INPUT_BYTES + 1)));
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgDetach {},
+                ..
+            } => {}
+            other => panic!("oversized paste escaped as partial foreground input: {other:?}"),
+        }
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "oversized paste must produce one detach and no FgInput chunks"
+        );
+        let failed = state
+            .fg_session
+            .as_ref()
+            .expect("failed attachment remains until daemon confirmation");
+        assert!(failed.detach_pending);
+        assert!(
+            failed
+                .terminal_error
+                .as_deref()
+                .is_some_and(|error| error.contains("foreground transaction limit"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_queue_full_keeps_failed_attachment_until_detach_retry_is_enqueued() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J8".into(),
+                attachment_id: 81,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+        fill_test_writer_queue(&state);
+
+        state.update(AppMsg::Resize(100, 30));
+
+        let failed = state
+            .fg_session
+            .as_ref()
+            .expect("failed attachment must remain locally fenced");
+        assert!(failed.terminal_error.is_some());
+        assert!(failed.detach_pending);
+        assert!(failed.detach_retry);
+        assert!(!state.fg_is_controller());
+        assert!(!state.should_quit, "a full queue is retryable");
+
+        state.update(AppMsg::Paste("must stay local".into()));
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+
+        for _ in 0..64 {
+            match read_test_message(&mut server_stream).await {
+                Message::Request {
+                    payload: RequestPayload::Ping {},
+                    ..
+                } => {}
+                other => panic!("failed attachment emitted a foreground write: {other:?}"),
+            }
+        }
+        tokio::task::yield_now().await;
+        state.update(AppMsg::Tick);
+
+        let failed = state
+            .fg_session
+            .as_ref()
+            .expect("enqueued detach still awaits daemon confirmation");
+        assert!(failed.detach_pending);
+        assert!(!failed.detach_retry);
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgDetach {},
+                ..
+            } => {}
+            other => panic!("detach retry was not enqueued: {other:?}"),
+        }
+        state.update(AppMsg::ServerEvent(EventPayload::FgExited {
+            id: "J8".into(),
+            attachment_id: 81,
+            reason: "detached".into(),
+        }));
+        assert!(!state.fg_active());
+    }
+
+    #[tokio::test]
+    async fn input_queue_full_enters_the_same_failed_detach_state() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J8".into(),
+                attachment_id: 83,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let _server_stream = attach_test_writer(&mut state);
+        fill_test_writer_queue(&state);
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+
+        let failed = state
+            .fg_session
+            .as_ref()
+            .expect("failed input must retain the attachment");
+        assert!(
+            failed
+                .terminal_error
+                .as_deref()
+                .is_some_and(|error| error.contains("send key input"))
+        );
+        assert!(failed.detach_pending);
+        assert!(failed.detach_retry);
+        assert!(!state.fg_is_controller());
+    }
+
+    #[tokio::test]
+    async fn closed_writer_forces_disconnect_without_losing_failed_attachment_first() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J8".into(),
+                attachment_id: 82,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let server_stream = attach_test_writer(&mut state);
+        let writer = state.writer.as_ref().expect("test writer").clone();
+        drop(server_stream);
+        writer
+            .try_send(RequestPayload::Ping {})
+            .expect("prime failed writer");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match writer.try_send(RequestPayload::Ping {}) {
+                    Err(WriterSendError::Closed) => break,
+                    Err(WriterSendError::Full) | Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected writer error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("writer task should observe the closed stream");
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+
+        let failed = state
+            .fg_session
+            .as_ref()
+            .expect("failed attachment must remain until the connection is dropped");
+        assert!(
+            failed
+                .terminal_error
+                .as_deref()
+                .is_some_and(|error| error.contains("send key input"))
+        );
+        assert!(failed.detach_pending);
+        assert!(failed.detach_retry);
+        assert!(!state.fg_is_controller());
+        assert!(
+            state.should_quit,
+            "closed writer must force connection teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_mouse_tracking_forwards_ghostty_encoded_input() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J9".into(),
+                attachment_id: 9,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J9".into(),
+            attachment_id: 9,
+            data: b"\x1b[?1000h\x1b[?1006h".to_vec(),
+        }));
+
+        state.update(AppMsg::MouseEvent(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgInput { data },
+                ..
+            } => {
+                assert!(data.starts_with(b"\x1b[<"));
+                assert!(data.ends_with(b"M"));
+            }
+            other => panic!("tracked mouse event was not forwarded: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_mouse_uses_local_selection_even_when_app_tracks_mouse() {
+        let mut state = AppState::new();
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J10".into(),
+                attachment_id: 10,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: b"hello\x1b[?1000h\x1b[?1006h".to_vec(),
+                snapshot_truncated: false,
+            },
+            None,
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
+
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 1),
+            (MouseEventKind::Drag(MouseButton::Left), 4),
+            (MouseEventKind::Up(MouseButton::Left), 4),
+        ] {
+            state.update(AppMsg::MouseEvent(MouseEvent {
+                kind,
+                column,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+
+        assert!(
+            state
+                .fg_session
+                .as_ref()
+                .expect("foreground session")
+                .terminal
+                .as_ref()
+                .expect("foreground terminal")
+                .has_selection()
+        );
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "observer mouse events must remain local"
+        );
     }
 
     #[tokio::test]
@@ -5132,35 +6074,49 @@ destination = "devbox"
         assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
     }
 
-    #[test]
-    fn fg_output_updates_terminal_modes_and_preserves_formatted_contents() {
+    #[tokio::test]
+    async fn fg_output_uses_ghostty_modes_and_preserves_formatted_contents() {
         let mut state = AppState::new();
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(None, ":fg J1".into(), Mode::Job, Vec::new()),
-        );
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(fg_attachment(
-                "J1",
-                ForegroundRole::Controller,
-                false,
-                Vec::new(),
-                false,
-            )),
-        });
+        let card_index = state.main_view.push_card(":fg J1".into(), Mode::Job);
+        assert!(state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 1,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            Some(card_index),
+        ));
+        let mut server_stream = attach_test_writer(&mut state);
         state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
             id: "J1".into(),
             attachment_id: 1,
             data: b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[31mhello\x1b[0m".to_vec(),
         }));
 
-        let screen = state.fg_screen().unwrap();
-        assert!(screen.alternate_screen());
-        assert!(screen.application_cursor());
-        assert!(screen.bracketed_paste());
-        assert!(screen.contents().contains("hello"));
+        assert!(state.fg_plain_text().unwrap().contains("hello"));
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgInput { data },
+                ..
+            } => assert_eq!(data, b"\x1bOA"),
+            other => panic!("application cursor key was not Ghostty encoded: {other:?}"),
+        }
+
+        state.update(AppMsg::Paste("pasted".into()));
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgInput { data },
+                ..
+            } => assert_eq!(data, b"\x1b[200~pasted\x1b[201~"),
+            other => panic!("bracketed paste was not Ghostty encoded: {other:?}"),
+        }
 
         state.update(AppMsg::ServerEvent(EventPayload::FgExited {
             id: "J1".into(),
@@ -5171,6 +6127,6 @@ destination = "devbox"
         let card = state.main_view.cards.last().unwrap();
         assert_eq!(card.status, CardStatus::Success);
         assert!(card.output.contains("hello"));
-        assert!(card.output.contains("\u{1b}[31m"));
+        assert!(card.output.contains('\u{1b}'));
     }
 }

@@ -68,7 +68,7 @@ hooks = [
   {
     id = "cargo-clippy",
     name = "cargo-clippy",
-    entry = "cargo clippy --all-targets -- -D warnings",
+    entry = "scripts/cargo-clippy.sh",
     language = "system",
     types = ["rust"],
     pass_filenames = false
