@@ -4163,22 +4163,43 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct FixtureDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
     struct ProcessGroupFixtureGuard {
         groups: Vec<(libc::pid_t, libc::pid_t)>,
+        owner_markers: Vec<PathBuf>,
     }
 
     #[cfg(unix)]
     impl Drop for ProcessGroupFixtureGuard {
         fn drop(&mut self) {
-            for &(leader, descendant) in &self.groups {
-                let leader_group = unsafe { libc::getpgid(leader) };
-                if leader_group == leader {
+            for (&(leader, descendant), marker) in self.groups.iter().zip(&self.owner_markers) {
+                let marker = marker.to_string_lossy();
+                let command_matches = |pid: libc::pid_t| {
+                    std::process::Command::new("/bin/ps")
+                        .args(["-p", &pid.to_string(), "-o", "command="])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .is_some_and(|output| {
+                            String::from_utf8_lossy(&output.stdout).contains(marker.as_ref())
+                        })
+                };
+                let leader_owned =
+                    command_matches(leader) && unsafe { libc::getpgid(leader) } == leader;
+                let descendant_owned =
+                    command_matches(descendant) && unsafe { libc::getpgid(descendant) } == leader;
+                if leader_owned || descendant_owned {
                     unsafe {
                         libc::kill(-leader, libc::SIGKILL);
-                    }
-                } else if unsafe { libc::getpgid(descendant) } == leader {
-                    unsafe {
-                        libc::kill(descendant, libc::SIGKILL);
                     }
                 }
             }
@@ -4236,6 +4257,7 @@ mod tests {
         request_kill: bool,
     ) {
         let cwd = make_temp_dir();
+        let _cwd_guard = FixtureDirectory(cwd.clone());
         let child_pid_path = cwd.join("child.pid");
         let script_path = cwd.join("spawn-child.sh");
         let tail_pid_path = cwd.join("tail-child.pid");
@@ -4254,7 +4276,8 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\n/bin/sleep 30{redirects} &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\n{tail_output}\n{wait_line}\n",
+                "#!/bin/sh\n/bin/sh -c 'trap : TERM; /bin/sleep 30; :' '{}' {redirects} &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\n{tail_output}\n{wait_line}\n",
+                script_path.display(),
                 child_pid_path.display()
             ),
         )
@@ -4263,7 +4286,8 @@ mod tests {
             std::fs::write(
                 &tail_script_path,
                 format!(
-                    "#!/bin/sh\n/bin/sleep 30{redirects} &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\n{wait_line}\n",
+                    "#!/bin/sh\n/bin/sh -c 'trap : TERM; /bin/sleep 30; :' '{}' {redirects} &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\n{wait_line}\n",
+                    tail_script_path.display(),
                     tail_pid_path.display()
                 ),
             )
@@ -4346,6 +4370,11 @@ mod tests {
         }
         let _guard = ProcessGroupFixtureGuard {
             groups: groups.clone(),
+            owner_markers: if pipeline_tail {
+                vec![script_path.clone(), tail_script_path.clone()]
+            } else {
+                vec![script_path.clone()]
+            },
         };
         if request_kill {
             for &(leader, descendant) in &groups {
@@ -4461,12 +4490,14 @@ mod tests {
     #[tokio::test]
     async fn partial_pipeline_spawn_failure_cleans_started_process_groups() {
         let cwd = make_temp_dir();
+        let _cwd_guard = FixtureDirectory(cwd.clone());
         let pid_path = cwd.join("partial-child.pid");
         let script_path = cwd.join("partial-child.sh");
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\n/bin/sleep 30 &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\nwait\n",
+                "#!/bin/sh\n/bin/sh -c 'trap : TERM; /bin/sleep 30; :' '{}' &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\nwait\n",
+                script_path.display(),
                 pid_path.display()
             ),
         )
@@ -4542,9 +4573,9 @@ mod tests {
         let group = observed.expect("first segment process group");
         let _guard = ProcessGroupFixtureGuard {
             groups: vec![group],
+            owner_markers: vec![script_path],
         };
         assert_processes_gone(&[group]).await;
-        std::fs::remove_dir_all(cwd).expect("remove temp dir");
     }
 
     #[tokio::test]
