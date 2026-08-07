@@ -2034,10 +2034,11 @@ async fn reader_task(task: PtyReaderTask) {
         tokio::select! {
             // Kill signal from the main actor loop.
             _ = kill_rx.recv() => {
-                info!(%job_id, "process_mgr: sending SIGTERM");
+                info!(%job_id, "process_mgr: sending SIGKILL to job process group");
                 request_child_kill(job_id, &mut child, "kill requested");
 
-                // Wait up to 10 s for graceful exit, then SIGKILL (kill_on_drop).
+                // The group has already received SIGKILL. Keep a bounded wait
+                // only for reaping the direct child and releasing its handle.
                 let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
                 tokio::select! {
                     status = child.wait() => {
@@ -2048,11 +2049,10 @@ async fn reader_task(task: PtyReaderTask) {
                                 EXIT_CODE_UNAVAILABLE
                             }
                         };
-                        debug!(%job_id, code, "process_mgr: child exited after SIGTERM");
+                        debug!(%job_id, code, "process_mgr: child reaped after SIGKILL");
                     }
                     () = timeout => {
-                        warn!(%job_id, "process_mgr: child did not exit in 10 s — dropping (SIGKILL)");
-                        // child is dropped here → kill_on_drop sends SIGKILL
+                        warn!(%job_id, "process_mgr: child was not reaped within 10 s of SIGKILL; dropping handle");
                         drop(child);
                     }
                 }
@@ -2763,23 +2763,47 @@ async fn notify_cleanup(cleanup_tx: &mpsc::Sender<JobId>, job_id: JobId) {
 fn request_child_kill(job_id: JobId, child: &mut tokio::process::Child, reason: &str) {
     #[cfg(unix)]
     if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        // Each ordinary child enters a dedicated process group and PTY children
-        // call `setsid`, so the child's pid is also its process-group id.
-        // Killing the group first prevents subprocesses such as `sleep` from
-        // surviving after their direct parent is reaped.
-        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if result == 0 {
-            return;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            warn!(
-                %job_id,
-                pid,
-                %reason,
-                err = %error,
-                "process_mgr: process-group kill request failed; falling back to child kill"
-            );
+        // Only signal a process group while its direct child is confirmed live.
+        // Once that child is reaped, its numeric PID may be reused for an
+        // unrelated process group and must no longer be treated as our PGID.
+        match child.try_wait() {
+            Ok(None) => {
+                // Ordinary children enter a dedicated process group. PTY
+                // children call `setsid`, which also makes pid == pgid.
+                let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                if result == 0 {
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(
+                        %job_id,
+                        pid,
+                        %reason,
+                        err = %error,
+                        "process_mgr: process-group kill request failed; falling back to child kill"
+                    );
+                }
+            }
+            Ok(Some(status)) => {
+                debug!(
+                    %job_id,
+                    pid,
+                    %reason,
+                    ?status,
+                    "process_mgr: child already exited; refusing stale process-group signal"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    %job_id,
+                    pid,
+                    %reason,
+                    err = %error,
+                    "process_mgr: child status check failed; falling back to child kill"
+                );
+            }
         }
     }
 
@@ -3932,8 +3956,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_pipe_job_stops_descendants_in_the_job_process_group() {
+    async fn assert_kill_stops_descendant(
+        job_id: JobId,
+        scope_byte: u8,
+        pty_enabled: bool,
+        pipeline_tail: bool,
+    ) {
         let cwd = make_temp_dir();
         let child_pid_path = cwd.join("child.pid");
         let script_path = cwd.join("spawn-child.sh");
@@ -3986,22 +4014,26 @@ mod tests {
             }
         });
 
-        let job_id = JobId(79);
+        let mut segments = vec![cue_core::pipeline::PipeSegment {
+            command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
+            pipe_to_next: pipeline_tail.then_some(cue_core::pipeline::PipeOp::Stdout),
+        }];
+        if pipeline_tail {
+            segments.push(cue_core::pipeline::PipeSegment {
+                command: vec!["/bin/cat".into()],
+                pipe_to_next: None,
+            });
+        }
         process_tx
             .send(ProcessMgrMsg::SpawnJob {
                 job_id,
-                plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline {
-                    segments: vec![cue_core::pipeline::PipeSegment {
-                        command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
-                        pipe_to_next: None,
-                    }],
-                }),
-                scope_hash: cue_core::ScopeHash([9; 32]),
+                plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline { segments }),
+                scope_hash: cue_core::ScopeHash([scope_byte; 32]),
                 options: ProcessJobOptions {
                     cwd_override: None,
                     sandbox: None,
                     wrapper_enabled: false,
-                    pty_enabled: false,
+                    pty_enabled,
                     direct_output_client: None,
                     session_id: None,
                 },
@@ -4064,6 +4096,24 @@ mod tests {
             .await
             .expect("send process_mgr shutdown");
         std::fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pipe_job_stops_descendants_in_the_job_process_group() {
+        assert_kill_stops_descendant(JobId(79), 9, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pty_job_stops_descendants_in_the_job_session() {
+        assert_kill_stops_descendant(JobId(80), 10, true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_native_pipeline_stops_descendants_in_each_process_group() {
+        assert_kill_stops_descendant(JobId(81), 11, false, true).await;
     }
 
     #[tokio::test]
