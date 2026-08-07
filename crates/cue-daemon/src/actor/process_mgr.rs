@@ -1089,6 +1089,24 @@ fn configure_command(
     cmd.kill_on_drop(true);
 }
 
+#[cfg(unix)]
+fn configure_process_group(cmd: &mut tokio::process::Command) {
+    // SAFETY: `setpgid` is async-signal-safe, and the closure only operates on
+    // the forked child before exec. A per-child process group lets cancellation
+    // terminate grandchildren instead of orphaning them under PID 1.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_cmd: &mut tokio::process::Command) {}
+
 fn effective_process_options(
     options: &ProcessJobOptions,
     _snapshot: &EnvSnapshot,
@@ -1288,6 +1306,7 @@ async fn spawn_single_pipe_job(
         options.cwd_override.as_deref(),
         sandbox.as_ref(),
     );
+    configure_process_group(&mut cmd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1796,6 +1815,7 @@ fn spawn_native_pipeline(
             cmd.args(&args);
         }
         configure_command(&mut cmd, snapshot, options.cwd_override, options.sandbox);
+        configure_process_group(&mut cmd);
 
         if idx == 0 {
             if options.capture_stdin {
@@ -2741,6 +2761,28 @@ async fn notify_cleanup(cleanup_tx: &mpsc::Sender<JobId>, job_id: JobId) {
 }
 
 fn request_child_kill(job_id: JobId, child: &mut tokio::process::Child, reason: &str) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        // Each ordinary child enters a dedicated process group and PTY children
+        // call `setsid`, so the child's pid is also its process-group id.
+        // Killing the group first prevents subprocesses such as `sleep` from
+        // surviving after their direct parent is reaped.
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if result == 0 {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            warn!(
+                %job_id,
+                pid,
+                %reason,
+                err = %error,
+                "process_mgr: process-group kill request failed; falling back to child kill"
+            );
+        }
+    }
+
     if let Err(error) = child.start_kill() {
         warn!(
             %job_id,
@@ -3881,6 +3923,141 @@ mod tests {
             }
             _ => panic!("expected JobFinished"),
         }
+
+        process_tx
+            .send(ProcessMgrMsg::Shutdown)
+            .await
+            .expect("send process_mgr shutdown");
+        std::fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pipe_job_stops_descendants_in_the_job_process_group() {
+        let cwd = make_temp_dir();
+        let child_pid_path = cwd.join("child.pid");
+        let script_path = cwd.join("spawn-child.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n/bin/sleep 30 &\nchild=$!\nprintf '%s' \"$child\" > {}\nwait\n",
+                child_pid_path.display()
+            ),
+        )
+        .expect("write descendant fixture");
+        let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, mut scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx.clone(),
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+
+        spawn(process_rx, sys);
+        tokio::spawn({
+            let cwd = cwd.clone();
+            async move {
+                while let Some(msg) = scope_rx.recv().await {
+                    match msg {
+                        ScopeStoreMsg::GetScope { hash, reply } => {
+                            reply
+                                .send(Ok(Some(cue_core::scope::Scope {
+                                    hash,
+                                    parent: None,
+                                    delta: None,
+                                    snapshot: Some(EnvSnapshot {
+                                        env: BTreeMap::new(),
+                                        cwd: cwd.clone(),
+                                    }),
+                                })))
+                                .expect("send scope reply");
+                        }
+                        ScopeStoreMsg::Shutdown => break,
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let job_id = JobId(79);
+        process_tx
+            .send(ProcessMgrMsg::SpawnJob {
+                job_id,
+                plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline {
+                    segments: vec![cue_core::pipeline::PipeSegment {
+                        command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
+                        pipe_to_next: None,
+                    }],
+                }),
+                scope_hash: cue_core::ScopeHash([9; 32]),
+                options: ProcessJobOptions {
+                    cwd_override: None,
+                    sandbox: None,
+                    wrapper_enabled: false,
+                    pty_enabled: false,
+                    direct_output_client: None,
+                    session_id: None,
+                },
+            })
+            .await
+            .expect("send spawn job");
+
+        let child_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&child_pid_path)
+                    && let Ok(pid) = raw.parse::<libc::pid_t>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant pid file");
+        assert_eq!(
+            unsafe { libc::kill(child_pid, 0) },
+            0,
+            "descendant should be running"
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        process_tx
+            .send(ProcessMgrMsg::KillJob {
+                job_id,
+                reply: reply_tx,
+            })
+            .await
+            .expect("send kill job");
+        tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx)
+            .await
+            .expect("kill reply")
+            .expect("kill reply sender")
+            .expect("kill job");
+        tokio::time::timeout(std::time::Duration::from_secs(5), scheduler_rx.recv())
+            .await
+            .expect("job finished after kill")
+            .expect("scheduler channel should stay open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = unsafe { libc::kill(child_pid, 0) };
+                if result == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant should be reaped after process-group kill");
 
         process_tx
             .send(ProcessMgrMsg::Shutdown)
