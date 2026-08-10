@@ -26,6 +26,3 @@ lcov.info
 *.profraw
 *.profdata
 .spark/
-
-# Mutation testing
-/mutants.out*

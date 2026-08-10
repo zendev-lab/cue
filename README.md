@@ -94,12 +94,15 @@ just check
 # Run tests
 just test
 
-# Full CI locally
+# Full CI locally (requires rustup with Rust 1.95 and uv)
 just ci
 
 # Install pre-commit hooks
 just pre-commit-install
 ```
+
+See [`docs/testing.md`](docs/testing.md) for test ownership, static-policy boundaries,
+and the checks that make up the local and hosted CI gates.
 
 ## Design Documents
 
