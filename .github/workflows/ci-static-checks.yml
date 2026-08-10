@@ -40,3 +40,5 @@ jobs:
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: uvx --from prek==0.4.12 prek run --all-files
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
