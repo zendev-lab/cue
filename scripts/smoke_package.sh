@@ -10,6 +10,8 @@ fi
 package_path="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/cue-installed-package.XXXXXX")"
 trap 'rm -rf "$smoke_root"' EXIT
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export HOME="$smoke_root/home"
 export XDG_CONFIG_HOME="$smoke_root/config"
 export XDG_DATA_HOME="$smoke_root/data"
