@@ -334,7 +334,7 @@ impl ResourceConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NvidiaResourceConfig {
-    #[serde(default)]
+    #[serde(default = "default_nvidia_enabled")]
     pub enabled: bool,
     #[serde(default = "default_nvidia_provider_id")]
     pub provider_id: String,
@@ -351,7 +351,7 @@ pub struct NvidiaResourceConfig {
 impl Default for NvidiaResourceConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_nvidia_enabled(),
             provider_id: default_nvidia_provider_id(),
             gpu_key: default_nvidia_gpu_key(),
             gpu_mem_key: default_nvidia_gpu_mem_key(),
@@ -359,6 +359,10 @@ impl Default for NvidiaResourceConfig {
             probe_ttl_ms: default_nvidia_probe_ttl_ms(),
         }
     }
+}
+
+fn default_nvidia_enabled() -> bool {
+    true
 }
 
 fn default_nvidia_provider_id() -> String {
@@ -1044,6 +1048,36 @@ pip = "uv pip"
             config.aliases.apply("pip install foo"),
             "uv pip install foo"
         );
+    }
+
+    #[test]
+    fn resources_nvidia_provider_is_enabled_by_default() {
+        let default_config = Config::default();
+        assert!(default_config.resources.nvidia.enabled);
+
+        let omitted = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.nvidia]
+probe_ttl_ms = 250
+"#,
+        )))
+        .expect("load config with omitted enabled flag");
+        assert!(omitted.resources.nvidia.enabled);
+    }
+
+    #[test]
+    fn resources_nvidia_provider_can_be_explicitly_disabled() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.nvidia]
+enabled = false
+"#,
+        )))
+        .expect("load config with explicitly disabled NVIDIA provider");
+
+        assert!(!config.resources.nvidia.enabled);
     }
 
     #[test]

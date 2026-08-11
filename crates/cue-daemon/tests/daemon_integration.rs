@@ -1669,6 +1669,9 @@ esac
             &env,
             &format!(
                 r#"
+[resources.nvidia]
+enabled = false
+
 [resources.cli.gpu]
 keys = ["gpu", "gpu_mem"]
 probe = ["{}", "probe", "{}"]

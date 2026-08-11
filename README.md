@@ -363,6 +363,19 @@ absolute paths outside the working tree, network access, process credentials, or
 environment variables. See `docs/design/sandbox-threat-model.md` for the full
 trust model.
 
+NVIDIA resource discovery is enabled by default. On hosts with a working NVML
+runtime, the daemon automatically registers the `gpu` and `gpu_mem` resource
+keys. On hosts without NVML or NVIDIA devices, startup continues without an
+NVIDIA provider. Operators can opt out explicitly:
+
+```toml
+[resources.nvidia]
+enabled = false
+```
+
+Managed GPU jobs request `need.gpu` and `need.gpu_mem`; the daemon injects the
+selected devices through `CUDA_VISIBLE_DEVICES`.
+
 Typical remote flow:
 
 ```bash

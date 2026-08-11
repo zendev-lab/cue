@@ -54,7 +54,10 @@ mod tests {
     #[test]
     fn registry_from_config_adds_cli_provider_routes() {
         let config = ResourceConfig {
-            nvidia: Default::default(),
+            nvidia: crate::config::NvidiaResourceConfig {
+                enabled: false,
+                ..Default::default()
+            },
             cli: BTreeMap::from([(
                 "license".to_string(),
                 CliResourceProviderConfig {

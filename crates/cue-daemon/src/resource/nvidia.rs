@@ -1,6 +1,9 @@
 //! Built-in NVIDIA GPU resource provider.
 //!
-//! The provider is available when daemon config enables `[resources.nvidia]`.
+//! The provider is enabled by default. Operators can explicitly disable it with
+//! `[resources.nvidia] enabled = false`. When NVML is unavailable or no NVIDIA
+//! runtime can be initialized, discovery safely returns no provider and the
+//! daemon continues serving non-GPU work.
 //! Actual NVML probing is compiled only behind the `gpu-nvidia` feature; the
 //! selection/reservation logic is pure Rust and testable without NVIDIA drivers.
 
