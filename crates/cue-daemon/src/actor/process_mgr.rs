@@ -1089,6 +1089,24 @@ fn configure_command(
     cmd.kill_on_drop(true);
 }
 
+#[cfg(unix)]
+fn configure_process_group(cmd: &mut tokio::process::Command) {
+    // SAFETY: `setpgid` is async-signal-safe, and the closure only operates on
+    // the forked child before exec. A per-child process group lets cancellation
+    // terminate grandchildren instead of orphaning them under PID 1.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_cmd: &mut tokio::process::Command) {}
+
 fn effective_process_options(
     options: &ProcessJobOptions,
     _snapshot: &EnvSnapshot,
@@ -1288,6 +1306,7 @@ async fn spawn_single_pipe_job(
         options.cwd_override.as_deref(),
         sandbox.as_ref(),
     );
+    configure_process_group(&mut cmd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1398,14 +1417,19 @@ async fn spawn_single_pipe_job(
         });
 
         let (exit_code, was_killed) = tokio::select! {
-            status = child.wait() => {
-                let code = match status {
-                    Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
-                    Err(error) => {
-                        error!(%job_id, err = %error, "process_mgr: pipe child wait failed");
-                        EXIT_CODE_UNAVAILABLE
+            exit = wait_for_child_exit_unreaped(&mut child) => {
+                match exit {
+                    Ok(()) => {
+                        signal_owned_process_group(job_id, &child, "pipe child exit cleanup", true);
                     }
-                };
+                    Err(error) => {
+                        warn!(%job_id, err = %error, "process_mgr: cannot prove pipe process-group ownership; using direct-child fallback");
+                        if let Err(kill_error) = child.start_kill() {
+                            warn!(%job_id, err = %kill_error, "process_mgr: pipe child fallback kill failed");
+                        }
+                    }
+                }
+                let code = wait_for_child(job_id, &mut child, "after pipe child exit").await;
                 (code, false)
             }
             _ = kill_rx.recv() => {
@@ -1675,7 +1699,8 @@ async fn spawn_native_pipeline_job(
             capture_stdin: options.pty_enabled,
             sys: &sys,
         },
-    )?;
+    )
+    .await?;
 
     let pids: Vec<u32> = children
         .iter()
@@ -1776,11 +1801,21 @@ async fn spawn_logical_job(
     })
 }
 
-fn spawn_native_pipeline(
+async fn spawn_native_pipeline(
     job_id: JobId,
     segments: &[ExpandedSegment],
     snapshot: &EnvSnapshot,
     options: NativePipelineOptions<'_>,
+) -> Result<NativePipelineSpawn, ()> {
+    spawn_native_pipeline_with_hook(job_id, segments, snapshot, options, |_| Ok(())).await
+}
+
+async fn spawn_native_pipeline_with_hook(
+    job_id: JobId,
+    segments: &[ExpandedSegment],
+    snapshot: &EnvSnapshot,
+    options: NativePipelineOptions<'_>,
+    mut before_segment: impl FnMut(usize) -> Result<(), ()>,
 ) -> Result<NativePipelineSpawn, ()> {
     let mut children = Vec::with_capacity(segments.len());
     let mut stdout_sources = Vec::new();
@@ -1789,6 +1824,10 @@ fn spawn_native_pipeline(
     let mut next_stdin = None;
 
     for (idx, segment) in segments.iter().enumerate() {
+        if before_segment(idx).is_err() {
+            cleanup_partial_pipeline_spawn(job_id, children).await;
+            return Err(());
+        }
         let (program, args) =
             wrap_segment_if_enabled(options.sys, options.wrapper_enabled, segment);
         let mut cmd = tokio::process::Command::new(&program);
@@ -1796,64 +1835,74 @@ fn spawn_native_pipeline(
             cmd.args(&args);
         }
         configure_command(&mut cmd, snapshot, options.cwd_override, options.sandbox);
+        configure_process_group(&mut cmd);
 
-        if idx == 0 {
-            if options.capture_stdin {
-                cmd.stdin(Stdio::piped());
+        let spawn_result = (|| -> Result<tokio::process::Child, ()> {
+            if idx == 0 {
+                if options.capture_stdin {
+                    cmd.stdin(Stdio::piped());
+                } else {
+                    cmd.stdin(Stdio::null());
+                }
+            } else if let Some(stdin) = next_stdin.take() {
+                cmd.stdin(Stdio::from(stdin));
             } else {
-                cmd.stdin(Stdio::null());
+                error!(%job_id, segment = idx, "process_mgr: missing pipeline stdin");
+                return Err(());
             }
-        } else if let Some(stdin) = next_stdin.take() {
-            cmd.stdin(Stdio::from(stdin));
-        } else {
-            error!(%job_id, segment = idx, "process_mgr: missing pipeline stdin");
-            return Err(());
-        }
 
-        match segment.pipe_to_next {
-            Some(cue_core::pipeline::PipeOp::Stdout) => {
-                let (read_end, write_end) = create_pipe().map_err(|error| {
-                    error!(%job_id, segment = idx, err = %error, "process_mgr: create stdout pipe failed");
-                })?;
-                cmd.stdout(Stdio::from(write_end));
-                cmd.stderr(Stdio::piped());
-                next_stdin = Some(read_end);
+            match segment.pipe_to_next {
+                Some(cue_core::pipeline::PipeOp::Stdout) => {
+                    let (read_end, write_end) = create_pipe().map_err(|error| {
+                        error!(%job_id, segment = idx, err = %error, "process_mgr: create stdout pipe failed");
+                    })?;
+                    cmd.stdout(Stdio::from(write_end));
+                    cmd.stderr(Stdio::piped());
+                    next_stdin = Some(read_end);
+                }
+                Some(cue_core::pipeline::PipeOp::StdoutStderr) => {
+                    let (read_end, write_end) = create_pipe().map_err(|error| {
+                        error!(%job_id, segment = idx, err = %error, "process_mgr: create stdout+stderr pipe failed");
+                    })?;
+                    let stderr_write = write_end.try_clone().map_err(|error| {
+                        error!(%job_id, segment = idx, err = %error, "process_mgr: clone combined pipe failed");
+                    })?;
+                    cmd.stdout(Stdio::from(write_end));
+                    cmd.stderr(Stdio::from(stderr_write));
+                    next_stdin = Some(read_end);
+                }
+                Some(cue_core::pipeline::PipeOp::StderrOnly) => {
+                    let (read_end, write_end) = create_pipe().map_err(|error| {
+                        error!(%job_id, segment = idx, err = %error, "process_mgr: create stderr-only pipe failed");
+                    })?;
+                    cmd.stdout(Stdio::piped());
+                    cmd.stderr(Stdio::from(write_end));
+                    next_stdin = Some(read_end);
+                }
+                None => {
+                    cmd.stdout(Stdio::piped());
+                    cmd.stderr(Stdio::piped());
+                }
             }
-            Some(cue_core::pipeline::PipeOp::StdoutStderr) => {
-                let (read_end, write_end) = create_pipe().map_err(|error| {
-                    error!(%job_id, segment = idx, err = %error, "process_mgr: create stdout+stderr pipe failed");
-                })?;
-                let stderr_write = write_end.try_clone().map_err(|error| {
-                    error!(%job_id, segment = idx, err = %error, "process_mgr: clone combined pipe failed");
-                })?;
-                cmd.stdout(Stdio::from(write_end));
-                cmd.stderr(Stdio::from(stderr_write));
-                next_stdin = Some(read_end);
-            }
-            Some(cue_core::pipeline::PipeOp::StderrOnly) => {
-                let (read_end, write_end) = create_pipe().map_err(|error| {
-                    error!(%job_id, segment = idx, err = %error, "process_mgr: create stderr-only pipe failed");
-                })?;
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::from(write_end));
-                next_stdin = Some(read_end);
-            }
-            None => {
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::piped());
-            }
-        }
 
-        let mut child = cmd.spawn().map_err(|error| {
-            log_spawn_failure(
-                job_id,
-                &program,
-                &args,
-                snapshot,
-                options.cwd_override,
-                &error,
-            );
-        })?;
+            cmd.spawn().map_err(|error| {
+                log_spawn_failure(
+                    job_id,
+                    &program,
+                    &args,
+                    snapshot,
+                    options.cwd_override,
+                    &error,
+                );
+            })
+        })();
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(()) => {
+                cleanup_partial_pipeline_spawn(job_id, children).await;
+                return Err(());
+            }
+        };
         if idx == 0 && options.capture_stdin {
             input = child
                 .stdin
@@ -1875,6 +1924,11 @@ fn spawn_native_pipeline(
         stdout_sources,
         stderr_sources,
     })
+}
+
+async fn cleanup_partial_pipeline_spawn(job_id: JobId, mut children: Vec<tokio::process::Child>) {
+    terminate_children(job_id, &mut children).await;
+    wait_for_children(job_id, &mut children).await;
 }
 
 fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
@@ -2009,15 +2063,36 @@ async fn reader_task(task: PtyReaderTask) {
     let log_file = Arc::new(Mutex::new(log_file));
     let mut pty_buf = vec![0u8; 8192];
     let mut pty_done = false;
+    let mut child_exit_observed = false;
+    let mut child_exit_poll = tokio::time::interval(std::time::Duration::from_millis(25));
+    child_exit_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            _ = child_exit_poll.tick(), if !child_exit_observed => {
+                match child_exit_pending_without_reaping(&child) {
+                    Ok(true) => {
+                        signal_owned_process_group(
+                            job_id,
+                            &child,
+                            "PTY child exit cleanup",
+                            true,
+                        );
+                        child_exit_observed = true;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(%job_id, err = %error, "process_mgr: failed to poll PTY child exit");
+                    }
+                }
+            }
             // Kill signal from the main actor loop.
             _ = kill_rx.recv() => {
-                info!(%job_id, "process_mgr: sending SIGTERM");
+                info!(%job_id, "process_mgr: sending SIGKILL to job process group");
                 request_child_kill(job_id, &mut child, "kill requested");
 
-                // Wait up to 10 s for graceful exit, then SIGKILL (kill_on_drop).
+                // The group has already received SIGKILL. Keep a bounded wait
+                // only for reaping the direct child and releasing its handle.
                 let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
                 tokio::select! {
                     status = child.wait() => {
@@ -2028,11 +2103,10 @@ async fn reader_task(task: PtyReaderTask) {
                                 EXIT_CODE_UNAVAILABLE
                             }
                         };
-                        debug!(%job_id, code, "process_mgr: child exited after SIGTERM");
+                        debug!(%job_id, code, "process_mgr: child reaped after SIGKILL");
                     }
                     () = timeout => {
-                        warn!(%job_id, "process_mgr: child did not exit in 10 s — dropping (SIGKILL)");
-                        // child is dropped here → kill_on_drop sends SIGKILL
+                        warn!(%job_id, "process_mgr: child was not reaped within 10 s of SIGKILL; dropping handle");
                         drop(child);
                     }
                 }
@@ -2102,22 +2176,41 @@ async fn reader_task(task: PtyReaderTask) {
         }
     }
 
-    // Wait for exit status while still honoring late kill requests.
-    let (exit_code, was_killed) = tokio::select! {
-        status = child.wait() => {
-            let code = match status {
-                Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
-                Err(e) => {
-                    error!(%job_id, err = %e, "process_mgr: wait failed");
-                    EXIT_CODE_UNAVAILABLE
+    // Wait for exit status while still honoring late kill requests. Observe
+    // natural exit without reaping first so the owned session/process-group id
+    // cannot be reused before descendant cleanup.
+    let (exit_code, was_killed) = if child_exit_observed {
+        (
+            wait_for_child(job_id, &mut child, "after observed PTY child exit").await,
+            false,
+        )
+    } else {
+        tokio::select! {
+            exit = wait_for_child_exit_unreaped(&mut child) => {
+                match exit {
+                    Ok(()) => {
+                        signal_owned_process_group(
+                            job_id,
+                            &child,
+                            "PTY child exit cleanup",
+                            true,
+                        );
+                    }
+                    Err(error) => {
+                        warn!(%job_id, err = %error, "process_mgr: cannot prove PTY process-group ownership; using direct-child fallback");
+                        if let Err(kill_error) = child.start_kill() {
+                            warn!(%job_id, err = %kill_error, "process_mgr: PTY child fallback kill failed");
+                        }
+                    }
                 }
-            };
-            (code, false)
-        }
-        _ = kill_rx.recv() => {
-            request_child_kill(job_id, &mut child, "late kill requested");
-            let code = wait_for_child(job_id, &mut child, "after late kill").await;
-            (code, true)
+                let code = wait_for_child(job_id, &mut child, "after PTY child exit").await;
+                (code, false)
+            }
+            _ = kill_rx.recv() => {
+                request_child_kill(job_id, &mut child, "late kill requested");
+                let code = wait_for_child(job_id, &mut child, "after late kill").await;
+                (code, true)
+            }
         }
     };
 
@@ -2219,8 +2312,14 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
     drop(chunk_tx);
 
     let mut was_killed = false;
+    let mut cleaned_groups = vec![false; children.len()];
+    let mut child_exit_poll = tokio::time::interval(std::time::Duration::from_millis(25));
+    child_exit_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while active_readers > 0 {
         tokio::select! {
+            _ = child_exit_poll.tick() => {
+                cleanup_exited_process_groups(job_id, &children, &mut cleaned_groups);
+            }
             _ = kill_rx.recv(), if !was_killed => {
                 was_killed = true;
                 info!(%job_id, "process_mgr: killing native pipeline");
@@ -2264,15 +2363,15 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
     }
 
     let exit_code = if was_killed {
-        wait_for_children(&mut children).await
+        wait_for_children(job_id, &mut children).await
     } else {
         tokio::select! {
             _ = kill_rx.recv() => {
                 was_killed = true;
                 terminate_children(job_id, &mut children).await;
-                wait_for_children(&mut children).await
+                wait_for_children(job_id, &mut children).await
             }
-            code = wait_for_children(&mut children) => code,
+            code = wait_for_children(job_id, &mut children) => code,
         }
     };
 
@@ -2498,13 +2597,18 @@ async fn run_pipeline_streaming(
             capture_stdin: context.options.capture_stdin,
             sys: context.sys,
         },
-    ) {
+    )
+    .await
+    {
         Ok(spawn) => spawn,
         Err(()) => return EXIT_CODE_UNAVAILABLE,
     };
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel(PIPELINE_CHUNK_CAP);
     let mut active_readers = 0usize;
+    let mut cleaned_groups = vec![false; spawn.children.len()];
+    let mut child_exit_poll = tokio::time::interval(std::time::Duration::from_millis(25));
+    child_exit_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     for stdout in spawn.stdout_sources.drain(..) {
         active_readers += 1;
@@ -2528,6 +2632,13 @@ async fn run_pipeline_streaming(
 
     while active_readers > 0 {
         tokio::select! {
+            _ = child_exit_poll.tick() => {
+                cleanup_exited_process_groups(
+                    context.job_id,
+                    &spawn.children,
+                    &mut cleaned_groups,
+                );
+            }
             _ = context.kill_rx.recv(), if !*context.was_killed => {
                 *context.was_killed = true;
                 terminate_children(context.job_id, &mut spawn.children).await;
@@ -2570,17 +2681,17 @@ async fn run_pipeline_streaming(
     }
 
     if *context.was_killed {
-        wait_for_children(&mut spawn.children).await;
+        wait_for_children(context.job_id, &mut spawn.children).await;
         EXIT_CODE_UNAVAILABLE
     } else {
         tokio::select! {
             _ = context.kill_rx.recv() => {
                 *context.was_killed = true;
                 terminate_children(context.job_id, &mut spawn.children).await;
-                wait_for_children(&mut spawn.children).await;
+                wait_for_children(context.job_id, &mut spawn.children).await;
                 EXIT_CODE_UNAVAILABLE
             }
-            code = wait_for_children(&mut spawn.children) => code,
+            code = wait_for_children(context.job_id, &mut spawn.children) => code,
         }
     }
 }
@@ -2740,7 +2851,148 @@ async fn notify_cleanup(cleanup_tx: &mpsc::Sender<JobId>, job_id: JobId) {
     }
 }
 
+#[cfg(unix)]
+fn child_exit_pending_without_reaping(child: &tokio::process::Child) -> std::io::Result<bool> {
+    let pid = child
+        .id()
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.assume_init().si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+async fn wait_for_child_exit_unreaped(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    loop {
+        #[cfg(unix)]
+        if child_exit_pending_without_reaping(child)? {
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+fn signal_owned_process_group(
+    job_id: JobId,
+    child: &tokio::process::Child,
+    reason: &str,
+    leader_exited: bool,
+) -> bool {
+    let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        return false;
+    };
+    // Callers retain an unreaped direct child while signaling. Its PID cannot
+    // be reused during that interval. The child became a process-group leader
+    // via `setpgid(0, 0)` (or a session/group leader via `setsid()` for PTY),
+    // and POSIX does not allow a process-group leader to join another group.
+    // Consequently `pid` remains the unique owned PGID until this signal, even
+    // after the direct child has become a zombie and `getpgid(pid)` reports
+    // ESRCH on platforms such as macOS.
+    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if result == 0 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    if cfg!(target_os = "macos") && leader_exited && error.raw_os_error() == Some(libc::EPERM) {
+        debug!(
+            %job_id,
+            pid,
+            %reason,
+            "process_mgr: exited process group has no remaining signalable members"
+        );
+        return true;
+    }
+    if error.raw_os_error() != Some(libc::ESRCH) {
+        warn!(
+            %job_id,
+            pid,
+            %reason,
+            err = %error,
+            "process_mgr: process-group signal failed"
+        );
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn signal_owned_process_group(
+    _job_id: JobId,
+    _child: &tokio::process::Child,
+    _reason: &str,
+    _leader_exited: bool,
+) -> bool {
+    false
+}
+
+fn cleanup_exited_process_groups(
+    job_id: JobId,
+    children: &[tokio::process::Child],
+    cleaned: &mut [bool],
+) {
+    for (index, child) in children.iter().enumerate() {
+        if cleaned.get(index).copied().unwrap_or(true) {
+            continue;
+        }
+        match child_exit_pending_without_reaping(child) {
+            Ok(true) => {
+                signal_owned_process_group(job_id, child, "pipeline child exit cleanup", true);
+                cleaned[index] = true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    %job_id,
+                    pid = ?child.id(),
+                    err = %error,
+                    "process_mgr: failed to poll pipeline child exit"
+                );
+            }
+        }
+    }
+}
+
 fn request_child_kill(job_id: JobId, child: &mut tokio::process::Child, reason: &str) {
+    #[cfg(unix)]
+    match child_exit_pending_without_reaping(child) {
+        Ok(leader_exited) => {
+            // `waitid(..., WNOWAIT)` proves that the daemon still owns an
+            // unreaped direct child. Its numeric PID therefore cannot be
+            // reused while we signal the process group established at spawn.
+            if signal_owned_process_group(job_id, child, reason, leader_exited) {
+                return;
+            }
+        }
+        Err(error) => {
+            warn!(
+                %job_id,
+                pid = ?child.id(),
+                %reason,
+                err = %error,
+                "process_mgr: could not prove process-group ownership; falling back to child kill"
+            );
+        }
+    }
+
     if let Err(error) = child.start_kill() {
         warn!(
             %job_id,
@@ -2773,10 +3025,31 @@ async fn terminate_children(job_id: JobId, children: &mut [tokio::process::Child
     }
 }
 
-async fn wait_for_children(children: &mut [tokio::process::Child]) -> i32 {
+async fn wait_for_children(job_id: JobId, children: &mut [tokio::process::Child]) -> i32 {
     let mut exit_code = EXIT_CODE_UNAVAILABLE;
     let last_idx = children.len().saturating_sub(1);
     for (idx, child) in children.iter_mut().enumerate() {
+        match wait_for_child_exit_unreaped(child).await {
+            Ok(()) => {
+                signal_owned_process_group(job_id, child, "pipeline child exit cleanup", true);
+            }
+            Err(error) => {
+                warn!(
+                    %job_id,
+                    pid = ?child.id(),
+                    err = %error,
+                    "process_mgr: cannot prove pipeline process-group ownership; using direct-child fallback"
+                );
+                if let Err(kill_error) = child.start_kill() {
+                    warn!(
+                        %job_id,
+                        pid = ?child.id(),
+                        err = %kill_error,
+                        "process_mgr: pipeline child fallback kill failed"
+                    );
+                }
+            }
+        }
         match child.wait().await {
             Ok(status) => {
                 if idx == last_idx {
@@ -3887,6 +4160,422 @@ mod tests {
             .await
             .expect("send process_mgr shutdown");
         std::fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    struct FixtureDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    struct ProcessGroupFixtureGuard {
+        groups: Vec<(libc::pid_t, libc::pid_t)>,
+        owner_markers: Vec<PathBuf>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessGroupFixtureGuard {
+        fn drop(&mut self) {
+            for (&(leader, descendant), marker) in self.groups.iter().zip(&self.owner_markers) {
+                let marker = marker.to_string_lossy();
+                let command_matches = |pid: libc::pid_t| {
+                    std::process::Command::new("/bin/ps")
+                        .args(["-p", &pid.to_string(), "-o", "command="])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .is_some_and(|output| {
+                            String::from_utf8_lossy(&output.stdout).contains(marker.as_ref())
+                        })
+                };
+                let leader_owned =
+                    command_matches(leader) && unsafe { libc::getpgid(leader) } == leader;
+                let descendant_owned =
+                    command_matches(descendant) && unsafe { libc::getpgid(descendant) } == leader;
+                if leader_owned || descendant_owned {
+                    unsafe {
+                        libc::kill(-leader, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn read_process_group_fixture(path: &Path) -> (libc::pid_t, libc::pid_t) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(path) {
+                    let mut parts = raw.trim().split(':');
+                    if let (Some(leader), Some(descendant)) = (parts.next(), parts.next())
+                        && let (Ok(leader), Ok(descendant)) = (
+                            leader.parse::<libc::pid_t>(),
+                            descendant.parse::<libc::pid_t>(),
+                        )
+                    {
+                        break (leader, descendant);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process group fixture pid file")
+    }
+
+    #[cfg(unix)]
+    async fn assert_processes_gone(groups: &[(libc::pid_t, libc::pid_t)]) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if groups.iter().all(|&(leader, descendant)| {
+                    [leader, descendant].into_iter().all(|pid| {
+                        let result = unsafe { libc::kill(pid, 0) };
+                        result == -1
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned direct children and descendants should terminate");
+    }
+
+    #[cfg(unix)]
+    async fn assert_job_stops_descendants(
+        job_id: JobId,
+        scope_byte: u8,
+        pty_enabled: bool,
+        pipeline_tail: bool,
+        request_kill: bool,
+    ) {
+        let cwd = make_temp_dir();
+        let _cwd_guard = FixtureDirectory(cwd.clone());
+        let child_pid_path = cwd.join("child.pid");
+        let script_path = cwd.join("spawn-child.sh");
+        let tail_pid_path = cwd.join("tail-child.pid");
+        let tail_script_path = cwd.join("spawn-tail-child.sh");
+        let wait_line = if request_kill { "wait" } else { "exit 0" };
+        let tail_output = if !request_kill && pty_enabled {
+            "printf 'pty-tail-output'"
+        } else {
+            ""
+        };
+        let redirects = if request_kill {
+            ""
+        } else {
+            " </dev/null >/dev/null 2>&1"
+        };
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n/bin/sh -c 'trap : TERM; /bin/sleep 30; :' '{}' {redirects} &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\n{tail_output}\n{wait_line}\n",
+                script_path.display(),
+                child_pid_path.display()
+            ),
+        )
+        .expect("write descendant fixture");
+        if pipeline_tail {
+            std::fs::write(
+                &tail_script_path,
+                format!(
+                    "#!/bin/sh\n/bin/sh -c 'trap : TERM; /bin/sleep 30; :' '{}' {redirects} &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\n{wait_line}\n",
+                    tail_script_path.display(),
+                    tail_pid_path.display()
+                ),
+            )
+            .expect("write tail descendant fixture");
+        }
+        let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, mut scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx.clone(),
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+
+        spawn(process_rx, sys);
+        tokio::spawn({
+            let cwd = cwd.clone();
+            async move {
+                while let Some(msg) = scope_rx.recv().await {
+                    match msg {
+                        ScopeStoreMsg::GetScope { hash, reply } => {
+                            reply
+                                .send(Ok(Some(cue_core::scope::Scope {
+                                    hash,
+                                    parent: None,
+                                    delta: None,
+                                    snapshot: Some(EnvSnapshot {
+                                        env: BTreeMap::new(),
+                                        cwd: cwd.clone(),
+                                    }),
+                                })))
+                                .expect("send scope reply");
+                        }
+                        ScopeStoreMsg::Shutdown => break,
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let mut segments = vec![cue_core::pipeline::PipeSegment {
+            command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
+            pipe_to_next: pipeline_tail.then_some(cue_core::pipeline::PipeOp::Stdout),
+        }];
+        if pipeline_tail {
+            segments.push(cue_core::pipeline::PipeSegment {
+                command: vec![
+                    "/bin/sh".into(),
+                    tail_script_path.to_string_lossy().into_owned(),
+                ],
+                pipe_to_next: None,
+            });
+        }
+        process_tx
+            .send(ProcessMgrMsg::SpawnJob {
+                job_id,
+                plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline { segments }),
+                scope_hash: cue_core::ScopeHash([scope_byte; 32]),
+                options: ProcessJobOptions {
+                    cwd_override: None,
+                    sandbox: None,
+                    wrapper_enabled: false,
+                    pty_enabled,
+                    direct_output_client: None,
+                    session_id: None,
+                },
+            })
+            .await
+            .expect("send spawn job");
+
+        let mut groups = vec![read_process_group_fixture(&child_pid_path).await];
+        if pipeline_tail {
+            groups.push(read_process_group_fixture(&tail_pid_path).await);
+        }
+        let _guard = ProcessGroupFixtureGuard {
+            groups: groups.clone(),
+            owner_markers: if pipeline_tail {
+                vec![script_path.clone(), tail_script_path.clone()]
+            } else {
+                vec![script_path.clone()]
+            },
+        };
+        if request_kill {
+            for &(leader, descendant) in &groups {
+                assert_eq!(
+                    unsafe { libc::getpgid(leader) },
+                    leader,
+                    "direct child should remain leader of its owned process group"
+                );
+                assert_eq!(
+                    unsafe { libc::getpgid(descendant) },
+                    leader,
+                    "descendant should inherit the direct child's process group"
+                );
+            }
+            if pipeline_tail {
+                assert_ne!(
+                    groups[0].0, groups[1].0,
+                    "native pipeline segments should own distinct process groups"
+                );
+            }
+        }
+
+        if request_kill {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            process_tx
+                .send(ProcessMgrMsg::KillJob {
+                    job_id,
+                    reply: reply_tx,
+                })
+                .await
+                .expect("send kill job");
+            tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx)
+                .await
+                .expect("kill reply")
+                .expect("kill reply sender")
+                .expect("kill job");
+        }
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), scheduler_rx.recv())
+            .await
+            .expect("job finished after process-group cleanup")
+            .expect("scheduler channel should stay open");
+        assert!(matches!(
+            finished,
+            SchedulerMsg::JobFinished {
+                job_id: finished_job,
+                ..
+            } if finished_job == job_id
+        ));
+
+        assert_processes_gone(&groups).await;
+        if !request_kill && pty_enabled {
+            let mut output = String::new();
+            while let Ok(message) = event_rx.try_recv() {
+                if let super::super::EventBusMsg::PublishSession {
+                    payload: EventPayload::OutputChunk { id, data, .. },
+                    ..
+                } = message
+                    && id == job_id.to_string()
+                {
+                    output.push_str(&data);
+                }
+            }
+            assert!(
+                output.contains("pty-tail-output"),
+                "PTY tail output should be drained after parent exit: {output:?}"
+            );
+        }
+
+        process_tx
+            .send(ProcessMgrMsg::Shutdown)
+            .await
+            .expect("send process_mgr shutdown");
+        std::fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pipe_job_stops_descendants_in_the_job_process_group() {
+        assert_job_stops_descendants(JobId(79), 9, false, false, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pty_job_stops_descendants_in_the_job_session() {
+        assert_job_stops_descendants(JobId(80), 10, true, false, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_native_pipeline_stops_descendants_in_each_process_group() {
+        assert_job_stops_descendants(JobId(81), 11, false, true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_parent_exit_cleans_detached_descendant_before_reaping() {
+        assert_job_stops_descendants(JobId(82), 12, false, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_pty_parent_exit_cleans_detached_descendant_before_reaping() {
+        assert_job_stops_descendants(JobId(83), 13, true, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_pipeline_exit_cleans_each_segments_detached_descendant() {
+        assert_job_stops_descendants(JobId(84), 14, false, true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_pipeline_spawn_failure_cleans_started_process_groups() {
+        let cwd = make_temp_dir();
+        let _cwd_guard = FixtureDirectory(cwd.clone());
+        let pid_path = cwd.join("partial-child.pid");
+        let script_path = cwd.join("partial-child.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n/bin/sh -c 'trap : TERM; /bin/sleep 30; :' '{}' &\nchild=$!\nprintf '%s:%s' \"$$\" \"$child\" > '{}'\nwait\n",
+                script_path.display(),
+                pid_path.display()
+            ),
+        )
+        .expect("write partial-spawn descendant fixture");
+        let pipeline = cue_core::pipeline::Pipeline {
+            segments: vec![
+                cue_core::pipeline::PipeSegment {
+                    command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
+                    pipe_to_next: Some(cue_core::pipeline::PipeOp::Stdout),
+                },
+                cue_core::pipeline::PipeSegment {
+                    command: vec!["/bin/cat".into()],
+                    pipe_to_next: None,
+                },
+            ],
+        };
+        let snapshot = snapshot();
+        let segments =
+            expand_pipeline_segments(JobId(85), &pipeline, &snapshot).expect("expand pipeline");
+        let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+        let mut observed = None;
+        let result = spawn_native_pipeline_with_hook(
+            JobId(85),
+            &segments,
+            &snapshot,
+            NativePipelineOptions {
+                cwd_override: Some(&cwd),
+                sandbox: None,
+                wrapper_enabled: false,
+                capture_stdin: false,
+                sys: &sys,
+            },
+            |index| {
+                if index == 1 {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(raw) = std::fs::read_to_string(&pid_path) {
+                            let mut parts = raw.trim().split(':');
+                            if let (Some(leader), Some(descendant)) = (parts.next(), parts.next())
+                                && let (Ok(leader), Ok(descendant)) = (
+                                    leader.parse::<libc::pid_t>(),
+                                    descendant.parse::<libc::pid_t>(),
+                                )
+                            {
+                                observed = Some((leader, descendant));
+                                return Err(());
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    panic!(
+                        "first pipeline segment did not start descendant before injected failure"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err(), "second segment failure should abort spawn");
+        let group = observed.expect("first segment process group");
+        let _guard = ProcessGroupFixtureGuard {
+            groups: vec![group],
+            owner_markers: vec![script_path],
+        };
+        assert_processes_gone(&[group]).await;
     }
 
     #[tokio::test]
