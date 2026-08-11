@@ -14,7 +14,7 @@ check:
 
 # Run tests
 test *ARGS:
-    cargo test {{ARGS}}
+    cargo test {{ ARGS }}
 
 # Exercise cue-tui's first-party debug socket in a real PTY
 tui-debug-smoke:
@@ -29,30 +29,46 @@ cov-open:
     cargo llvm-cov test --html -- --no-capture
     open target/llvm-cov/html/index.html || xdg-open target/llvm-cov/html/index.html
 
-# MSRV check. Cargo enforces workspace.package.rust-version (1.95), so this
-# works with both rustup-managed and standalone/Homebrew toolchains.
+# Compile with the actual minimum supported Rust toolchain.
 msrv:
-    cargo check --workspace --all-targets
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v rustup >/dev/null 2>&1; then
+        echo "rustup is required to verify MSRV 1.95" >&2
+        exit 1
+    fi
+    rustup run 1.95 cargo check --workspace --all-targets
+
+# Build and exercise the public wheel command surface.
+package-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    package_dir="$(mktemp -d "${TMPDIR:-/tmp}/cue-package-smoke.XXXXXX")"
+    trap 'rm -rf "$package_dir"' EXIT
+    uvx --from maturin==1.13.3 maturin build --release --locked --out "$package_dir"
+    uvx --from maturin==1.13.3 maturin sdist --out "$package_dir"
+    ./scripts/smoke_package.sh "$package_dir"/*.whl
+    ./scripts/smoke_package.sh "$package_dir"/*.tar.gz
 
 # Clean build artifacts
 clean:
     rm -rf target/
     rm -f lcov.info
 
-# Full CI check (format check + clippy + test + MSRV)
-ci: check test msrv
+# Full local CI gate.
+ci: check test msrv package-smoke
 
 # Run pre-commit on all files
 pre-commit:
-    uvx prek run --all-files
+    uvx --from prek==0.4.12 prek run --all-files
 
 # Install local git hooks via prek
 pre-commit-install:
-    uvx prek install --install-hooks --hook-type pre-commit --hook-type commit-msg
+    uvx --from prek==0.4.12 prek install --install-hooks --hook-type pre-commit --hook-type commit-msg
 
 # Remove local git hooks installed by prek
 pre-commit-uninstall:
-    uvx prek uninstall
+    uvx --from prek==0.4.12 prek uninstall
 
 # Display project information
 info:

@@ -69,8 +69,3 @@ codegen-units = 1
 
 [profile.test]
 opt-level = 1
-
-# Faster rebuilds for cargo-mutants (no debuginfo).
-[profile.mutants]
-inherits = "test"
-debug = false
