@@ -1,6 +1,6 @@
 //! Self-update via GitHub Releases.
 //!
-//! Fetches the latest release from `github.com/zrr1999/cue-shell`, finds a
+//! Fetches the latest release from `github.com/zendev-lab/cue`, finds a
 //! binary asset matching the current OS and architecture, downloads it with
 //! `curl`, extracts it (if a tarball), and atomically replaces the running
 //! executable.  If the service manager is installed, it is restarted
@@ -21,8 +21,8 @@ use serde::Deserialize;
 
 use crate::command_util::CommandSpec;
 
-const REPO: &str = "zrr1999/cue-shell";
-const API_URL: &str = "https://api.github.com/repos/zrr1999/cue-shell/releases/latest";
+const REPO: &str = "zendev-lab/cue";
+const API_URL: &str = "https://api.github.com/repos/zendev-lab/cue/releases/latest";
 
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
@@ -334,6 +334,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn release_source_uses_canonical_repository() {
+        assert_eq!(REPO, "zendev-lab/cue");
+        assert_eq!(
+            API_URL,
+            "https://api.github.com/repos/zendev-lab/cue/releases/latest"
+        );
+    }
 
     #[test]
     fn temp_dir_cleanup_removes_existing_directory() {

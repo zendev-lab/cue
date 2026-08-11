@@ -24,10 +24,10 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Documentation = "https://github.com/zrr1999/cue-shell#readme"
-Homepage = "https://github.com/zrr1999/cue-shell"
-Releases = "https://github.com/zrr1999/cue-shell/releases"
-Repository = "https://github.com/zrr1999/cue-shell"
+Documentation = "https://github.com/zendev-lab/cue#readme"
+Homepage = "https://github.com/zendev-lab/cue"
+Releases = "https://github.com/zendev-lab/cue/releases"
+Repository = "https://github.com/zendev-lab/cue"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

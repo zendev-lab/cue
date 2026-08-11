@@ -12,7 +12,7 @@ members = [
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
-repository = "https://github.com/zrr1999/cue-shell"
+repository = "https://github.com/zendev-lab/cue"
 license = "MIT"
 
 [workspace.dependencies]
