@@ -1,6 +1,6 @@
 # TUI debug control
 
-External processes (test harnesses, AI agents) can drive and observe a running `cue-tui` without owning its terminal. The design mirrors the control surface that proved useful in Spark's [zellij harness](https://github.com/zrr1999/spark/blob/main/docs/spark-zellij-harness.md): launch the TUI in a real terminal, inject input, capture rendered pane text, inspect state, and subscribe to frame changes.
+External processes (test harnesses, AI agents) can drive and observe a running `cue-tui` without owning its terminal. The design mirrors the control surface that proved useful in Spark's [zellij harness](https://github.com/zendev-lab/spark/blob/main/docs/spark-zellij-harness.md): launch the TUI in a real terminal, inject input, capture rendered pane text, inspect state, and subscribe to frame changes.
 
 Unlike `cued` IPC (length-prefixed JSON to the daemon), debug control lives in the **TUI process** because rendering and input focus are owned there.
 
