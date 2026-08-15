@@ -317,7 +317,7 @@ fn run_start(
     preserve_restart_fence: bool,
     socket_override: Option<PathBuf>,
 ) -> Result<i32> {
-    let paths = daemon_runtime_paths(socket_override.as_deref())?;
+    let paths = daemon_control_paths(socket_override.as_deref())?;
 
     if force {
         if crate::lifecycle::restart_record_exists(&paths.socket)? {
@@ -383,7 +383,7 @@ fn wait_and_clear_cancelled_restart(paths: &DaemonRuntimePaths, timeout: Duratio
 }
 
 fn run_restart(socket_override: Option<PathBuf>, wait: bool) -> Result<()> {
-    let paths = daemon_runtime_paths(socket_override.as_deref())?;
+    let paths = daemon_control_paths(socket_override.as_deref())?;
     let socket_path = paths.socket.clone();
     if !daemon_responding(&socket_path) {
         if let PidFileState::Running(pid) = inspect_pid_file(&paths.pid)? {
@@ -1237,7 +1237,7 @@ async fn finalize_startup_restart(
 // ── Stop ──
 
 fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
-    let paths = daemon_runtime_paths(socket_override.as_deref())?;
+    let paths = daemon_control_paths(socket_override.as_deref())?;
     run_stop_with_paths(&paths, STOP_WAIT_TIMEOUT)
 }
 
@@ -1458,6 +1458,25 @@ fn daemon_runtime_paths(socket_override: Option<&Path>) -> Result<DaemonRuntimeP
         lock: crate::dirs::lock_path_for_socket(&socket),
         socket,
     })
+}
+
+fn daemon_control_paths(socket_override: Option<&Path>) -> Result<DaemonRuntimePaths> {
+    let paths = daemon_runtime_paths(socket_override)?;
+    let Some(parent) = paths
+        .lock
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(paths);
+    };
+    if !parent
+        .try_exists()
+        .with_context(|| format!("inspect daemon runtime directory {}", parent.display()))?
+    {
+        crate::dirs::ensure_private_dir(parent)
+            .with_context(|| format!("create daemon runtime directory {}", parent.display()))?;
+    }
+    Ok(paths)
 }
 
 fn validate_daemon_socket_path(field: &str, path: &Path) -> Result<()> {
@@ -2637,6 +2656,19 @@ mod tests {
             paths.pid,
             crate::dirs::pid_path_for_socket(&crate::dirs::socket_path())
         );
+    }
+
+    #[test]
+    fn daemon_control_paths_recreate_a_missing_runtime_directory_before_locking() {
+        let dir = make_temp_dir();
+        let socket = dir.join("missing-runtime/cued.sock");
+
+        let paths = daemon_control_paths(Some(&socket)).expect("prepare daemon control paths");
+        assert!(socket.parent().unwrap().is_dir());
+        let instance_lock = acquire_instance_lock(&paths.lock).expect("acquire daemon lock");
+
+        drop(instance_lock);
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
     }
 
     #[test]
