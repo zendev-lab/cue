@@ -78,21 +78,27 @@ impl TestEnv {
         self.spawn_daemon_with_env(std::iter::empty::<(&str, String)>())
     }
 
+    fn cued_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cued"));
+        command
+            .env("XDG_RUNTIME_DIR", &self.root)
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("HOME", &self.root);
+        command
+    }
+
     fn spawn_daemon_with_env<I, K, V>(&self, extra_env: I) -> Child
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<std::ffi::OsStr>,
         V: AsRef<std::ffi::OsStr>,
     {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cued"));
+        let mut command = self.cued_command();
         command
             .args(["start", "--fg", "--socket"])
             .arg(&self.socket)
-            .env("XDG_RUNTIME_DIR", &self.root)
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("HOME", &self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -108,6 +114,34 @@ impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+struct DetachedDaemonGuard(Option<u32>);
+
+impl DetachedDaemonGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DetachedDaemonGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+    }
+}
+
+fn assert_command_succeeded(label: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed with {}; stdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 /// Wait (with retries) until the socket file appears and is connectable.
@@ -831,6 +865,78 @@ async fn test_daemon_lifecycle() {
             .expect("wait failed");
         // Might exit 0 or via signal — both are acceptable.
         let _ = status;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_daemon_control_recovers_after_runtime_directory_is_cleared() {
+    run_daemon_test(async {
+        let env = TestEnv::new("missing-runtime-dir");
+        let runtime_dir = env.root.join("runtime");
+        let socket = runtime_dir.join("cued.sock");
+        let pid_path = runtime_dir.join("cued.sock.cued.pid");
+        assert!(!runtime_dir.exists());
+
+        let start = env
+            .cued_command()
+            .args(["start", "--socket"])
+            .arg(&socket)
+            .output()
+            .await
+            .expect("run cued start");
+        assert_command_succeeded("cued start", &start);
+        let first_pid = fs::read_to_string(&pid_path)
+            .expect("read first daemon PID")
+            .parse::<u32>()
+            .expect("parse first daemon PID");
+        let mut first_daemon = DetachedDaemonGuard(Some(first_pid));
+
+        let stop = env
+            .cued_command()
+            .args(["stop", "--socket"])
+            .arg(&socket)
+            .output()
+            .await
+            .expect("run first cued stop");
+        assert_command_succeeded("first cued stop", &stop);
+        first_daemon.disarm();
+
+        fs::remove_dir_all(&runtime_dir).expect("simulate reboot clearing runtime directory");
+        assert!(!runtime_dir.exists());
+
+        let restart = env
+            .cued_command()
+            .args(["restart", "--wait", "--socket"])
+            .arg(&socket)
+            .output()
+            .await
+            .expect("run cued restart");
+        assert_command_succeeded("cued restart", &restart);
+        let second_pid = fs::read_to_string(&pid_path)
+            .expect("read successor daemon PID")
+            .parse::<u32>()
+            .expect("parse successor daemon PID");
+        let mut second_daemon = DetachedDaemonGuard(Some(second_pid));
+
+        let status = env
+            .cued_command()
+            .args(["status", "--socket"])
+            .arg(&socket)
+            .output()
+            .await
+            .expect("run cued status");
+        assert_command_succeeded("cued status", &status);
+
+        let stop = env
+            .cued_command()
+            .args(["stop", "--socket"])
+            .arg(&socket)
+            .output()
+            .await
+            .expect("run successor cued stop");
+        assert_command_succeeded("successor cued stop", &stop);
+        second_daemon.disarm();
     })
     .await;
 }
