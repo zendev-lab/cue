@@ -34,12 +34,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
           components: llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: taiki-e/install-action@fb8f18cbbad93e39d8b8d65145468a6b2c09877f # cargo-llvm-cov
+      - uses: taiki-e/install-action@62c00134de3baf86116d0436bae2b425a8e0adbb # cargo-llvm-cov
 
       - name: Run tests with coverage
         run: cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
