@@ -507,6 +507,23 @@ fn restart_record_lock_path(socket_path: &Path) -> PathBuf {
 
 fn acquire_restart_record_lock(socket_path: &Path) -> Result<std::fs::File> {
     let path = restart_record_lock_path(socket_path);
+    // Same power-loss case as the instance lock: /tmp cleanup can remove the
+    // runtime directory before any restart-record sidecar is reopened.
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent
+            .try_exists()
+            .with_context(|| format!("inspect daemon runtime directory {}", parent.display()))?
+    {
+        crate::dirs::ensure_private_dir(parent).with_context(|| {
+            format!(
+                "create daemon runtime directory {} for restart record lock {}",
+                parent.display(),
+                path.display()
+            )
+        })?;
+    }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -784,6 +801,33 @@ mod tests {
             phase: RestartPhase::Armed,
             supervisor_restart: false,
         }
+    }
+
+    #[test]
+    fn restart_record_lock_recreates_only_a_missing_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_socket("restart-lock-parent");
+        let runtime = root.join("runtime");
+        let socket = runtime.join("cued.sock");
+
+        let lock = acquire_restart_record_lock(&socket)
+            .expect("missing runtime directory must be recreated");
+        assert!(runtime.is_dir());
+        drop(lock);
+
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+            .expect("set custom runtime directory mode");
+        let lock = acquire_restart_record_lock(&socket).expect("reacquire restart record lock");
+        let mode = std::fs::metadata(&runtime)
+            .expect("inspect custom runtime directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "existing custom parent mode must be preserved");
+
+        drop(lock);
+        std::fs::remove_dir_all(root).expect("remove restart lock test root");
     }
 
     #[test]
