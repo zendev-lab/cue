@@ -349,12 +349,23 @@ fn run_start(
 }
 
 fn clear_cancelled_restart_for_explicit_start(paths: &DaemonRuntimePaths) -> Result<()> {
-    let instance_lock = acquire_instance_lock(&paths.lock).with_context(|| {
-        format!(
-            "cannot clear a cancelled restart while {} is still owned",
-            paths.lock.display()
-        )
-    })?;
+    let instance_lock = match acquire_instance_lock(&paths.lock) {
+        Ok(file) => file,
+        Err(error) if is_instance_lock_held_error(&error) => {
+            anyhow::bail!(
+                "cannot clear a cancelled restart while {} is still owned",
+                paths.lock.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot clear a cancelled restart: failed to open daemon lock {}",
+                    paths.lock.display()
+                )
+            });
+        }
+    };
     // This is an explicit supersession of stop, not background GC. Once the
     // user asks to start again, any already queued launcher for this same
     // binary/socket is authorized; the instance lock still elects one owner.
@@ -1462,20 +1473,7 @@ fn daemon_runtime_paths(socket_override: Option<&Path>) -> Result<DaemonRuntimeP
 
 fn daemon_control_paths(socket_override: Option<&Path>) -> Result<DaemonRuntimePaths> {
     let paths = daemon_runtime_paths(socket_override)?;
-    let Some(parent) = paths
-        .lock
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return Ok(paths);
-    };
-    if !parent
-        .try_exists()
-        .with_context(|| format!("inspect daemon runtime directory {}", parent.display()))?
-    {
-        crate::dirs::ensure_private_dir(parent)
-            .with_context(|| format!("create daemon runtime directory {}", parent.display()))?;
-    }
+    ensure_lock_parent_dir(&paths.lock)?;
     Ok(paths)
 }
 
@@ -1527,7 +1525,53 @@ fn default_env_filter(default_directive: &str) -> Result<tracing_subscriber::Env
         .with_context(|| format!("parse default tracing directive `{default_directive}`"))
 }
 
+fn ensure_lock_parent_dir(lock_path: &Path) -> Result<()> {
+    let Some(parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    if parent
+        .try_exists()
+        .with_context(|| format!("inspect daemon runtime directory {}", parent.display()))?
+    {
+        return Ok(());
+    }
+    crate::dirs::ensure_private_dir(parent).with_context(|| {
+        format!(
+            "create daemon runtime directory {} for lock {}",
+            parent.display(),
+            lock_path.display()
+        )
+    })
+}
+
+#[derive(Debug)]
+struct InstanceLockHeld {
+    lock_path: PathBuf,
+}
+
+impl std::fmt::Display for InstanceLockHeld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "another cued instance is starting or running (lock {})",
+            self.lock_path.display()
+        )
+    }
+}
+
+impl std::error::Error for InstanceLockHeld {}
+
+fn is_instance_lock_held_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<InstanceLockHeld>().is_some()
+}
+
 fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
+    // Socket sidecars live next to the socket. After /tmp cleanup the parent
+    // directory can be gone even when no process owns the instance lock.
+    ensure_lock_parent_dir(lock_path)?;
     let file = crate::dirs::open_private_read_write(lock_path)
         .with_context(|| format!("open daemon lock {}", lock_path.display()))?;
     // SAFETY: `file` owns a valid descriptor for the full duration of the
@@ -1542,10 +1586,10 @@ fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists
     ) {
-        anyhow::bail!(
-            "another cued instance is starting or running (lock {})",
-            lock_path.display()
-        );
+        return Err(InstanceLockHeld {
+            lock_path: lock_path.to_path_buf(),
+        }
+        .into());
     }
     Err(error).with_context(|| format!("lock daemon instance {}", lock_path.display()))
 }
@@ -2679,9 +2723,59 @@ mod tests {
 
         let error = acquire_instance_lock(&lock_path).expect_err("second lock must fail");
         assert!(error.to_string().contains("another cued instance"));
+        assert!(is_instance_lock_held_error(&error));
 
         drop(first);
         acquire_instance_lock(&lock_path).expect("lock is released when owner drops");
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn instance_lock_recreates_missing_parent_directory() {
+        let dir = make_temp_dir();
+        let nested = dir.join("missing-runtime").join("cued.sock.cued.lock");
+
+        let lock = acquire_instance_lock(&nested)
+            .expect("missing parent must be created before opening the lock");
+        assert!(nested.parent().expect("lock parent").is_dir());
+        drop(lock);
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn instance_lock_preserves_existing_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = make_temp_dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set custom runtime directory mode");
+        let lock_path = dir.join("cued.sock.cued.lock");
+
+        let lock = acquire_instance_lock(&lock_path).expect("acquire daemon lock");
+        let mode = std::fs::metadata(&dir)
+            .expect("inspect custom runtime directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "existing custom parent mode must be preserved");
+
+        drop(lock);
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn explicit_start_clear_recreates_missing_runtime_dir() {
+        let dir = make_temp_dir();
+        let runtime = dir.join("gone-after-tmp-clean");
+        let paths = DaemonRuntimePaths {
+            socket: runtime.join("cued.sock"),
+            pid: runtime.join("cued.sock.cued.pid"),
+            lock: runtime.join("cued.sock.cued.lock"),
+        };
+
+        clear_cancelled_restart_for_explicit_start(&paths)
+            .expect("background start must recreate the runtime dir before clearing fences");
+        assert!(runtime.is_dir());
         std::fs::remove_dir_all(dir).expect("remove temp dir");
     }
 
