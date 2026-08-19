@@ -24,7 +24,7 @@ use cue_core::command_spec::{
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
 use super::ast::{Argument, Ast, ChainNode, JobExpr, PipeSegment, Pipeline, ScriptItemAst};
-use super::token::{IdKind, Span, Spanned, Token, Value};
+use super::token::{IdKind, ShellSyntax, Span, Spanned, Token, Value};
 use super::tokenizer::Tokenizer;
 
 /// Parser error.
@@ -46,6 +46,8 @@ pub enum ParseErrorKind {
     InvalidIdRef,
     UnmatchedParen,
     InvalidCronSchedule,
+    /// Unquoted bash syntax cue-shell does not interpret.
+    UnsupportedShellSyntax,
 }
 
 /// Recursive descent parser.
@@ -718,10 +720,34 @@ impl<'a> Parser<'a> {
                     self.advance();
                     words.push(s);
                 }
+                Token::ShellSyntax(syntax) => {
+                    return Err(unsupported_shell_syntax(*syntax, self.peek_span()));
+                }
                 _ => break,
             }
         }
         Ok(words)
+    }
+}
+
+/// Reject unquoted bash syntax where a command is expected.
+///
+/// These bytes used to become argv elements, which meant `wc -l > out.txt`
+/// silently ran `wc` with the literal arguments `>` and `out.txt`. cue-shell
+/// runs commands directly and never consults a shell, so the only honest
+/// options are to interpret the construct or to say plainly that it is not
+/// interpreted.
+fn unsupported_shell_syntax(syntax: ShellSyntax, span: Span) -> ParseError {
+    ParseError {
+        span,
+        message: format!(
+            "{} `{}` is bash syntax that cue-shell does not interpret; {}. Quote it to pass it through as a literal argument.",
+            syntax.label(),
+            syntax.text,
+            syntax.hint()
+        ),
+        kind: ParseErrorKind::UnsupportedShellSyntax,
+        suggestions: syntax.suggestions(),
     }
 }
 
@@ -1192,6 +1218,76 @@ mod tests {
                 .contains("bare `|` is not a cue-shell pipe operator")
         );
         assert!(err.message.contains("use `|>`"));
+    }
+
+    #[test]
+    fn parse_rejects_unquoted_shell_syntax_in_command_position() {
+        // Regression: these used to parse as ordinary argv words, so
+        // `wc -l > out.txt` silently ran `wc` with the arguments `>` and
+        // `out.txt` instead of redirecting anything.
+        let cases: &[(&str, &str)] = &[
+            (":run wc -l > out.txt", "redirection"),
+            (":run cmd >> log", "redirection"),
+            (":run cmd 2> err.txt", "redirection"),
+            (":run cmd 2>&1", "redirection"),
+            (":run cmd &> all.txt", "redirection"),
+            (":run cmd < in.txt", "redirection"),
+            (":run cat <<EOF", "redirection"),
+            (":run first ; second", "`;` command separator"),
+            (":run echo $(date)", "command substitution"),
+            (":run echo `date`", "command substitution"),
+        ];
+        for (input, label) in cases {
+            let err = Parser::parse(input).expect_err("unquoted shell syntax must be rejected");
+            assert_eq!(
+                err.kind,
+                ParseErrorKind::UnsupportedShellSyntax,
+                "unexpected kind for {input}: {err}"
+            );
+            assert!(
+                err.message.contains(label),
+                "error for {input} should name `{label}`: {err}"
+            );
+            assert!(
+                err.message.contains("Quote it"),
+                "error for {input} should mention quoting: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_keeps_quoted_shell_metacharacters_as_arguments() {
+        let ast = Parser::parse(r#":run producer 'a; b' "c > d" '$(e)'"#).unwrap();
+        match ast {
+            Ast::Command { argument, .. } => match argument {
+                Argument::Chain(chain) => {
+                    let p = leaf_pipeline(&chain);
+                    assert_eq!(
+                        p.segments[0].command,
+                        vec!["producer", "a; b", "c > d", "$(e)"]
+                    );
+                }
+                _ => panic!("expected pipeline"),
+            },
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn raw_text_builtins_still_carry_shell_metacharacters() {
+        // `:send` writes bytes to a job's stdin, where the receiving program may
+        // legitimately be a shell. Recognizing shell syntax as a token rather
+        // than a tokenizer error is what keeps this payload intact.
+        let ast = Parser::parse(":send J1 echo hi > out.txt ; echo done").unwrap();
+        match ast {
+            Ast::Command { argument, .. } => match argument {
+                Argument::Text(text) => {
+                    assert_eq!(text, "J1 echo hi > out.txt ; echo done");
+                }
+                other => panic!("expected raw text argument, got {other:?}"),
+            },
+            other => panic!("expected Command, got {other:?}"),
+        }
     }
 
     #[test]

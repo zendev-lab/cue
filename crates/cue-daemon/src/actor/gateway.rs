@@ -915,7 +915,7 @@ async fn route_request(
                             request_id,
                             payload: ResponsePayload::err(
                                 error_code::INVALID_SYNTAX,
-                                syntax_error_message(&input, &e.to_string()),
+                                e.to_string(),
                             ),
                         })
                         .await
@@ -971,7 +971,7 @@ async fn route_request(
                             request_id,
                             payload: ResponsePayload::err(
                                 error_code::INVALID_SYNTAX,
-                                syntax_error_message(&input, &e.to_string()),
+                                e.to_string(),
                             ),
                         })
                         .await
@@ -1597,41 +1597,6 @@ fn invalid_event_channel_response(channel: &str) -> ResponsePayload {
     )
 }
 
-fn syntax_error_message(input: &str, base: &str) -> String {
-    let hints = bash_syntax_hints(input);
-    if hints.is_empty() {
-        base.to_string()
-    } else {
-        format!(
-            "{base}\n\nPossible bash syntax issue:\n- {}",
-            hints.join("\n- ")
-        )
-    }
-}
-
-fn bash_syntax_hints(input: &str) -> Vec<&'static str> {
-    let mut hints = Vec::new();
-    if input.contains(';') {
-        hints.push("cue-shell does not use ';' command separators; use a script submission or cue-shell chain operators such as '->' or '~>'");
-    }
-    if input.contains("$(") || input.contains('`') {
-        hints.push(
-            "command substitution is shell syntax; use an explicit helper command/script instead",
-        );
-    }
-    if input.contains("2>") || input.contains("1>") || input.contains(" >") || input.contains("<") {
-        hints.push("redirection is shell syntax; use cue-shell pipes '|>'/'|&>' or write/read files explicitly");
-    }
-    if input.contains(" | ")
-        && !input.contains("|>")
-        && !input.contains("|&>")
-        && !input.contains("|!>")
-    {
-        hints.push("bare '|' is shell syntax; use cue-shell '|>' for stdout pipes or '|&>' for stdout+stderr pipes");
-    }
-    hints
-}
-
 fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
     let prefix = prefix_before_cursor(input, cursor).trim_start();
 
@@ -1719,6 +1684,9 @@ fn highlight_input(input: &str) -> Vec<HighlightSpan> {
                     | Token::PipeStderr => HighlightKind::Operator,
                     Token::IdRef(_, _) => HighlightKind::IdRef,
                     Token::Word(_) => HighlightKind::Word,
+                    // Recognized only to be rejected, so highlight it as an error
+                    // even though tokenization itself succeeded.
+                    Token::ShellSyntax(_) => HighlightKind::Error,
                     Token::Colon => HighlightKind::CommandPrefix,
                     Token::GroupOpen | Token::GroupClose => HighlightKind::Word,
                     Token::Whitespace(_) | Token::Newline | Token::Eof => return None,
@@ -2517,11 +2485,19 @@ mod tests {
     }
 
     #[test]
-    fn syntax_error_message_adds_bash_hints() {
-        let message = syntax_error_message("echo hi | wc -c > out.txt", "parse failed");
-        assert!(message.contains("Possible bash syntax issue"));
-        assert!(message.contains("bare '|' is shell syntax"));
-        assert!(message.contains("redirection is shell syntax"));
+    fn unsupported_shell_syntax_is_reported_without_generic_hints() {
+        // The old advisory-hint block guessed at bash constructs from raw text
+        // because the tokenizer accepted them silently. Now the parser names the
+        // exact construct, so the response needs no second-guessing layer.
+        let error = parse_command("echo hi > out.txt", cue_core::mode::Mode::Job)
+            .expect_err("redirection must be rejected");
+
+        assert_eq!(
+            error.kind,
+            crate::parser::ParseErrorKind::UnsupportedShellSyntax
+        );
+        assert!(error.to_string().contains("redirection"));
+        assert!(!error.to_string().contains("Possible bash syntax issue"));
     }
 
     #[test]

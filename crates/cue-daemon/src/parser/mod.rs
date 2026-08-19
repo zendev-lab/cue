@@ -18,6 +18,8 @@ mod tokenizer;
 use cue_core::mode::Mode;
 
 pub(crate) use parse::ParseError;
+#[cfg(test)]
+pub(crate) use parse::ParseErrorKind;
 pub(crate) use resolver::{ResolvedCommand, ResolvedScriptItem};
 pub(crate) use token::Token;
 pub(crate) use tokenizer::Tokenizer;

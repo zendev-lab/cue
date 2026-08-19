@@ -4,7 +4,7 @@
 //! - `(` immediately after a `Command` token → `ModeParenOpen`
 //! - `(` elsewhere → `GroupOpen`
 
-use super::token::{IdKind, Span, Spanned, Token, Value};
+use super::token::{IdKind, ShellSyntax, ShellSyntaxKind, Span, Spanned, Token, Value};
 
 /// Tokenizer state machine.
 pub struct Tokenizer<'a> {
@@ -203,7 +203,17 @@ impl<'a> Tokenizer<'a> {
 
             b'|' => self.tokenize_pipe_or_parallel()?,
 
-            _ => self.tokenize_word()?,
+            _ => {
+                // Unquoted bash syntax at a token boundary becomes its own
+                // token; a word only stops before it.
+                if let Some(syntax) = shell_syntax_at(self.bytes, self.pos) {
+                    self.pos += syntax.text.len();
+                    self.last_significant = Some(TokenClass::Other);
+                    Token::ShellSyntax(syntax)
+                } else {
+                    self.tokenize_word()?
+                }
+            }
         };
 
         if !matches!(tok, Token::Whitespace(_)) {
@@ -317,21 +327,26 @@ impl<'a> Tokenizer<'a> {
             return Ok(Token::Comma);
         }
 
-        // Quoted string (double quotes — escape sequences supported)
-        if self.bytes[self.pos] == b'"' {
-            return self.tokenize_quoted_string();
-        }
-        // Single-quoted string (literal — no escape sequences)
-        if self.bytes[self.pos] == b'\'' {
-            return self.tokenize_single_quoted_string();
-        }
+        // A word is the concatenation of raw runs and quoted segments, so
+        // shell-style adjacency holds: `--msg="a b"` is one argument, not two,
+        // and `a'b'c` is `abc`. Quotes are removed; the text they cover is
+        // exempt from operator and delimiter scanning.
+        let mut buf: Vec<u8> = Vec::new();
 
-        // Regular word: gobble until delimiter or operator.
-        while self.pos < self.bytes.len()
-            && !is_delimiter(self.bytes[self.pos])
-            && !(self.in_mode_params
-                && (self.bytes[self.pos] == b'=' || self.bytes[self.pos] == b','))
-        {
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+
+            if b == b'"' {
+                self.read_double_quoted(&mut buf)?;
+                continue;
+            }
+            if b == b'\'' {
+                self.read_single_quoted(&mut buf)?;
+                continue;
+            }
+            if self.word_run_ends_at(self.pos) {
+                break;
+            }
             // Stop before any cue-shell operator (longest-match-first).
             if let Some((token, boundary)) = starts_with_operator(self.bytes, self.pos) {
                 if boundary == OperatorBoundary::WhitespaceRequired
@@ -345,7 +360,22 @@ impl<'a> Tokenizer<'a> {
                 }
                 break;
             }
+            // Unquoted bash syntax becomes its own token so the parser can
+            // reject it in command position while raw-text builtins ignore it.
+            if shell_syntax_at(self.bytes, self.pos).is_some() {
+                break;
+            }
+
+            let run_start = self.pos;
             self.pos += 1;
+            while self.pos < self.bytes.len()
+                && !self.word_run_ends_at(self.pos)
+                && starts_with_operator(self.bytes, self.pos).is_none()
+                && shell_syntax_at(self.bytes, self.pos).is_none()
+            {
+                self.pos += 1;
+            }
+            buf.extend_from_slice(&self.bytes[run_start..self.pos]);
         }
 
         if self.pos == start {
@@ -357,7 +387,10 @@ impl<'a> Tokenizer<'a> {
             });
         }
 
-        let text = self.slice(start, self.pos).to_string();
+        let text = String::from_utf8(buf).map_err(|_| TokenizeError {
+            pos: start,
+            message: "invalid UTF-8 in word".into(),
+        })?;
         self.last_significant = Some(TokenClass::Other);
 
         if self.in_mode_params
@@ -367,6 +400,82 @@ impl<'a> Tokenizer<'a> {
         }
 
         Ok(Token::Word(text))
+    }
+
+    /// Tokenize a double-quoted segment, appending its literal bytes to `buf`.
+    ///
+    /// Escape sequences `\"`, `\\`, `\n`, `\t` are interpreted; any other
+    /// backslash pair is preserved verbatim so `"\$USER"` still reaches word
+    /// expansion as `\$USER`.
+    fn read_double_quoted(&mut self, buf: &mut Vec<u8>) -> Result<(), TokenizeError> {
+        let start = self.pos;
+        self.pos += 1; // skip opening quote
+        loop {
+            match self.advance() {
+                None => {
+                    return Err(TokenizeError {
+                        pos: start,
+                        message: "unterminated string".into(),
+                    });
+                }
+                Some(b'"') => break,
+                Some(b'\\') => match self.advance() {
+                    Some(b'"') => buf.push(b'"'),
+                    Some(b'\\') => buf.push(b'\\'),
+                    Some(b'n') => buf.push(b'\n'),
+                    Some(b't') => buf.push(b'\t'),
+                    Some(c) => {
+                        buf.push(b'\\');
+                        buf.push(c);
+                    }
+                    None => {
+                        return Err(TokenizeError {
+                            pos: self.pos,
+                            message: "unterminated escape".into(),
+                        });
+                    }
+                },
+                Some(c) => buf.push(c),
+            }
+        }
+        Ok(())
+    }
+
+    /// Tokenize a single-quoted segment, appending its literal bytes to `buf`.
+    ///
+    /// Single quotes capture everything literally until the closing `'`;
+    /// unlike double quotes there are no escape sequences.
+    fn read_single_quoted(&mut self, buf: &mut Vec<u8>) -> Result<(), TokenizeError> {
+        let start = self.pos;
+        self.pos += 1; // skip opening quote
+        loop {
+            match self.advance() {
+                None => {
+                    return Err(TokenizeError {
+                        pos: start,
+                        message: "unterminated single-quoted string".into(),
+                    });
+                }
+                Some(b'\'') => break,
+                Some(c) => buf.push(c),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether an unquoted word run must stop at `pos`.
+    ///
+    /// Quote bytes end a raw run so the outer word loop can consume the quoted
+    /// segment and continue appending to the same word.
+    fn word_run_ends_at(&self, pos: usize) -> bool {
+        let b = self.bytes[pos];
+        if b == b'"' || b == b'\'' {
+            return true;
+        }
+        if is_delimiter(b) {
+            return true;
+        }
+        self.in_mode_params && (b == b'=' || b == b',')
     }
 
     fn try_id_kind(&self) -> Option<IdKind> {
@@ -396,75 +505,6 @@ impl<'a> Tokenizer<'a> {
                 self.slice(start, end)
             ),
         }
-    }
-
-    fn tokenize_quoted_string(&mut self) -> Result<Token, TokenizeError> {
-        let start = self.pos;
-        self.pos += 1; // skip opening quote
-        let mut bytes: Vec<u8> = Vec::new();
-        loop {
-            match self.advance() {
-                None => {
-                    return Err(TokenizeError {
-                        pos: start,
-                        message: "unterminated string".into(),
-                    });
-                }
-                Some(b'"') => break,
-                Some(b'\\') => match self.advance() {
-                    Some(b'"') => bytes.push(b'"'),
-                    Some(b'\\') => bytes.push(b'\\'),
-                    Some(b'n') => bytes.push(b'\n'),
-                    Some(b't') => bytes.push(b'\t'),
-                    Some(c) => {
-                        bytes.push(b'\\');
-                        bytes.push(c);
-                    }
-                    None => {
-                        return Err(TokenizeError {
-                            pos: self.pos,
-                            message: "unterminated escape".into(),
-                        });
-                    }
-                },
-                Some(c) => bytes.push(c),
-            }
-        }
-        let s = String::from_utf8(bytes).map_err(|_| TokenizeError {
-            pos: start,
-            message: "invalid UTF-8 in string".into(),
-        })?;
-        self.last_significant = Some(TokenClass::Other);
-        Ok(Token::Word(s))
-    }
-
-    /// Tokenize a single-quoted string literal.
-    ///
-    /// Single quotes capture everything literally until the closing `'`.
-    /// Unlike double-quoted strings, there are no escape sequences.
-    /// Unmatched quotes produce a `TokenizeError`.
-    fn tokenize_single_quoted_string(&mut self) -> Result<Token, TokenizeError> {
-        let start = self.pos;
-        self.pos += 1; // skip opening quote
-        let mut bytes: Vec<u8> = Vec::new();
-        loop {
-            match self.advance() {
-                None => {
-                    return Err(TokenizeError {
-                        pos: start,
-                        message: "unterminated single-quoted string".into(),
-                    });
-                }
-                Some(b'\'') => break,
-                Some(c) => bytes.push(c),
-            }
-        }
-        let s = String::from_utf8(bytes).map_err(|_| TokenizeError {
-            pos: start,
-            message: "invalid UTF-8 in single-quoted string".into(),
-        })?;
-        self.last_significant = Some(TokenClass::Other);
-        Ok(Token::Word(s))
     }
 }
 
@@ -534,15 +574,53 @@ fn is_operator_boundary_after(bytes: &[u8], end: usize) -> bool {
     end >= bytes.len() || matches!(bytes[end], b' ' | b'\t' | b'\n' | b'\r')
 }
 
+/// Detect unquoted bash syntax at `pos`.
+///
+/// Before this check these bytes were neither delimiters nor operators, so they
+/// became ordinary argv elements: `wc -l > out.txt` ran `wc` with the literal
+/// arguments `>` and `out.txt`. Silently passing them on is the worst outcome
+/// for a caller that assumed bash, so they are tokenized separately and then
+/// rejected with the cue-shell equivalent.
+fn shell_syntax_at(bytes: &[u8], pos: usize) -> Option<ShellSyntax> {
+    use ShellSyntaxKind::{CommandSubstitution, Redirect, Semicolon};
+
+    let tail = &bytes[pos..];
+    // Longest match first so `2>>` is not reported as `2>`.
+    for (text, kind) in [
+        ("$(", CommandSubstitution),
+        ("2>>", Redirect),
+        ("&>>", Redirect),
+        ("1>>", Redirect),
+        ("1>", Redirect),
+        ("2>", Redirect),
+        ("&>", Redirect),
+        (">>", Redirect),
+        (">&", Redirect),
+        ("<<", Redirect),
+        (">", Redirect),
+        ("<", Redirect),
+        (";", Semicolon),
+        ("`", CommandSubstitution),
+    ] {
+        if tail.starts_with(text.as_bytes()) {
+            return Some(ShellSyntax { kind, text });
+        }
+    }
+    None
+}
+
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn is_delimiter(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b'"')
+    matches!(b, b' ' | b'\t' | b'\n' | b'(' | b')' | b'|')
+    // Note: quote bytes are NOT delimiters.  `word_run_ends_at` stops a raw run
+    // at a quote so the word loop can consume the quoted segment and keep
+    // appending to the same word; that is what makes `--msg="a b"` one argument.
     // Note: Comma is NOT a general delimiter.  It is part of words outside
-    // mode-params context.  Inside mode-params the while-loop condition
-    // explicitly stops at `,` so key=val pairs are split correctly.
+    // mode-params context.  Inside mode-params `word_run_ends_at` explicitly
+    // stops at `,` so key=val pairs are split correctly.
     // Note: `-` and `~` are NOT delimiters here.
     // The main tokenize loop handles `->` and `~>` as operators before
     // falling through to word tokenization, so `-` inside words (e.g. `--release`)
@@ -998,6 +1076,163 @@ mod tests {
         assert!(
             has_emoji_word,
             "emoji should survive mode param tokenization"
+        );
+    }
+
+    #[test]
+    fn quotes_join_adjacent_runs_into_one_word() {
+        // A quote is a lexical boundary, not an argument boundary: shell-style
+        // adjacency must hold so `--msg="a b"` stays a single argv element.
+        let toks = tokens(r#"cmd --msg="a b" "a b"c a'b'c pre"mid"post"#);
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("cmd".into()),
+                Token::Word("--msg=a b".into()),
+                Token::Word("a bc".into()),
+                Token::Word("abc".into()),
+                Token::Word("premidpost".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_segments_hide_operators_and_delimiters() {
+        // Text inside quotes is exempt from operator and delimiter scanning even
+        // when the word starts unquoted.
+        let toks = tokens(r#"cmd pre'a -> b'post x"y ||| z" 'a|b'"#);
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("cmd".into()),
+                Token::Word("prea -> bpost".into()),
+                Token::Word("xy ||| z".into()),
+                Token::Word("a|b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn mid_word_quotes_do_not_start_a_command() {
+        // `:` only introduces a builtin at the start of input, and a quoted
+        // segment must never be reinterpreted as one.
+        let toks = tokens(r#"echo a":wrap on"b"#);
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("a:wrap onb".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_mid_word_quotes_are_rejected() {
+        for input in [r#"echo a"b"#, "echo a'b"] {
+            let err = Tokenizer::tokenize(input).unwrap_err();
+            assert!(
+                err.message.contains("unterminated"),
+                "unexpected error for {input}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_param_values_support_quoted_segments() {
+        let toks = tokens(r#":run(cwd="/tmp/a b") cargo test"#);
+        assert_eq!(
+            toks,
+            vec![
+                Token::Command("run".into()),
+                Token::ModeParenOpen,
+                Token::Word("cwd".into()),
+                Token::ParamEq,
+                Token::Word("/tmp/a b".into()),
+                Token::ModeParenClose,
+                Token::Word("cargo".into()),
+                Token::Word("test".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_shell_syntax_becomes_its_own_token() {
+        // These bytes used to be swallowed into words and handed to exec as
+        // literal argv elements. They must now be visible to the parser.
+        let toks = tokens("wc -l > out.txt");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("wc".into()),
+                Token::Word("-l".into()),
+                Token::ShellSyntax(ShellSyntax {
+                    kind: ShellSyntaxKind::Redirect,
+                    text: ">",
+                }),
+                Token::Word("out.txt".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_syntax_is_matched_longest_first() {
+        let cases: &[(&str, &str, ShellSyntaxKind)] = &[
+            ("a 2>&1", "2>", ShellSyntaxKind::Redirect),
+            ("a 2>>log", "2>>", ShellSyntaxKind::Redirect),
+            ("a &>>log", "&>>", ShellSyntaxKind::Redirect),
+            ("a >>log", ">>", ShellSyntaxKind::Redirect),
+            ("a <in", "<", ShellSyntaxKind::Redirect),
+            ("a <<EOF", "<<", ShellSyntaxKind::Redirect),
+            ("a; b", ";", ShellSyntaxKind::Semicolon),
+            ("a $(b)", "$(", ShellSyntaxKind::CommandSubstitution),
+            ("a `b`", "`", ShellSyntaxKind::CommandSubstitution),
+        ];
+        for (input, text, kind) in cases {
+            let toks = tokens(input);
+            assert!(
+                toks.contains(&Token::ShellSyntax(ShellSyntax { kind: *kind, text })),
+                "expected {text} token for {input}, got {toks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_syntax_ends_an_adjacent_word() {
+        // `a>b` must not stay one opaque word; splitting it is what lets the
+        // parser explain the failure.
+        let toks = tokens("a>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::ShellSyntax(ShellSyntax {
+                    kind: ShellSyntaxKind::Redirect,
+                    text: ">",
+                }),
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_shell_syntax_stays_literal_data() {
+        let toks = tokens(r#"echo 'a; b' "c > d" 'e $(f)' "g `h`""#);
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("a; b".into()),
+                Token::Word("c > d".into()),
+                Token::Word("e $(f)".into()),
+                Token::Word("g `h`".into()),
+                Token::Eof,
+            ]
         );
     }
 

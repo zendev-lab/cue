@@ -61,6 +61,7 @@ enum Token {
     // Content
     Word(String),           // command arguments, filenames, flags
     IdRef(IdKind, u32),     // J1, C3
+    ShellSyntax(ShellSyntax), // unquoted bash syntax, recognized to reject
 
     // Whitespace (preserved for highlighting, stripped for parsing)
     Whitespace(String),
@@ -79,6 +80,26 @@ enum Value {
     Bool(bool),
 }
 ```
+
+### Word assembly and quoting
+
+A `Word` is the concatenation of unquoted runs and quoted segments, so shell
+adjacency holds: `--msg="a b"` is one argument, `a'b'c` is `abc`. Quotes are
+lexical boundaries, not argument boundaries, and are removed from the token.
+Double quotes interpret `\"`, `\\`, `\n`, `\t` and preserve any other backslash
+pair; single quotes are fully literal. Text inside quotes is exempt from
+operator, delimiter, and shell-syntax scanning, which is how `echo 'a; b'` and
+`echo "c > d"` pass metacharacters through as data.
+
+### Unquoted bash syntax
+
+cue-shell runs commands directly and never hands a command line to a shell, so
+`>`, `>>`, `<`, `2>`, `&>`, `>&`, `<<`, `;`, `$(`, and backticks cannot mean what
+bash would make them mean. They tokenize as `ShellSyntax` rather than being
+absorbed into words, and the parser rejects them wherever a command is expected
+with `ParseErrorKind::UnsupportedShellSyntax`, naming the construct and the
+cue-shell equivalent. Keeping them as a token instead of a tokenizer error lets
+raw-text builtins such as `:send` still carry those bytes as literal payload.
 
 ### `()` Disambiguation
 
@@ -179,7 +200,10 @@ parallel_op = "|||" | "|?|"
 pipe_op     = "|>" | "|&>" | "|!>"
 
 id_ref      = [JCS] DIGITS
-word        = <non-operator, non-special token>
+word        = (raw_run | quoted_segment)+
+raw_run     = <non-operator, non-delimiter, non-shell-syntax bytes>
+quoted_segment = "'" <literal bytes> "'"
+            | '"' <bytes with \" \\ \n \t escapes> '"'
 
 cron_expr   = schedule "do" chain
 schedule    = "every" DURATION
@@ -195,6 +219,10 @@ Notes:
   wrapped across lines naturally
 - resolver can therefore return either one normal command or one script command
   containing multiple resolved top-level items
+- adjacent raw runs and quoted segments form one `word`, so a quote never splits
+  an argument
+- unquoted shell syntax is not part of `word`; it becomes its own token and is
+  rejected in command position
 
 ## 6. Resolver
 
@@ -288,6 +316,7 @@ enum ParseErrorKind {
     UnmatchedParen,
     InvalidOperator,
     InvalidCronSchedule,
+    UnsupportedShellSyntax,
 }
 ```
 

@@ -54,6 +54,12 @@ pub enum Token {
     Word(String),
     /// An entity ID reference like J1 or C3.
     IdRef(IdKind, u32),
+    /// Unquoted bash syntax cue-shell does not interpret.
+    ///
+    /// Kept as a token rather than a tokenizer error so raw-text builtins such
+    /// as `:send` can still carry these bytes as literal payload; the parser
+    /// rejects it only where a command is expected.
+    ShellSyntax(ShellSyntax),
 
     // Whitespace (preserved for highlighting, skipped during parsing)
     Whitespace(String),
@@ -68,6 +74,74 @@ pub enum Token {
 pub enum IdKind {
     Job,
     Cron,
+}
+
+/// An unquoted bash construct cue-shell recognizes only to reject.
+///
+/// cue-shell never hands a command line to a shell, so these bytes cannot mean
+/// what bash would make them mean. Recognizing them explicitly is what turns a
+/// silently wrong argv into a diagnosable error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellSyntax {
+    pub kind: ShellSyntaxKind,
+    /// The exact operator text matched in the input.
+    pub text: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellSyntaxKind {
+    /// `>`, `>>`, `<`, `2>`, `&>`, `>&`, `<<`, ... — file/fd redirection.
+    Redirect,
+    /// `;` — command separator.
+    Semicolon,
+    /// `$(` or a backtick — command substitution.
+    CommandSubstitution,
+}
+
+impl ShellSyntax {
+    /// Human-readable name of the construct, for error messages.
+    pub fn label(self) -> &'static str {
+        match self.kind {
+            ShellSyntaxKind::Redirect => "redirection",
+            ShellSyntaxKind::Semicolon => "`;` command separator",
+            ShellSyntaxKind::CommandSubstitution => "command substitution",
+        }
+    }
+
+    /// The cue-shell equivalent, or why there is none.
+    pub fn hint(self) -> &'static str {
+        match self.kind {
+            ShellSyntaxKind::Redirect => {
+                "cue-shell runs commands directly instead of through a shell, so redirection would not be applied; pipe with `|>` / `|&>` / `|!>`, or let the command write the file itself"
+            }
+            ShellSyntaxKind::Semicolon => {
+                "use `->` to continue on success, `~>` to continue regardless, or `&&` / `||` to stay inside one job"
+            }
+            ShellSyntaxKind::CommandSubstitution => {
+                "command substitution needs a shell; run the inner command as its own job and pass its result explicitly"
+            }
+        }
+    }
+
+    /// Suggested rewrites offered alongside the parse error.
+    pub fn suggestions(self) -> Vec<String> {
+        match self.kind {
+            ShellSyntaxKind::Redirect => vec![
+                "producer |> consumer".into(),
+                "producer |&> consumer".into(),
+            ],
+            ShellSyntaxKind::Semicolon => {
+                vec!["first -> second".into(), "first ~> second".into()]
+            }
+            ShellSyntaxKind::CommandSubstitution => Vec::new(),
+        }
+    }
+}
+
+impl fmt::Display for ShellSyntax {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.text)
+    }
 }
 
 /// Typed value in mode-params.
@@ -127,6 +201,7 @@ impl fmt::Display for Token {
             Self::PipeStderr => f.write_str("|!>"),
             Self::Word(s) => write!(f, "{s}"),
             Self::IdRef(k, n) => write!(f, "{k}{n}"),
+            Self::ShellSyntax(s) => write!(f, "{s}"),
             Self::Whitespace(s) => write!(f, "{s}"),
             Self::Newline => f.write_str("\\n"),
             Self::Eof => f.write_str("<EOF>"),
