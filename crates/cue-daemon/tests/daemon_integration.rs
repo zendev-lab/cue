@@ -4608,6 +4608,134 @@ async fn test_job_command_expands_tilde_and_env_vars() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_quoted_word_segments_reach_argv_as_one_argument() {
+    run_daemon_test(async {
+        let env = TestEnv::new("quote-join");
+        let bin_dir = env.root.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create test bin dir");
+
+        let script_path = bin_dir.join("show-args.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\n",
+        )
+        .expect("write test script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("stat test script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod test script");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!(r#"{} --msg="a b" "c d"e f'g h'i"#, script_path.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert!(
+                    data.contains("[--msg=a b][c de][fg hi]"),
+                    "quoted segments must join into single argv elements, got {data:?}"
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unquoted_shell_syntax_is_rejected_before_spawning() {
+    run_daemon_test(async {
+        let env = TestEnv::new("shell-syntax");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        // Each of these previously spawned a process with the metacharacters as
+        // literal argv elements, so the caller saw success while nothing was
+        // redirected, separated, or substituted.
+        let cases = [
+            ("echo hi > out.txt", "redirection"),
+            ("echo hi 2>&1", "redirection"),
+            ("echo a ; echo b", "`;` command separator"),
+            ("echo $(date)", "command substitution"),
+        ];
+
+        let mut request_id = 1;
+        for (input, label) in cases {
+            let resp = roundtrip(
+                &mut stream,
+                request_id,
+                RequestPayload::Eval {
+                    input: input.into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await;
+            request_id += 1;
+
+            match resp {
+                ResponsePayload::Err { code, message } => {
+                    assert_eq!(code, ipc::error_code::INVALID_SYNTAX, "for {input}");
+                    assert!(
+                        message.contains(label),
+                        "error for {input} should name `{label}`, got {message:?}"
+                    );
+                }
+                other => panic!("expected rejection for {input}, got {other:?}"),
+            }
+        }
+
+        let jobs = roundtrip(
+            &mut stream,
+            request_id,
+            RequestPayload::ListJobs { limit: None },
+        )
+        .await;
+        match jobs {
+            ResponsePayload::Ok(OkPayload::JobListPage { jobs, .. }) => {
+                assert!(
+                    jobs.is_empty(),
+                    "rejected shell syntax must not create jobs, got {jobs:?}"
+                );
+            }
+            other => panic!("expected JobListPage, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_add_and_list() {
     run_daemon_test(async {
         let env = TestEnv::new("cron");

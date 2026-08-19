@@ -141,6 +141,18 @@ archive 是可逆的隐藏状态，不会删除 session 身份、scope cursor、
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
+引号是**词法边界，不是参数边界**：相邻的裸片段与引号片段拼成同一个 argv 元素，所以 `--msg="a b"` 是一个参数、`a'b'c` 是 `abc`。双引号解释 `\"` `\\` `\n` `\t`，其他反斜杠组合原样保留；单引号完全字面。引号内的文本不参与操作符、分隔符与 shell 语法扫描，因此 `echo 'a; b'`、`echo "c > d"` 可以把元字符当数据传下去。
+
+未加引号的 bash 语法会被**明确拒绝**，而不是当成普通 argv 元素：
+
+| 写法 | 拒绝理由与替代 |
+|---|---|
+| `>` `>>` `<` `2>` `2>>` `&>` `&>>` `1>` `>&` `<<` | cue-shell 直接 exec，不经 shell，重定向不会生效；用 `\|>` / `\|&>` / `\|!>` 管道，或让命令自己写文件 |
+| `;` | 用 `->`（成功继续）、`~>`（无论结果继续），或 `&&` / `\|\|` 留在同一个 job 内 |
+| `$(...)` / 反引号 | command substitution 需要 shell；把内层命令作为独立 job 运行并显式传递结果 |
+
+这些输入以前会静默降级：`wc -l > out.txt` 会真的执行 `wc`，只是把 `>` 和 `out.txt` 当成两个参数，调用方看到的是成功。现在它们在 parse 阶段失败并给出对应写法；需要原样传递时加引号。
+
 `cue-shell` 的文件脚本模式使用统一的 `.cue` 后缀，并通过显式 CLI 入口运行：
 
 ```text
