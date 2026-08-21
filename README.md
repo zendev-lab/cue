@@ -46,7 +46,15 @@ crates/
 ├── cue-daemon/ — Background daemon library plus `cue-daemon` / `cued` CLIs
 ├── cue-tui/    — Interactive TUI frontend plus `cue-tui` CLI
 ├── cue-cli/    — `cue` aggregator entrypoint for explicit namespaces and extensions
+skills/
+└── cue/        — Agent guidance maintained with cue-shell contracts
 ```
+
+## Agent skill
+
+[`skills/cue/SKILL.md`](skills/cue/SKILL.md) is the canonical agent-facing Cue
+Skill. cue-shell binaries do not load it; downstream products pin verified
+snapshots for their own hosts.
 
 ## Installation
 
