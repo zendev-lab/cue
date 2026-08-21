@@ -304,17 +304,12 @@ pub enum OkPayload {
         /// Daemon `cued` build version reported by the running daemon.
         version: String,
         /// Stable UUID for this daemon process. Changes after every restart.
-        /// Empty when talking to a daemon that predates instance IDs.
-        #[serde(default)]
         instance_id: String,
         /// Restart generation token. A planned successor must match the target
         /// generation preallocated in the restart intent.
-        #[serde(default)]
         generation_id: String,
         /// True only after startup restoration, exact restart fencing, and
-        /// scheduler execution activation have all completed. Missing means
-        /// true for compatibility with daemons predating startup fencing.
-        #[serde(default = "default_pong_ready")]
+        /// trigger execution activation have all completed.
         ready: bool,
         /// IPC protocol version implemented by the daemon.
         protocol_version: u32,
@@ -339,10 +334,6 @@ pub struct ResourceProviderInfo {
     pub active_reservations: usize,
     pub captured_at_ms: u64,
     pub units: Vec<ResourceUnit>,
-}
-
-fn default_pong_ready() -> bool {
-    true
 }
 
 // ── Events (cued → Client, pushed) ──
@@ -951,7 +942,7 @@ mod tests {
 
     #[test]
     fn pong_requires_version_field() {
-        let json = r#"{"Ok":{"Pong":{}}}"#;
+        let json = r#"{"Ok":{"Pong":{"instance_id":"instance-1","generation_id":"generation-1","ready":true,"protocol_version":3,"capabilities":[]}}}"#;
         let error = serde_json::from_str::<ResponsePayload>(json)
             .expect_err("Pong must carry a daemon version");
 
@@ -963,7 +954,7 @@ mod tests {
 
     #[test]
     fn pong_requires_protocol_version_field() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","capabilities":[]}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"instance-1","generation_id":"generation-1","ready":true,"capabilities":[]}}}"#;
         let error = serde_json::from_str::<ResponsePayload>(json)
             .expect_err("Pong must carry a protocol version");
 
@@ -977,7 +968,7 @@ mod tests {
 
     #[test]
     fn pong_requires_capabilities_field() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","protocol_version":2}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"instance-1","generation_id":"generation-1","ready":true,"protocol_version":3}}}"#;
         let error = serde_json::from_str::<ResponsePayload>(json)
             .expect_err("Pong must carry protocol capabilities");
 
@@ -988,40 +979,35 @@ mod tests {
     }
 
     #[test]
-    fn pong_decodes_legacy_payload_without_instance_id() {
-        let json = r#"{"type":"response","id":7,"payload":{"Ok":{"Pong":{"version":"0.1.0","protocol_version":3,"capabilities":["session-handshake-required"]}}}}"#;
-        let decoded: Message = serde_json::from_str(json).unwrap();
-
-        match decoded {
-            Message::Response {
-                id: 7,
-                payload:
-                    ResponsePayload::Ok(OkPayload::Pong {
-                        version,
-                        instance_id,
-                        generation_id,
-                        ready,
-                        protocol_version,
-                        capabilities,
-                    }),
-            } => {
-                assert_eq!(version, "0.1.0");
-                assert_eq!(instance_id, "");
-                assert_eq!(generation_id, "");
-                assert!(ready);
-                assert_eq!(protocol_version, IPC_PROTOCOL_VERSION);
-                assert_eq!(
-                    capabilities,
-                    vec![IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED.to_string()]
-                );
-            }
-            _ => panic!("wrong variant"),
+    fn pong_requires_runtime_identity_and_readiness_fields() {
+        for (missing, json) in [
+            (
+                "instance_id",
+                r#"{"Ok":{"Pong":{"version":"0.1.0","generation_id":"generation-1","ready":true,"protocol_version":3,"capabilities":[]}}}"#,
+            ),
+            (
+                "generation_id",
+                r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"instance-1","ready":true,"protocol_version":3,"capabilities":[]}}}"#,
+            ),
+            (
+                "ready",
+                r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"instance-1","generation_id":"generation-1","protocol_version":3,"capabilities":[]}}}"#,
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsePayload>(json)
+                .expect_err("Pong v3 fields must be required");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{missing}`")),
+                "wrong error for {missing}: {error}"
+            );
         }
     }
 
     #[test]
     fn pong_decodes_versioned_payload() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","protocol_version":3,"capabilities":["execution-v3","session-handshake-required","cancel-execution","operation-idempotency","graceful-restart","named-sessions","session-archive"]}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","ready":true,"protocol_version":3,"capabilities":["execution-v3","session-handshake-required","cancel-execution","operation-idempotency","graceful-restart","named-sessions","session-archive"]}}}"#;
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
             ResponsePayload::Ok(OkPayload::Pong {
