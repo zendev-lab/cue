@@ -285,7 +285,7 @@ impl<'a> Tokenizer<'a> {
             }
             _ => Err(TokenizeError {
                 pos: start,
-                message: "bare `|` is not a cue-shell pipe operator; use `|>` for stdout pipes, `|&>` for stdout+stderr, or quote `|` to pass it as an argument".into(),
+                message: "bare `|` is not a Cue pipe operator; use `|>` for stdout pipes, `|&>` for stdout+stderr, or quote `|` to pass it as an argument".into(),
             }),
         }
     }
@@ -347,7 +347,7 @@ impl<'a> Tokenizer<'a> {
             if self.word_run_ends_at(self.pos) {
                 break;
             }
-            // Stop before any cue-shell operator (longest-match-first).
+            // Stop before any Cue operator (longest-match-first).
             if let Some((token, boundary)) = starts_with_operator(self.bytes, self.pos) {
                 if boundary == OperatorBoundary::WhitespaceRequired
                     && !self.operator_has_required_whitespace(
@@ -508,7 +508,7 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-/// Check whether `bytes[pos..]` starts with a cue-shell operator.
+/// Check whether `bytes[pos..]` starts with a Cue operator.
 /// Operators are checked longest-match-first so longer operators are not split.
 fn starts_with_operator(bytes: &[u8], pos: usize) -> Option<(Token, OperatorBoundary)> {
     let tail = &bytes[pos..];
@@ -580,7 +580,7 @@ fn is_operator_boundary_after(bytes: &[u8], end: usize) -> bool {
 /// became ordinary argv elements: `wc -l > out.txt` ran `wc` with the literal
 /// arguments `>` and `out.txt`. Silently passing them on is the worst outcome
 /// for a caller that assumed bash, so they are tokenized separately and then
-/// rejected with the cue-shell equivalent.
+/// rejected with the Cue equivalent.
 fn shell_syntax_at(bytes: &[u8], pos: usize) -> Option<ShellSyntax> {
     use ShellSyntaxKind::{CommandSubstitution, Redirect, Semicolon};
 
@@ -757,13 +757,12 @@ mod tests {
             let err = Tokenizer::tokenize(input).unwrap_err();
             assert_eq!(err.pos, input.find('|').expect("test input has pipe"));
             assert!(
-                err.message
-                    .contains("bare `|` is not a cue-shell pipe operator"),
+                err.message.contains("bare `|` is not a Cue pipe operator"),
                 "unexpected error for {input}: {err}"
             );
             assert!(
                 err.message.contains("use `|>`"),
-                "error should point to cue-shell pipe syntax for {input}: {err}"
+                "error should point to Cue pipe syntax for {input}: {err}"
             );
         }
     }

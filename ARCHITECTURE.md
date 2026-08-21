@@ -1,23 +1,24 @@
-# cue-shell Architecture
+# Cue architecture
 
-cue-shell is a durable process substrate. The daemon owns process lifecycle,
-scope persistence, schedules, and event streams; clients are views and control
-surfaces over that same substrate.
+Cue is a persistent local execution runtime. The daemon accepts typed
+`ExecutionSpec` values and owns execution, session/scope, resource, process,
+PTY, schedule, output, idempotency, and persistence state. Language and UI are
+clients.
 
-Start with the design index:
-
-- [Design overview](docs/design/README.md)
-- [Conceptual model](docs/design/conceptual-model.md)
-- [Daemon architecture](docs/design/daemon-architecture.md)
-- [IPC protocol](docs/design/ipc-protocol.md)
-- [Commands and modes](docs/design/commands-and-modes.md)
-
-The short boundary is:
+The shortest contract is:
 
 ```text
-argv/cwd/env/stdin -> job_id, exit code, stdout/stderr, structured events, scope hash
+ExecutionSpec + session scope + launch context
+    -> ExecutionId + stable StepIds + state/events/output
 ```
 
-Agent runtime policy, workflow orchestration, backend lifecycle, and model
-selection belong above cue-shell. cue-shell keeps the process layer small,
-observable, and durable.
+Start with:
+
+- [Design index](docs/design/README.md)
+- [Core types](docs/design/core-types.md)
+- [Daemon architecture](docs/design/daemon-architecture.md)
+- [IPC v3](docs/design/ipc-protocol.md)
+- [Project direction](SPARK.md)
+
+Agent/workflow policy, approval, secrets, fleet coordination, and general DAG
+runtime semantics belong above Cue.

@@ -63,16 +63,16 @@ mod tests {
     #[test]
     fn display_path_abbreviates_home_prefix() {
         let home = Path::new("/home/tester");
-        let rendered = display_path_with_home(&home.join("cue-shell/client.toml"), Some(home));
+        let rendered = display_path_with_home(&home.join("cue/client.toml"), Some(home));
         assert_eq!(
             rendered,
-            format!("~/{}", Path::new("cue-shell/client.toml").display())
+            format!("~/{}", Path::new("cue/client.toml").display())
         )
     }
 
     #[test]
     fn display_path_keeps_absolute_path_without_home() {
-        let path = Path::new("/tmp/cue-shell/client.toml");
+        let path = Path::new("/tmp/cue/client.toml");
 
         assert_eq!(
             display_path_with_home(path, None),

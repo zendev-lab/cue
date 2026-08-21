@@ -1,4 +1,4 @@
-//! cue-daemon — background daemon for cue-shell.
+//! cue-daemon — background daemon for Cue.
 //!
 //! Public entry points are intentionally narrow: the daemon binary launcher,
 //! the gateway-stdio bridge used by integration tests, and version reporting.

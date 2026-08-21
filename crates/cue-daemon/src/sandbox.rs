@@ -848,7 +848,7 @@ mod tests {
             cue_core::JobId(424242),
             &config,
             Path::new("/tmp"),
-            &test_defaults(Path::new("/tmp/cue-shell-sandbox")),
+            &test_defaults(Path::new("/tmp/cue-sandbox")),
         )
         .expect_err("non-linux overlay should be unsupported");
         assert!(error.to_string().contains("only supported on Linux"));
@@ -865,7 +865,7 @@ mod tests {
             cue_core::JobId(424243),
             &config,
             Path::new("/tmp"),
-            &test_defaults(Path::new("/tmp/cue-shell-sandbox")),
+            &test_defaults(Path::new("/tmp/cue-sandbox")),
         )
         .expect_err("non-linux tmpfs overlay should be unsupported");
         assert!(error.to_string().contains("only supported on Linux"));

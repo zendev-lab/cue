@@ -113,7 +113,7 @@ Pros:
 - Small, familiar UX.
 - No plugin ABI.
 - No daemon trust boundary problem.
-- Extensions are just programs; cue-shell remains process substrate.
+- Extensions are just programs; Cue remains process substrate.
 
 Cons:
 
@@ -174,7 +174,7 @@ Open questions:
 - Persistence/state ownership.
 - Upgrade/reload semantics.
 - Event subscription permissions.
-- API stability across cue-shell versions.
+- API stability across Cue versions.
 
 This should not be the first step. It is a different product surface than CLI subcommand extension.
 
@@ -223,9 +223,9 @@ cargo test
   -> rtk cargo test
 ```
 
-Important constraints from cue-shell design:
+Important constraints from Cue design:
 
-- cue-shell should remain mechanism, not policy.
+- Cue should remain mechanism, not policy.
 - Native pipelines should preserve per-segment observability; no `sh -c` fallback.
 - Wrapping should be explicit and predictable; broad interception is risky.
 - Interactive commands should not be accidentally wrapped into unusable PTY behavior.
@@ -440,7 +440,7 @@ For now, basename allowlist is enough.
 
 Recommended invariant:
 
-> Wrapper decisions are per spawned process segment, after word expansion and before `tokio::process::Command::new`, without changing cue-shell's pipeline topology.
+> Wrapper decisions are per spawned process segment, after word expansion and before `tokio::process::Command::new`, without changing Cue's pipeline topology.
 
 That preserves native pipe observability:
 

@@ -1,143 +1,71 @@
-# Cue Shell — core type contracts
+# Core execution types
 
-This page records the domain model and invariants. It intentionally does not
-mirror Rust field definitions; the source of truth for concrete structs,
-serialization, and command metadata is the code:
+`cue-core` owns the language-neutral contract and pure execution reducer. It
+does not own tokenizer, parser, completion, highlighting, or an interactive
+command table.
 
-- Core IDs, jobs, crons, chains, scopes, resources, and IPC payloads:
-  `crates/cue-core/src/`
-- Scope schema: `crates/cue-core/src/scope.rs`
-- Execution plans and launch context: `crates/cue-core/src/execution.rs`
-- Spawn-adapter wire contract: `crates/cue-core/src/spawn_adapter.rs`
-- Command and mode-param metadata: `crates/cue-language/src/command_spec.rs`
-- Daemon scheduling/runtime state: `crates/cue-daemon/src/actor/`
-- Persistence schema/roundtrips: `crates/cue-daemon/src/storage.rs`
+## Identity
 
-## IDs
+- `ExecutionId`: one immutable submission, displayed as `E<n>`.
+- `StepId`: one process-bearing pipeline leaf, displayed as `E<n>/S<n>`.
+- `ScheduleId`: one trigger template, displayed as `C<n>`.
+- `ScopeHash`: a content-addressed environment and working-directory snapshot.
 
-User-facing IDs are compact display handles:
+Retries submit a new `ExecutionSpec` with `retry_of` pointing at the old ID.
+No API revives or rewrites a terminal execution.
 
-- Jobs: `J<n>`
-- Cron entries: `C<n>`
-- Chains: `CH<n>`
-- Script runs: `R<n>`
-- Scopes: `S@<short-content-hash>`
+## ExecutionSpec
 
-Use the concrete newtypes in `cue-core` when changing parsing, IPC, or storage.
-
-## Scopes
-
-A scope is an immutable, content-addressed snapshot. It carries the environment
-and working directory only. Logical client sessions own mutable scope cursors;
-`cwd=...` on `:run(...)` and `:cron(...)` derives child start scopes without
-moving the caller's session cursor.
-
-Rules:
-
-- Scope identity is content-addressed; equivalent snapshots share a hash.
-- Scope deltas point at a parent and inherit unspecified fields.
-- `:env set` and `:cd` advance only the current session cursor.
-- `cwd=...` launcher mode params derive a start scope for that job/cron only.
-- Resource needs, PTY choices, and sandbox settings are launch options, not
-  environment variables and not scope identity.
-
-Implementation references:
-
-- `crates/cue-core/src/scope.rs`
-- `crates/cue-daemon/src/actor/scope_store.rs`
-- `crates/cue-daemon/src/runtime_env.rs`
-
-## Jobs
-
-A job is a durable execution record created from one fixed start scope. Terminal
-jobs keep their observed exit status and, when scope mutation is enabled for a
-chain leaf, may also record an end scope.
-
-Lifecycle summary:
-
-```text
-Pending -> Running -> Done | Failed | Killed | Cancelled(reason)
+```rust
+struct ExecutionSpec {
+    plan: ExecutionPlan,
+    start_scope: Option<ScopeHash>,
+    launch_context: LaunchContext,
+    source: Option<SourceMetadata>,
+    retry_of: Option<ExecutionId>,
+}
 ```
 
-Rules:
+`LaunchContext` contains PTY preference, resource needs, optional workspace
+view, wrapper override, and an ephemeral SpawnAdapter handle. The adapter token
+is removed before persistence. A scheduled template may not contain one.
 
-- Jobs never move when a session cursor changes.
-- Output belongs to jobs; scripts/chains only aggregate job outcomes.
-- A missing process exit status is represented explicitly in code; do not infer
-  success from missing status.
+## ExecutionPlan
 
-Implementation references:
+The plan is a deliberately small tree:
 
-- `crates/cue-core/src/job.rs`
-- `crates/cue-daemon/src/actor/scheduler.rs`
-- `crates/cue-daemon/src/actor/process_mgr.rs`
+```rust
+enum ExecutionPlan {
+    Pipeline { pipeline: Pipeline },
+    OnSuccess { left, right },
+    OnFailure { left, right },
+    Always { left, right },
+    ParallelAll { branches },
+    AnySuccess { branches },
+    ContextDelta { delta },
+}
+```
 
-## Crons
+A `Pipeline` preserves exact argv segments, per-segment environment overrides,
+and pipe connections. Only process-bearing pipeline nodes receive public step
+IDs. Context deltas participate in reducer ordering without pretending to be
+processes.
 
-Cron entries are recurring factories for jobs. They capture the scope and mode
-settings needed to launch future jobs predictably.
+## State
 
-Rules:
+Execution state is:
 
-- `:cron(cwd=...)` stores cwd in the cron scope.
-- Restored legacy cron records may still carry a daemon-side cwd override; new
-  records should prefer captured start scopes.
-- Cron removal and job cancellation are separate lifecycle operations.
+- `queued`
+- `running`
+- `succeeded`
+- `failed`
+- `cancelled { user | forced }`
 
-Implementation references:
+Step state is queued, running, succeeded, failed with an exit/signal/spawn/
+infrastructure reason, or cancelled with an explicit reason. Conditional
+branches skipped by the reducer are terminal cancelled steps; they never become
+unowned shadow jobs.
 
-- `crates/cue-core/src/cron.rs`
-- `crates/cue-daemon/src/actor/scheduler.rs`
-- `crates/cue-daemon/src/actor/cron_schedule.rs`
-
-## Pipelines and chains
-
-Cue-shell has two composition layers:
-
-- **Pipeline**: process-level composition inside one job (`|>`, `|&>`, `|!>`).
-- **Chain**: job-level composition across jobs (`->`, `~>`, `|||`, `|?|`).
-
-Use the parser and pipeline modules as the source of truth for exact AST and
-operator semantics:
-
-- `crates/cue-core/src/pipeline.rs`
-- `crates/cue-daemon/src/parser/`
-- `docs/design/commands-and-modes.md`
-
-## Mode params and command metadata
-
-Mode params are execution metadata in the command prefix, not argv. The canonical
-support matrix is `crates/cue-core/src/command_spec.rs`; parser behavior and
-snapshot tests live under `crates/cue-daemon/src/parser/parse.rs`.
-
-Current design intent:
-
-- `cwd` is scope-affecting where supported; it derives a start scope without
-  moving the current session cursor.
-- Explicit PTY, resource needs, and sandbox settings are launch options for the
-  job request; they do not change scope hashes.
-- `need.<resource>` is provider-owned and currently accepted only for `:run`.
-- Sandbox mode params are currently accepted only for `:run`.
-- Unsupported mode params fail during parsing or command resolution instead of
-  being ignored.
-
-For user-facing command syntax, see `docs/design/commands-and-modes.md`.
-
-## Ephemeral spawn adapters
-
-An execution may carry a runtime-only local adapter handle. For each real
-pipeline segment, ProcessManager applies scope/environment and argv expansion,
-the workspace view, and the configured wrapper before it sends the final argv
-to the adapter. A rejection or unavailable adapter prevents that segment from
-spawning.
-
-After a spawned segment exits, is signalled, or fails to spawn, ProcessManager
-sends one settlement carrying a bounded diagnostic tail. Settlement transport
-failure preserves captured process output but turns the execution result into
-an infrastructure failure. Adapter endpoints must be private Unix sockets
-owned by the daemon UID and located directly in Cue's runtime adapter directory.
-Tokens are runtime-only and must never enter environment variables, events,
-logs, or persistent storage. Scheduled templates cannot carry adapter handles.
-
-The contract is intentionally policy-neutral: approval, sandbox providers, and
-provider-specific denial classification belong to the client-side broker.
+The reducer is the only owner of composition semantics. The daemon coordinator
+supplies node outcomes and performs the returned actions; it does not implement
+a second chain or script state machine.

@@ -230,14 +230,15 @@ fn parse_foreground_watch_args(
             }
             Some(value) => {
                 if id.replace(value.to_string()).is_some() {
-                    bail!("`cue-client fg watch` accepts exactly one job ID");
+                    bail!("`cue-client fg watch` accepts exactly one execution step ID");
                 }
             }
-            None => bail!("foreground job IDs must be valid UTF-8"),
+            None => bail!("foreground execution step IDs must be valid UTF-8"),
         }
     }
 
-    let id = id.ok_or_else(|| anyhow::anyhow!("`cue-client fg watch` expects one job ID"))?;
+    let id =
+        id.ok_or_else(|| anyhow::anyhow!("`cue-client fg watch` expects one execution step ID"))?;
     Ok(ForegroundCommand::Watch {
         id,
         session,
@@ -1081,13 +1082,13 @@ fn print_help() {
 
 fn print_foreground_help() {
     println!(
-        "cue-client fg\n\nUsage:\n  cue-client fg watch <Jid> [--session <name-or-id>] [--session-refresh] [--jsonl]\n\nCommands:\n  watch    Attach as a persistent read-only observer; exits when the job exits\n\nOutput:\n  default  Write the exact PTY snapshot and live output bytes to stdout; lifecycle status goes to stderr\n  --jsonl  Emit snapshot, output, control_changed, and exited records; byte fields use base64\n\nOptions:\n  --session <name-or-id>  Select a named session, overriding CUE_SESSION\n  --session-refresh       Explicitly recover a selected needs_refresh session\n  --jsonl                 Emit newline-delimited JSON records\n\nEnvironment:\n  CUE_SOCKET           Override the local daemon socket\n  CUE_SESSION          Default named-session selector\n  CUE_SESSION_REFRESH  Set to 1 to opt into the same restart recovery as --session-refresh"
+        "cue-client fg\n\nUsage:\n  cue-client fg watch <Eid/Sid> [--session <name-or-id>] [--session-refresh] [--jsonl]\n\nCommands:\n  watch    Attach as a persistent read-only observer; exits when the step exits\n\nOutput:\n  default  Write the exact PTY snapshot and live output bytes to stdout; lifecycle status goes to stderr\n  --jsonl  Emit snapshot, output, control_changed, and exited records; byte fields use base64\n\nOptions:\n  --session <name-or-id>  Select a named session, overriding CUE_SESSION\n  --session-refresh       Explicitly recover a selected needs_refresh session\n  --jsonl                 Emit newline-delimited JSON records\n\nEnvironment:\n  CUE_SOCKET           Override the local daemon socket\n  CUE_SESSION          Default named-session selector\n  CUE_SESSION_REFRESH  Set to 1 to opt into the same restart recovery as --session-refresh"
     );
 }
 
 fn print_session_help() {
     println!(
-        "cue-client session\n\nUsage:\n  cue-client session create <name> [--json]\n  cue-client session list [--archived | --all] [--json]\n  cue-client session archive <name-or-id> [--json]\n  cue-client session restore <name-or-id> [--json]\n  cue-client session attach <name-or-id> [--refresh] [--json]\n  cue-client session info <name-or-id> [--json]\n\nCommands:\n  create    Create a durable named session from the current scope\n  list      List active sessions by default, archived sessions, or both\n  archive   Reversibly hide an idle session from the default list\n  restore   Make an archived session active and attachable again\n  attach    Attach this control connection, print a probe result, then exit\n  info      Inspect a selected named session\n\nOptions:\n  --archived  List only archived sessions\n  --all       List active and archived sessions\n  --refresh   Explicitly replace a scope that could not survive daemon restart\n  --json      Emit authoritative session metadata as JSON\n\nArchive safety:\n  Archiving never deletes state and refuses sessions with connected clients, non-terminal work, pending scripts/chains, or owned crons. Restore before attaching.\n\nEnvironment:\n  CUE_SOCKET           Override the local daemon socket\n  CUE_SESSION          Session selector used by `cue-client run` before submission\n  CUE_SESSION_REFRESH  Set to 1 to let `cue-client run` recover a needs_refresh session"
+        "cue-client session\n\nUsage:\n  cue-client session create <name> [--json]\n  cue-client session list [--archived | --all] [--json]\n  cue-client session archive <name-or-id> [--json]\n  cue-client session restore <name-or-id> [--json]\n  cue-client session attach <name-or-id> [--refresh] [--json]\n  cue-client session info <name-or-id> [--json]\n\nCommands:\n  create    Create a durable named session from the current scope\n  list      List active sessions by default, archived sessions, or both\n  archive   Reversibly hide an idle session from the default list\n  restore   Make an archived session active and attachable again\n  attach    Attach this control connection, print a probe result, then exit\n  info      Inspect a selected named session\n\nOptions:\n  --archived  List only archived sessions\n  --all       List active and archived sessions\n  --refresh   Explicitly replace a scope that could not survive daemon restart\n  --json      Emit authoritative session metadata as JSON\n\nArchive safety:\n  Archiving never deletes state and refuses sessions with connected clients, non-terminal executions, or owned schedules. Restore before attaching.\n\nEnvironment:\n  CUE_SOCKET           Override the local daemon socket\n  CUE_SESSION          Session selector used by `cue-client run` before submission\n  CUE_SESSION_REFRESH  Set to 1 to let `cue-client run` recover a needs_refresh session"
     );
 }
 
@@ -1192,12 +1193,12 @@ mod tests {
                 OsString::from("--jsonl"),
                 OsString::from("--session"),
                 OsString::from("shared-bench"),
-                OsString::from("J42"),
+                OsString::from("E42/S1"),
                 OsString::from("--session-refresh"),
             ])
             .expect("parse persistent foreground watch"),
             ClientCommand::Foreground(ForegroundCommand::Watch {
-                id: "J42".into(),
+                id: "E42/S1".into(),
                 session: Some("shared-bench".into()),
                 session_refresh: true,
                 jsonl: true,
@@ -1212,14 +1213,14 @@ mod tests {
             OsString::from("fg"),
             OsString::from("watch"),
         ])
-        .expect_err("watch requires one job ID");
-        assert!(format!("{missing_id:#}").contains("expects one job ID"));
+        .expect_err("watch requires one execution step ID");
+        assert!(format!("{missing_id:#}").contains("expects one execution step ID"));
 
         let missing_session = parse_command([
             OsString::from("cue-client"),
             OsString::from("fg"),
             OsString::from("watch"),
-            OsString::from("J1"),
+            OsString::from("E1/S1"),
             OsString::from("--session"),
         ])
         .expect_err("--session requires its selector");
@@ -1229,11 +1230,11 @@ mod tests {
             OsString::from("cue-client"),
             OsString::from("fg"),
             OsString::from("watch"),
-            OsString::from("J1"),
-            OsString::from("J2"),
+            OsString::from("E1/S1"),
+            OsString::from("E2/S1"),
         ])
-        .expect_err("watch must select one job");
-        assert!(format!("{extra_id:#}").contains("exactly one job ID"));
+        .expect_err("watch must select one execution step");
+        assert!(format!("{extra_id:#}").contains("exactly one execution step ID"));
     }
 
     #[test]
@@ -1258,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_event_filter_requires_job_and_attachment_epoch() {
+    fn foreground_event_filter_requires_step_and_attachment_epoch() {
         let matched = matching_foreground_event(
             EventPayload::FgOutput {
                 id: step(7),

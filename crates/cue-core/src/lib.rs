@@ -1,4 +1,4 @@
-//! cue-core — shared types for the cue-shell ecosystem.
+//! cue-core — shared types for the Cue ecosystem.
 //!
 //! This crate defines the core domain types and pure scheduling primitives used
 //! by both the daemon (cued) and clients (cue-tui, cue-cli). It contains no

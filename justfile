@@ -72,7 +72,7 @@ pre-commit-uninstall:
 
 # Display project information
 info:
-    @echo "=== cue-shell ==="
+    @echo "=== Cue ==="
     @echo "Rust: $(rustc --version)"
     @echo "Cargo: $(cargo --version)"
     @echo ""

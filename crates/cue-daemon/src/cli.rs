@@ -255,7 +255,7 @@ fn cli() -> bpaf::OptionParser<Cli> {
     parser
         .to_options()
         .version(env!("CARGO_PKG_VERSION"))
-        .descr("cued — background daemon for cue-shell")
+        .descr("cued — background daemon for Cue")
 }
 
 pub(crate) fn run() -> i32 {
@@ -1037,7 +1037,7 @@ fn run_start_foreground(paths: DaemonRuntimePaths, clear_cancelled: bool) -> Res
     let _instance_lock = acquire_instance_lock(&paths.lock)?;
     ensure_not_running_with_pid_path(&paths.pid, &paths.socket)?;
     if paths.socket == crate::dirs::socket_path() {
-        crate::legacy_migration::prepare().context("prepare cue-shell legacy migration")?;
+        crate::legacy_migration::prepare().context("prepare Cue legacy migration")?;
     }
 
     let startup_restart = match prepare_foreground_startup(&paths.socket, clear_cancelled)? {
@@ -1103,7 +1103,7 @@ async fn async_main(
     let scope_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
     crate::legacy_migration::import_context(&scope_db)
-        .context("import cue-shell session and scope context")?;
+        .context("import Cue session and scope context")?;
     let scheduler_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
 

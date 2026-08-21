@@ -3,7 +3,7 @@ name = "cue-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "CLI entry point for cue-shell: command parsing, mode dispatch"
+description = "CLI entry point for Cue: command parsing, mode dispatch"
 repository.workspace = true
 license.workspace = true
 
@@ -24,11 +24,6 @@ required-features = ["cue-client"]
 name = "cue-tui"
 path = "src/bin/cue-tui.rs"
 required-features = ["cue-tui"]
-
-[[bin]]
-name = "cue-daemon"
-path = "src/bin/cue-daemon.rs"
-required-features = ["cue-daemon"]
 
 [[bin]]
 name = "cued"

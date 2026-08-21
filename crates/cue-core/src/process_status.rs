@@ -1,6 +1,6 @@
 use std::process::ExitStatus;
 
-/// Convert an OS child status into the numeric exit code cue-shell reports.
+/// Convert an OS child status into the numeric exit code Cue reports.
 ///
 /// Normal exit statuses keep their process-provided code. On Unix, signal
 /// termination follows the shell convention `128 + signal`. Rare platform

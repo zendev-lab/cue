@@ -345,19 +345,17 @@ mod tests {
             "remote",
             "devbox",
             "cued gateway --stdio",
-            "cued start --socket ~/.cache/cue-shell/remote.sock",
+            "cued start --socket ~/.cache/cue/remote.sock",
             &SharedStderr::default(),
             anyhow::anyhow!(
-                "connect to /run/user/1000/cue-shell/cued.sock: daemon socket not found; is cued running?"
+                "connect to /run/user/1000/cue/cued.sock: daemon socket not found; is cued running?"
             ),
         )
         .await;
 
         let message = format!("{error:#}");
         assert!(message.contains("Start it explicitly with"));
-        assert!(
-            message.contains("ssh devbox 'cued start --socket ~/.cache/cue-shell/remote.sock'")
-        );
+        assert!(message.contains("ssh devbox 'cued start --socket ~/.cache/cue/remote.sock'"));
         assert!(message.contains("daemon socket not found"));
     }
 

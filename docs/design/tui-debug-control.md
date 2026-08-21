@@ -96,7 +96,7 @@ The smoke launches `cue-tui --debug-socket` in a real PTY, drives the socket dir
 
 ## Rationale (zellij-inspired)
 
-Spark's native TUI validation uses zellij as an outer session manager: an external process launches a pane, sends keys, captures scrollback, and subscribes to pane updates. cue-shell needs the same capability without requiring zellij:
+Spark's native TUI validation uses zellij as an outer session manager: an external process launches a pane, sends keys, captures scrollback, and subscribes to pane updates. Cue needs the same capability without requiring zellij:
 
 1. **Harness launch** — run `cue-tui` in a real terminal with `--debug-socket`
 2. **Inject input** — `send-keys` / `write-chars` feed the TUI event loop

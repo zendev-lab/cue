@@ -48,7 +48,7 @@ pub enum ParseErrorKind {
     InvalidIdRef,
     UnmatchedParen,
     InvalidCronSchedule,
-    /// Unquoted bash syntax cue-shell does not interpret.
+    /// Unquoted bash syntax Cue does not interpret.
     UnsupportedShellSyntax,
 }
 
@@ -778,7 +778,7 @@ fn parse_env_assignment(word: &str) -> Option<(&str, &str)> {
 /// Reject unquoted bash syntax where a command is expected.
 ///
 /// These bytes used to become argv elements, which meant `wc -l > out.txt`
-/// silently ran `wc` with the literal arguments `>` and `out.txt`. cue-shell
+/// silently ran `wc` with the literal arguments `>` and `out.txt`. Cue
 /// runs commands directly and never consults a shell, so the only honest
 /// options are to interpret the construct or to say plainly that it is not
 /// interpreted.
@@ -786,7 +786,7 @@ fn unsupported_shell_syntax(syntax: ShellSyntax, span: Span) -> ParseError {
     ParseError {
         span,
         message: format!(
-            "{} `{}` is bash syntax that cue-shell does not interpret; {}. Quote it to pass it through as a literal argument.",
+            "{} `{}` is bash syntax that Cue does not interpret; {}. Quote it to pass it through as a literal argument.",
             syntax.label(),
             syntax.text,
             syntax.hint()
@@ -1304,10 +1304,7 @@ mod tests {
         let err = Parser::parse(":run echo hi | wc -c")
             .expect_err("bare shell pipe should not be accepted as a word");
 
-        assert!(
-            err.message
-                .contains("bare `|` is not a cue-shell pipe operator")
-        );
+        assert!(err.message.contains("bare `|` is not a Cue pipe operator"));
         assert!(err.message.contains("use `|>`"));
     }
 
