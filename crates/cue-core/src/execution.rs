@@ -5,7 +5,7 @@
 //! here so pipelines, conditions, parallel branches, and context changes do
 //! not grow independent state machines.
 
-use std::{error::Error, fmt, path::PathBuf};
+use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,7 @@ use crate::{
     pipeline::Pipeline,
     resource::Need,
     scope::EnvDelta,
+    spawn_adapter::SpawnAdapterHandle,
 };
 
 /// A typed, tree-shaped execution plan.
@@ -65,23 +66,6 @@ pub struct LaunchContext {
     /// Ephemeral per-execution spawn interception lease. Never persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_adapter: Option<SpawnAdapterHandle>,
-}
-
-/// Ephemeral local handle used to intercept process launch and settlement.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpawnAdapterHandle {
-    pub endpoint: PathBuf,
-    pub token: String,
-}
-
-impl fmt::Debug for SpawnAdapterHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SpawnAdapterHandle")
-            .field("endpoint", &self.endpoint)
-            .field("token", &"[REDACTED]")
-            .finish()
-    }
 }
 
 /// Optional compiler-provided source location for diagnostics and display.
@@ -1095,8 +1079,8 @@ mod tests {
     #[test]
     fn spawn_adapter_debug_redacts_token() {
         let handle = SpawnAdapterHandle {
-            endpoint: PathBuf::from("/run/user/1/cue/adapters/a.sock"),
-            token: "secret-token".into(),
+            endpoint: std::path::PathBuf::from("/run/user/1/cue/adapters/a.sock"),
+            token: crate::spawn_adapter::SecretToken::new("secret-token"),
         };
 
         let debug = format!("{handle:?}");

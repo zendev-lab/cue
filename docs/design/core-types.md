@@ -7,8 +7,9 @@ serialization, and command metadata is the code:
 - Core IDs, jobs, crons, chains, scopes, resources, and IPC payloads:
   `crates/cue-core/src/`
 - Scope schema: `crates/cue-core/src/scope.rs`
-- Job launch options: `crates/cue-core/src/job.rs`
-- Command and mode-param metadata: `crates/cue-core/src/command_spec.rs`
+- Execution plans and launch context: `crates/cue-core/src/execution.rs`
+- Spawn-adapter wire contract: `crates/cue-core/src/spawn_adapter.rs`
+- Command and mode-param metadata: `crates/cue-language/src/command_spec.rs`
 - Daemon scheduling/runtime state: `crates/cue-daemon/src/actor/`
 - Persistence schema/roundtrips: `crates/cue-daemon/src/storage.rs`
 
@@ -121,3 +122,22 @@ Current design intent:
   being ignored.
 
 For user-facing command syntax, see `docs/design/commands-and-modes.md`.
+
+## Ephemeral spawn adapters
+
+An execution may carry a runtime-only local adapter handle. For each real
+pipeline segment, ProcessManager applies scope/environment and argv expansion,
+the workspace view, and the configured wrapper before it sends the final argv
+to the adapter. A rejection or unavailable adapter prevents that segment from
+spawning.
+
+After a spawned segment exits, is signalled, or fails to spawn, ProcessManager
+sends one settlement carrying a bounded diagnostic tail. Settlement transport
+failure preserves captured process output but turns the execution result into
+an infrastructure failure. Adapter endpoints must be private Unix sockets
+owned by the daemon UID and located directly in Cue's runtime adapter directory.
+Tokens are runtime-only and must never enter environment variables, events,
+logs, or persistent storage. Scheduled templates cannot carry adapter handles.
+
+The contract is intentionally policy-neutral: approval, sandbox providers, and
+provider-specific denial classification belong to the client-side broker.

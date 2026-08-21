@@ -61,6 +61,11 @@ pub(crate) fn runtime_sandbox_dir() -> PathBuf {
     runtime_dir().join("sandbox")
 }
 
+/// Private directory where clients may create ephemeral spawn-adapter sockets.
+pub(crate) fn runtime_adapter_dir() -> PathBuf {
+    runtime_dir().join("adapters")
+}
+
 // ── Data dir (SQLite + output logs) ──
 
 /// `$XDG_DATA_HOME/cue-shell/` (fallback `~/.local/share/cue-shell/`).
@@ -155,6 +160,7 @@ pub fn ensure_dirs() -> Result<()> {
     let layout = DirectoryLayout {
         runtime: runtime_dir(),
         sandbox: runtime_sandbox_dir(),
+        adapters: runtime_adapter_dir(),
         data: data_dir()?,
         output: output_dir()?,
         state: state_dir()?,
@@ -166,6 +172,7 @@ pub fn ensure_dirs() -> Result<()> {
 struct DirectoryLayout {
     runtime: PathBuf,
     sandbox: PathBuf,
+    adapters: PathBuf,
     data: PathBuf,
     output: PathBuf,
     state: PathBuf,
@@ -176,6 +183,7 @@ fn ensure_layout(layout: &DirectoryLayout) -> Result<()> {
     for dir in [
         &layout.runtime,
         &layout.sandbox,
+        &layout.adapters,
         &layout.data,
         &layout.output,
         &layout.state,
@@ -478,6 +486,7 @@ mod tests {
         let layout = DirectoryLayout {
             runtime: root.join("runtime"),
             sandbox: root.join("runtime/sandbox"),
+            adapters: root.join("runtime/adapters"),
             data: root.join("data"),
             output: root.join("data/output"),
             state: root.join("state"),
@@ -486,6 +495,7 @@ mod tests {
         for dir in [
             &layout.runtime,
             &layout.sandbox,
+            &layout.adapters,
             &layout.data,
             &layout.output,
             &layout.state,

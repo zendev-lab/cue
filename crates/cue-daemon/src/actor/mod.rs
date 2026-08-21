@@ -119,6 +119,15 @@ pub(crate) struct ProcessJobOptions {
     pub direct_output_client: Option<u64>,
     /// Durable named-session owner for state and output event isolation.
     pub session_id: Option<String>,
+    /// Ephemeral per-execution launch interception. Never persisted.
+    pub spawn_adapter: Option<ProcessSpawnAdapter>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessSpawnAdapter {
+    pub handle: cue_core::SpawnAdapterHandle,
+    pub execution_id: cue_core::ExecutionId,
+    pub step_id: cue_core::StepId,
 }
 
 // ── Per-actor message types ──
