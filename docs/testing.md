@@ -34,11 +34,16 @@ important modules while implying that mutation testing is an active gate.
 
 ## Gates
 
-- `just check` runs Rust formatting and Clippy on the active toolchain.
+- `just check` runs Rust formatting and Clippy on the repository-pinned primary toolchain.
 - `just test` runs the workspace behavior suite.
 - `just msrv` compiles all targets with Rust 1.95 through rustup.
 - `just package-smoke` builds wheel and source distributions and exercises every installed command.
 - `just ci` is the serial local aggregate of those gates; hosted CI keeps independent lanes parallel.
+
+The primary toolchain is pinned in `rust-toolchain.toml` and advances through a dedicated Renovate
+change instead of making unrelated pull requests absorb a new stable compiler implicitly. Hosted CI
+also runs the Rust 1.95 MSRV check as its own job, so primary-toolchain and compatibility failures
+remain attributable to the lane that owns them.
 
 When reviewing a test, ask what observable regression becomes invisible if it is removed, whether a
 wording-only refactor would break it, whether fail-closed and recovery behavior have negative paths,
