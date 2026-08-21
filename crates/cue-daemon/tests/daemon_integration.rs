@@ -37,6 +37,10 @@ use cue_core::mode::Mode;
 
 /// Per-test timeout to prevent hangs.
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Restart tests include instrumented daemon shutdown and successor readiness.
+const RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(40);
+/// LLVM coverage flushes profile data while the predecessor process exits.
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// These integration tests spawn real daemons and child processes. Run them one
 /// at a time so the default Rust test harness does not create cross-test
@@ -44,11 +48,15 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 static DAEMON_TEST_PERMIT: Semaphore = Semaphore::const_new(1);
 
 async fn run_daemon_test(test: impl Future<Output = ()>) {
+    run_daemon_test_with_timeout(TEST_TIMEOUT, test).await;
+}
+
+async fn run_daemon_test_with_timeout(max_duration: Duration, test: impl Future<Output = ()>) {
     let _permit = DAEMON_TEST_PERMIT
         .acquire()
         .await
         .expect("daemon integration test permit is never closed");
-    timeout(TEST_TIMEOUT, test).await.expect("test timed out");
+    timeout(max_duration, test).await.expect("test timed out");
 }
 
 /// A self-contained test environment with unique dirs and socket.
@@ -990,7 +998,7 @@ async fn test_restart_refuses_unreachable_live_daemon_without_force_stopping_it(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_drains_active_job_rejects_late_admission_and_fences_successor() {
-    run_daemon_test(async {
+    run_daemon_test_with_timeout(RESTART_TEST_TIMEOUT, async {
         let env = TestEnv::new("graceful-restart");
         let marker = env.root.join("restart-marker");
         let script = env.root.join("finish-once.sh");
@@ -1064,7 +1072,7 @@ async fn test_restart_drains_active_job_rejects_late_admission_and_fences_succes
             other => panic!("late execution must be rejected, got {other:?}"),
         }
 
-        timeout(Duration::from_secs(8), child.wait())
+        timeout(RESTART_DRAIN_TIMEOUT, child.wait())
             .await
             .expect("predecessor did not exit after active job completed")
             .expect("wait for predecessor");
