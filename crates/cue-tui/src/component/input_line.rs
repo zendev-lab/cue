@@ -13,7 +13,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use cue_core::Mode;
+use cue_language::Mode;
 
 use super::Component;
 use crate::message::AppMsg;

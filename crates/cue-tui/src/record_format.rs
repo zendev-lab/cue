@@ -1,6 +1,6 @@
-use cue_core::Mode;
 use cue_core::cron::CronStatus;
 use cue_core::job::JobStatus;
+use cue_language::Mode;
 
 use crate::component::main_view::{Card, CardStatus};
 use crate::status_view;

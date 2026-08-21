@@ -7,16 +7,18 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::Mode;
 use cue_core::command::{ModeParams, ParamValue};
 use cue_core::execution::{ExecutionPlan, ExecutionSpec, LaunchContext, SourceMetadata};
 use cue_core::ipc::RequestPayload;
 use cue_core::job::{SandboxMode, SandboxSettings, SandboxUpper};
-use cue_core::mode::Mode;
-use cue_core::pipeline::{ChainNode, JobPlan, ParallelOp, SerialOp};
+use cue_core::pipeline::{PipeSegment as CorePipeSegment, Pipeline as CorePipeline};
 use cue_core::scope::EnvDelta;
 use cue_core::{ExecutionId, ScheduleId, StepId};
 
-use crate::{ParseError, ResolvedCommand, parse_command, parse_file_script_command};
+use crate::ast::{ChainNode, JobExpr, ParallelOp, Pipeline as AstPipeline, SerialOp};
+use crate::resolver::ResolvedCommand;
+use crate::{ParseError, parse_command, parse_file_script_command};
 
 #[derive(Debug, Clone)]
 pub enum CompiledCommand {
@@ -81,13 +83,15 @@ fn compile_resolved(
             let mut plans = Vec::with_capacity(items.len());
             let mut launch_context = None;
             for item in items {
-                let (plan, item_launch) = compile_script_item(*item.command)?;
+                let source = item.source;
+                let (plan, item_launch) = compile_script_item(*item.command).map_err(|error| {
+                    CompileError::Invalid(format!("invalid script item `{source}`: {error}"))
+                })?;
                 if let Some(existing) = &launch_context {
                     if existing != &item_launch {
-                        return Err(CompileError::Invalid(
-                            ".cue files require one shared launch context; split commands with different pty, resource, wrapper, or workspace-view settings into separate submissions"
-                                .into(),
-                        ));
+                        return Err(CompileError::Invalid(format!(
+                            ".cue files require one shared launch context; `{source}` differs from earlier items, so split commands with different pty, resource, wrapper, or workspace-view settings into separate submissions"
+                        )));
                     }
                 } else {
                     launch_context = Some(item_launch);
@@ -150,16 +154,9 @@ fn compile_resolved(
         ResolvedCommand::Crons => Ok(CompiledCommand::Daemon(RequestPayload::ListSchedules {
             limit: None,
         })),
-        ResolvedCommand::Scopes
-        | ResolvedCommand::ListScopes { .. }
-        | ResolvedCommand::Scope { subcommand: None } => {
+        ResolvedCommand::Scopes | ResolvedCommand::Scope { subcommand: None } => {
             Ok(CompiledCommand::Daemon(RequestPayload::ListScopes {
                 limit: None,
-            }))
-        }
-        ResolvedCommand::ShowEnv { tail_bytes } => {
-            Ok(CompiledCommand::Daemon(RequestPayload::ShowEnv {
-                tail_bytes,
             }))
         }
         ResolvedCommand::Config { subcommand }
@@ -170,11 +167,6 @@ fn compile_resolved(
         {
             Ok(CompiledCommand::Daemon(RequestPayload::ShowConfig {
                 tail_bytes: None,
-            }))
-        }
-        ResolvedCommand::ShowConfig { tail_bytes } => {
-            Ok(CompiledCommand::Daemon(RequestPayload::ShowConfig {
-                tail_bytes,
             }))
         }
         ResolvedCommand::Kill { id } => {
@@ -433,7 +425,7 @@ fn compile_run(
 
 fn compile_chain(node: ChainNode, scope_enabled: bool) -> Result<ExecutionPlan, CompileError> {
     match node {
-        ChainNode::Leaf(plan) => compile_job_plan(plan, scope_enabled),
+        ChainNode::Leaf(expression) => compile_job_expression(expression, scope_enabled),
         ChainNode::Serial { left, op, right } => {
             let left = Box::new(compile_chain(*left, scope_enabled)?);
             let right = Box::new(compile_chain(*right, scope_enabled)?);
@@ -455,9 +447,13 @@ fn compile_chain(node: ChainNode, scope_enabled: bool) -> Result<ExecutionPlan, 
     }
 }
 
-fn compile_job_plan(plan: JobPlan, scope_enabled: bool) -> Result<ExecutionPlan, CompileError> {
-    match plan {
-        JobPlan::Pipeline(pipeline) => {
+fn compile_job_expression(
+    expression: JobExpr,
+    scope_enabled: bool,
+) -> Result<ExecutionPlan, CompileError> {
+    match expression {
+        JobExpr::Pipeline(pipeline) => {
+            let pipeline = compile_pipeline(pipeline);
             if scope_enabled && pipeline.segments.len() == 1 {
                 let segment = &pipeline.segments[0];
                 if segment.env.is_empty()
@@ -469,14 +465,28 @@ fn compile_job_plan(plan: JobPlan, scope_enabled: bool) -> Result<ExecutionPlan,
             }
             Ok(ExecutionPlan::Pipeline { pipeline })
         }
-        JobPlan::And { left, right } => Ok(ExecutionPlan::OnSuccess {
-            left: Box::new(compile_job_plan(*left, scope_enabled)?),
-            right: Box::new(compile_job_plan(*right, scope_enabled)?),
+        JobExpr::And { left, right } => Ok(ExecutionPlan::OnSuccess {
+            left: Box::new(compile_job_expression(*left, scope_enabled)?),
+            right: Box::new(compile_job_expression(*right, scope_enabled)?),
         }),
-        JobPlan::Or { left, right } => Ok(ExecutionPlan::OnFailure {
-            left: Box::new(compile_job_plan(*left, scope_enabled)?),
-            right: Box::new(compile_job_plan(*right, scope_enabled)?),
+        JobExpr::Or { left, right } => Ok(ExecutionPlan::OnFailure {
+            left: Box::new(compile_job_expression(*left, scope_enabled)?),
+            right: Box::new(compile_job_expression(*right, scope_enabled)?),
         }),
+    }
+}
+
+fn compile_pipeline(pipeline: AstPipeline) -> CorePipeline {
+    CorePipeline {
+        segments: pipeline
+            .segments
+            .into_iter()
+            .map(|segment| CorePipeSegment {
+                env: segment.env,
+                command: segment.command,
+                pipe_to_next: segment.pipe_to_next,
+            })
+            .collect(),
     }
 }
 

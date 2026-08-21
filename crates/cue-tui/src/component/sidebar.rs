@@ -3,9 +3,9 @@
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use cue_core::Mode;
 use cue_core::cron::CronStatus;
 use cue_core::job::JobStatus;
+use cue_language::Mode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

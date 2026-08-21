@@ -50,8 +50,8 @@ pub(crate) fn inspect_card_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cue_core::Mode;
     use cue_core::job::CancelReason;
+    use cue_language::Mode;
 
     use crate::component::main_view::{Card, CardStatus};
 

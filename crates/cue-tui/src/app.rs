@@ -9,14 +9,14 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEv
 #[cfg(test)]
 use crossterm::event::{KeyEvent, MouseEvent};
 
+use cue_core::EventChannel;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     EventPayload, ExecutionInfo, ForegroundAttachmentInfo, ForegroundRole, JobOpenHint, OkPayload,
     RequestPayload, ResponsePayload, ScheduleInfo,
 };
 use cue_core::job::JobStatus;
-use cue_core::{EventChannel, Mode};
-use cue_language::{CompiledCommand, FrontendAction, compile_command, render_help};
+use cue_language::{CompiledCommand, FrontendAction, Mode, compile_command, render_help};
 use ratatui::layout::Rect;
 use tui_term::vt100;
 

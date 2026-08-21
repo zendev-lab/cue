@@ -1,19 +1,16 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-
-/// TUI input mode — determines the default command for bare input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+/// Frontend input mode — determines the language construct for bare input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Mode {
-    /// Primary work mode: bare input → `:run`
+    /// Primary execution mode: bare input compiles as `:run`.
     #[default]
     Job,
-    /// Scheduled work mode: bare input → `:cron`
+    /// Schedule mode: bare input compiles as `:cron`.
     Cron,
 }
 
 impl Mode {
-    /// Cycle to next mode (Shift+Tab).
     pub fn next(self) -> Self {
         match self {
             Self::Job => Self::Cron,
@@ -21,7 +18,6 @@ impl Mode {
         }
     }
 
-    /// Status bar indicator.
     pub fn indicator(self) -> &'static str {
         match self {
             Self::Job => "⚡ JOB",
@@ -29,7 +25,6 @@ impl Mode {
         }
     }
 
-    /// Default command name injected for bare input.
     pub fn default_command(self) -> &'static str {
         match self {
             Self::Job => "run",

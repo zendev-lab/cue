@@ -4,7 +4,7 @@
 //! by status (green=ok, red=error, yellow=pending/streaming).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
-use cue_core::Mode;
+use cue_language::Mode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};

@@ -1,6 +1,6 @@
-use cue_core::Mode;
 use cue_core::cron::CronStatus;
 use cue_core::job::JobStatus;
+use cue_language::Mode;
 use ratatui::layout::Rect;
 
 use crate::geometry::{centered_rect, inner_rect};

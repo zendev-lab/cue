@@ -1,4 +1,4 @@
-use cue_core::Mode;
+use cue_language::Mode;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSubmission {

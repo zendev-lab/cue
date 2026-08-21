@@ -3,8 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::Mode;
 use anyhow::Context;
-use cue_core::Mode;
 
 use crate::command_spec::command_names;
 

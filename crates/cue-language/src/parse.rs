@@ -23,9 +23,11 @@ use crate::command_spec::{
     CommandArgKind, CommandIdKind, CommandSpec, ModeParamSpec, ModeParamValueKind, command_spec,
     command_suggestions, mode_param_spec, mode_param_spec_for_command,
 };
-use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
+use cue_core::pipeline::PipeOp;
 
-use super::ast::{Argument, Ast, ChainNode, JobExpr, PipeSegment, Pipeline, ScriptItemAst};
+use super::ast::{
+    Argument, Ast, ChainNode, JobExpr, ParallelOp, PipeSegment, Pipeline, ScriptItemAst, SerialOp,
+};
 use super::token::{IdKind, ShellSyntax, Span, Spanned, Token, Value};
 use super::tokenizer::Tokenizer;
 

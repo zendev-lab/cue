@@ -4,38 +4,38 @@
 //! 1. Mode injection: BareInput → wraps with default command per mode
 //! 2. Argument type validation
 //! 3. Mode params merge with config defaults
-//! 4. AST → cue_core types conversion
+//! 4. Produce validated, language-owned execution syntax
 
+use crate::Mode;
 use cue_core::command::{ModeParams, ParamValue};
 use cue_core::cron::{
     CronPreset, CronSchedule, CrontabSchedule, parse_day_filter, parse_time_of_day,
 };
 use cue_core::ipc::ForegroundRole;
-use cue_core::mode::Mode;
-use cue_core::pipeline::{self as core_pipeline};
+use cue_core::pipeline::PipeOp;
 
-use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, JobExpr, Pipeline, ScriptItemAst};
+use super::ast::{
+    Argument, Ast, ChainNode, CronScheduleAst, JobExpr, ParallelOp, Pipeline, ScriptItemAst,
+    SerialOp,
+};
 use super::duration::parse_duration_str;
 use super::parse::{ParseError, ParseErrorKind};
 use super::token::{Span, Value};
 
 /// Resolved command ready for execution.
 #[derive(Debug, Clone)]
-pub enum ResolvedCommand {
+pub(crate) enum ResolvedCommand {
     /// One script submission containing one or more top-level commands.
-    Script {
-        mode: Mode,
-        items: Vec<ResolvedScriptItem>,
-    },
-    /// Run a chain of jobs.
+    Script { items: Vec<ResolvedScriptItem> },
+    /// Run a typed composition tree.
     Run {
-        chain: core_pipeline::ChainNode,
+        chain: ChainNode,
         params: ModeParams,
     },
-    /// Add a cron job.
+    /// Add a typed schedule template.
     Cron {
         schedule: CronSchedule,
-        chain: core_pipeline::ChainNode,
+        chain: ChainNode,
         params: ModeParams,
     },
     /// Kill a job/session.
@@ -73,12 +73,8 @@ pub enum ResolvedCommand {
     Providers,
     /// Show resource provider capacity snapshots.
     Resources,
-    /// List scopes with pagination metadata.
-    ListScopes { limit: Option<usize> },
     /// Environment operations.
     Env { subcommand: Option<String> },
-    /// Show current session environment with output limits.
-    ShowEnv { tail_bytes: Option<usize> },
     /// Change directory.
     Cd { path: String },
     /// Scope operations.
@@ -87,8 +83,6 @@ pub enum ResolvedCommand {
     Help { topic: Option<String> },
     /// Config operations.
     Config { subcommand: Option<String> },
-    /// Show config with output limits.
-    ShowConfig { tail_bytes: Option<usize> },
     /// Clear REPL.
     Clear,
     /// Quit.
@@ -98,7 +92,7 @@ pub enum ResolvedCommand {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedScriptItem {
+pub(crate) struct ResolvedScriptItem {
     pub source: String,
     pub command: Box<ResolvedCommand>,
 }
@@ -110,7 +104,6 @@ impl Resolver {
     pub(super) fn resolve(ast: Ast, mode: Mode) -> Result<ResolvedCommand, ParseError> {
         match ast {
             Ast::Script { items, .. } => Ok(ResolvedCommand::Script {
-                mode,
                 items: items
                     .into_iter()
                     .map(|item| Self::resolve_script_item(item, mode))
@@ -150,7 +143,7 @@ impl Resolver {
         match mode {
             Mode::Job => match argument {
                 Argument::Chain(chain) => Ok(ResolvedCommand::Run {
-                    chain: convert_chain(chain),
+                    chain,
                     params: ModeParams::new(),
                 }),
                 Argument::Empty => Err(ParseError {
@@ -180,10 +173,7 @@ impl Resolver {
 
         Ok(match name {
             "run" => match argument {
-                Argument::Chain(chain) => ResolvedCommand::Run {
-                    chain: convert_chain(chain),
-                    params,
-                },
+                Argument::Chain(chain) => ResolvedCommand::Run { chain, params },
                 _ => unreachable!("parser guarantees Chain for :run"),
             },
             "cron" | "schedule" => match argument {
@@ -201,7 +191,7 @@ impl Resolver {
                         })?;
                     ResolvedCommand::Cron {
                         schedule,
-                        chain: convert_chain(body),
+                        chain: body,
                         params,
                     }
                 }
@@ -281,52 +271,6 @@ impl Resolver {
             "restart" => ResolvedCommand::Restart,
             _ => unreachable!("parser rejects unknown commands"),
         })
-    }
-}
-
-// ── Conversion helpers ──
-
-fn convert_chain(node: ChainNode) -> core_pipeline::ChainNode {
-    match node {
-        ChainNode::Leaf(expr) => core_pipeline::ChainNode::Leaf(convert_job_expr(expr)),
-        ChainNode::Serial { op, left, right } => core_pipeline::ChainNode::Serial {
-            left: Box::new(convert_chain(*left)),
-            op,
-            right: Box::new(convert_chain(*right)),
-        },
-        ChainNode::Parallel { op, left, right } => core_pipeline::ChainNode::Parallel {
-            left: Box::new(convert_chain(*left)),
-            op,
-            right: Box::new(convert_chain(*right)),
-        },
-    }
-}
-
-fn convert_job_expr(expr: JobExpr) -> core_pipeline::JobPlan {
-    match expr {
-        JobExpr::Pipeline(p) => core_pipeline::JobPlan::Pipeline(convert_pipeline(p)),
-        JobExpr::And { left, right } => core_pipeline::JobPlan::And {
-            left: Box::new(convert_job_expr(*left)),
-            right: Box::new(convert_job_expr(*right)),
-        },
-        JobExpr::Or { left, right } => core_pipeline::JobPlan::Or {
-            left: Box::new(convert_job_expr(*left)),
-            right: Box::new(convert_job_expr(*right)),
-        },
-    }
-}
-
-fn convert_pipeline(p: Pipeline) -> core_pipeline::Pipeline {
-    core_pipeline::Pipeline {
-        segments: p
-            .segments
-            .into_iter()
-            .map(|s| core_pipeline::PipeSegment {
-                env: s.env,
-                command: s.command,
-                pipe_to_next: s.pipe_to_next,
-            })
-            .collect(),
     }
 }
 
@@ -449,15 +393,15 @@ fn chain_to_text(node: &ChainNode) -> String {
         ChainNode::Leaf(expr) => job_expr_to_text(expr),
         ChainNode::Serial { left, op, right } => {
             let op_str = match op {
-                core_pipeline::SerialOp::Then => "->",
-                core_pipeline::SerialOp::Always => "~>",
+                SerialOp::Then => "->",
+                SerialOp::Always => "~>",
             };
             format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
         }
         ChainNode::Parallel { left, op, right } => {
             let op_str = match op {
-                core_pipeline::ParallelOp::All => "|||",
-                core_pipeline::ParallelOp::Race => "|?|",
+                ParallelOp::All => "|||",
+                ParallelOp::Race => "|?|",
             };
             format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
         }
@@ -483,9 +427,9 @@ fn pipeline_to_text(pipeline: &Pipeline) -> String {
         .map(|s| {
             let cmd = s.command.join(" ");
             match s.pipe_to_next {
-                Some(core_pipeline::PipeOp::Stdout) => format!("{cmd} |>"),
-                Some(core_pipeline::PipeOp::StdoutStderr) => format!("{cmd} |&>"),
-                Some(core_pipeline::PipeOp::StderrOnly) => format!("{cmd} |!>"),
+                Some(PipeOp::Stdout) => format!("{cmd} |>"),
+                Some(PipeOp::StdoutStderr) => format!("{cmd} |&>"),
+                Some(PipeOp::StderrOnly) => format!("{cmd} |!>"),
                 None => cmd,
             }
         })
@@ -526,7 +470,7 @@ fn resolve_bare_cron(argument: Argument, span: Span) -> Result<ResolvedCommand, 
     })?;
     Ok(ResolvedCommand::Cron {
         schedule,
-        chain: convert_chain(body),
+        chain: body,
         params: ModeParams::new(),
     })
 }
@@ -753,7 +697,6 @@ mod tests {
 
     use crate::command_spec::{COMMAND_SPECS, CommandArgKind};
     use cue_core::cron::{DayFilter, Weekday};
-    use cue_core::pipeline::JobPlan;
 
     use super::super::parse::Parser as CueParser;
     use super::*;
@@ -768,9 +711,9 @@ mod tests {
         Resolver::resolve(ast, Mode::Job).unwrap()
     }
 
-    fn leaf_pipeline(chain: core_pipeline::ChainNode) -> core_pipeline::Pipeline {
+    fn leaf_pipeline(chain: ChainNode) -> Pipeline {
         match chain {
-            core_pipeline::ChainNode::Leaf(JobPlan::Pipeline(pipeline)) => pipeline,
+            ChainNode::Leaf(JobExpr::Pipeline(pipeline)) => pipeline,
             other => panic!("expected leaf pipeline, got {other:?}"),
         }
     }
@@ -874,7 +817,7 @@ mod tests {
                 assert_eq!(schedule, CronSchedule::Interval(Duration::from_secs(300)));
                 assert!(params.is_empty());
                 match chain {
-                    core_pipeline::ChainNode::Serial { left, right, .. } => {
+                    ChainNode::Serial { left, right, .. } => {
                         let pipeline = leaf_pipeline(*left);
                         assert_eq!(pipeline.segments[0].command, vec!["cargo", "test"]);
                         let pipeline = leaf_pipeline(*right);
