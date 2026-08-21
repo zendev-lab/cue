@@ -13,6 +13,7 @@ use crate::event_channel::EventChannel;
 use crate::execution::{CancelMode, ExecutionSpec, ExecutionState, StepState};
 use crate::id::{ExecutionId, ScheduleId, ScopeHash, StepId};
 use crate::job::JobStatus;
+use crate::resource::ResourceUnit;
 use crate::scope::EnvDelta;
 
 /// IPC protocol version required by sessionized clients.
@@ -216,6 +217,8 @@ pub enum RequestPayload {
     ListScopes {
         limit: Option<usize>,
     },
+    /// Inspect provider routing, current capacity, and active reservations.
+    ListResources {},
     CancelExecution {
         id: ExecutionId,
         mode: CancelMode,
@@ -325,6 +328,7 @@ pub enum OkPayload {
         scopes: Vec<ScopeInfo>,
         page: PageInfo,
     },
+    ResourceList(Vec<ResourceProviderInfo>),
     SessionInfo(Box<SessionInfo>),
     SessionList(Vec<SessionInfo>),
     ScriptInfo(ScriptInfo),
@@ -401,6 +405,16 @@ pub enum OkPayload {
         /// Exact generation token the successor must advertise in Pong.
         target_generation: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceProviderInfo {
+    pub id: String,
+    pub keys: Vec<String>,
+    pub active_reservations: usize,
+    pub captured_at_ms: u64,
+    pub units: Vec<ResourceUnit>,
 }
 
 fn default_pong_ready() -> bool {

@@ -997,7 +997,7 @@ fn unsupported_capability_message(capability: &'static str) -> String {
     }
 }
 
-const APP_DIR: &str = "cue-shell";
+const APP_DIR: &str = "cue";
 static PROCESS_SESSION_ID: OnceLock<String> = OnceLock::new();
 
 #[doc(hidden)]

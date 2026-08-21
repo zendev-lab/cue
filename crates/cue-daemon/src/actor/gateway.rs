@@ -882,6 +882,48 @@ async fn route_request(
             .await?;
         }
 
+        RequestPayload::ListResources {} => {
+            if current_binding(sys, client_id).await?.is_none() {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            }
+            let routes = sys.resources.key_routes();
+            let reservations: std::collections::BTreeMap<_, _> = sys
+                .resources
+                .active_reservation_counts()
+                .into_iter()
+                .collect();
+            let providers = sys
+                .resources
+                .snapshot()
+                .into_iter()
+                .map(|(id, snapshot)| cue_core::ipc::ResourceProviderInfo {
+                    keys: routes
+                        .iter()
+                        .filter_map(|(key, provider)| (provider == &id).then_some(key.clone()))
+                        .collect(),
+                    active_reservations: reservations.get(&id).copied().unwrap_or(0),
+                    captured_at_ms: snapshot
+                        .captured_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    units: snapshot.units,
+                    id: id.to_string(),
+                })
+                .collect();
+            send_typed_response(
+                sys,
+                client_id,
+                request_id,
+                ResponsePayload::Ok(OkPayload::ResourceList(providers)),
+                "send typed resource list response",
+            )
+            .await?;
+        }
+
         RequestPayload::SubmitExecution { spec } => {
             if lifecycle.execution_admission_closed() {
                 sys.gateway

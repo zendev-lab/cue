@@ -12,10 +12,6 @@ autobins = false
 name = "cued"
 path = "src/main.rs"
 
-[[bin]]
-name = "cue-daemon"
-path = "src/bin/cue-daemon.rs"
-
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true

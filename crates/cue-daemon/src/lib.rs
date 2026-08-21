@@ -9,6 +9,7 @@ pub(crate) mod command_util;
 mod config;
 mod dirs;
 mod gateway_stdio;
+mod legacy_migration;
 mod lifecycle;
 mod pty;
 mod resource;
