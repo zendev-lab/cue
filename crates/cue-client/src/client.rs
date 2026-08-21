@@ -189,6 +189,16 @@ impl CuedClient {
         self.send(RequestPayload::FgWatch { id: id.into() }).await
     }
 
+    /// Acquire the controller lease for a typed execution step.
+    pub async fn step_attach(&mut self, id: cue_core::StepId) -> Result<u32> {
+        self.send(RequestPayload::StepAttach { id }).await
+    }
+
+    /// Observe a typed execution step without taking its controller lease.
+    pub async fn step_watch(&mut self, id: cue_core::StepId) -> Result<u32> {
+        self.send(RequestPayload::StepWatch { id }).await
+    }
+
     /// Claim the free controller lease for the currently watched job.
     pub async fn fg_claim_control(&mut self) -> Result<u32> {
         self.send(RequestPayload::FgClaimControl {}).await
@@ -232,6 +242,16 @@ impl CuedClient {
     ) -> Result<ForegroundAttachmentInfo> {
         let request_id = self.fg_watch(id).await?;
         self.wait_for_foreground_attachment(request_id, "watch foreground")
+            .await
+    }
+
+    /// Watch a typed execution step and return its atomic snapshot.
+    pub async fn step_watch_roundtrip(
+        &mut self,
+        id: cue_core::StepId,
+    ) -> Result<ForegroundAttachmentInfo> {
+        let request_id = self.step_watch(id).await?;
+        self.wait_for_foreground_attachment(request_id, "watch execution step")
             .await
     }
 
@@ -1477,6 +1497,7 @@ mod tests {
                     ready: true,
                     protocol_version: IPC_PROTOCOL_VERSION,
                     capabilities: vec![
+                        IPC_CAPABILITY_EXECUTION_V3.into(),
                         IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED.into(),
                         IPC_CAPABILITY_FOREGROUND_OBSERVERS.into(),
                     ],
