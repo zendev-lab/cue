@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,9 @@ pub struct Pipeline {
 /// One process in a pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipeSegment {
+    /// Environment overrides applied only to this process segment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     /// Command words, e.g. `["cargo", "test", "--release"]`.
     pub command: Vec<String>,
     /// How this segment's output connects to the next (None for last segment).
@@ -98,6 +102,7 @@ impl Pipeline {
     pub fn simple(command: Vec<String>) -> Self {
         Self {
             segments: vec![PipeSegment {
+                env: BTreeMap::new(),
                 command,
                 pipe_to_next: None,
             }],
@@ -140,6 +145,9 @@ impl fmt::Display for Pipeline {
                 f.write_str(" ")?;
             }
 
+            for (key, value) in &segment.env {
+                write!(f, "{key}={value} ")?;
+            }
             let cmd = segment.command.join(" ");
             match segment.pipe_to_next {
                 Some(op) => write!(f, "{cmd} {op}")?,
@@ -258,6 +266,23 @@ mod tests {
     }
 
     #[test]
+    fn segment_environment_roundtrips_and_defaults_for_existing_specs() {
+        let existing: PipeSegment =
+            serde_json::from_str(r#"{"command":["echo","ok"],"pipe_to_next":null}"#)
+                .expect("decode pre-assignment segment");
+        assert!(existing.env.is_empty());
+
+        let segment = PipeSegment {
+            env: BTreeMap::from([("FOO".into(), "bar".into())]),
+            command: vec!["printenv".into(), "FOO".into()],
+            pipe_to_next: None,
+        };
+        let encoded = serde_json::to_string(&segment).expect("encode segment environment");
+        let decoded: PipeSegment = serde_json::from_str(&encoded).expect("decode environment");
+        assert_eq!(decoded, segment);
+    }
+
+    #[test]
     fn chain_leaf_count() {
         let a = ChainNode::Leaf(JobPlan::simple(vec!["a".into()]));
         let b = ChainNode::Leaf(JobPlan::simple(vec!["b".into()]));
@@ -304,14 +329,17 @@ mod tests {
         let pipeline = Pipeline {
             segments: vec![
                 PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["printf".into(), "hi".into()],
                     pipe_to_next: Some(PipeOp::Stdout),
                 },
                 PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["grep".into(), "h".into()],
                     pipe_to_next: Some(PipeOp::StderrOnly),
                 },
                 PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["wc".into(), "-l".into()],
                     pipe_to_next: None,
                 },

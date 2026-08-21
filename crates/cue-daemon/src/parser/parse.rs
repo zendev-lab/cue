@@ -10,12 +10,14 @@
 //! parallel    = job_expr (parallel_op job_expr)*
 //! job_expr    = pipeline (("&&" | "||") pipeline)*
 //! pipeline    = atom (pipe_op atom)*
-//! atom        = "(" chain ")" | word+
+//! atom        = "(" chain ")" | assignment* word+
 //!
 //! serial_op   = "->" | "~>"
 //! parallel_op = "|||" | "|?|"
 //! pipe_op     = "|>" | "|&>" | "|!>"
 //! ```
+
+use std::collections::BTreeMap;
 
 use cue_core::command_spec::{
     CommandArgKind, CommandIdKind, CommandSpec, ModeParamSpec, ModeParamValueKind, command_spec,
@@ -656,17 +658,15 @@ impl<'a> Parser<'a> {
                     if current_words.is_empty() {
                         break;
                     }
-                    segments.push(PipeSegment {
-                        command: current_words,
-                        pipe_to_next: None,
-                    });
+                    segments.push(pipe_segment(current_words, None, self.peek_span())?);
                     break;
                 }
             };
-            segments.push(PipeSegment {
-                command: current_words,
-                pipe_to_next: Some(pipe_op),
-            });
+            segments.push(pipe_segment(
+                current_words,
+                Some(pipe_op),
+                self.peek_span(),
+            )?);
             self.advance(); // consume pipe op
             current_words = self.parse_atom_words()?;
         }
@@ -728,6 +728,51 @@ impl<'a> Parser<'a> {
         }
         Ok(words)
     }
+}
+
+fn pipe_segment(
+    words: Vec<String>,
+    pipe_to_next: Option<PipeOp>,
+    span: Span,
+) -> Result<PipeSegment, ParseError> {
+    let assignment_count = words
+        .iter()
+        .take_while(|word| parse_env_assignment(word).is_some())
+        .count();
+    let mut env = BTreeMap::new();
+    for assignment in &words[..assignment_count] {
+        let (name, value) = parse_env_assignment(assignment)
+            .expect("assignment prefix was counted only after validation");
+        env.insert(name.to_string(), value.to_string());
+    }
+    let command = words[assignment_count..].to_vec();
+
+    if !env.is_empty() && command.is_empty() {
+        return Err(ParseError {
+            span,
+            message: "environment assignments must be followed by a command".into(),
+            kind: ParseErrorKind::MissingArgument,
+            suggestions: vec!["VAR=value command".into()],
+        });
+    }
+
+    Ok(PipeSegment {
+        env,
+        command,
+        pipe_to_next,
+    })
+}
+
+fn parse_env_assignment(word: &str) -> Option<(&str, &str)> {
+    let (name, value) = word.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some((name, value))
 }
 
 /// Reject unquoted bash syntax where a command is expected.
@@ -1206,6 +1251,52 @@ mod tests {
             },
             _ => panic!("expected Command"),
         }
+    }
+
+    #[test]
+    fn parse_environment_assignments_per_pipeline_segment() {
+        let ast = Parser::parse(
+            r#":run FOO=one EMPTY= MSG="hello world" printenv FOO |> BAR=$HOME printenv BAR"#,
+        )
+        .unwrap();
+        let Ast::Command { argument, .. } = ast else {
+            panic!("expected command");
+        };
+        let Argument::Chain(chain) = argument else {
+            panic!("expected chain");
+        };
+        let pipeline = leaf_pipeline(&chain);
+        assert_eq!(pipeline.segments[0].env.get("FOO"), Some(&"one".into()));
+        assert_eq!(pipeline.segments[0].env.get("EMPTY"), Some(&String::new()));
+        assert_eq!(
+            pipeline.segments[0].env.get("MSG"),
+            Some(&"hello world".into())
+        );
+        assert_eq!(pipeline.segments[0].command, vec!["printenv", "FOO"]);
+        assert_eq!(pipeline.segments[1].env.get("BAR"), Some(&"$HOME".into()));
+        assert_eq!(pipeline.segments[1].command, vec!["printenv", "BAR"]);
+    }
+
+    #[test]
+    fn parse_rejects_assignment_without_command() {
+        let error = Parser::parse(":run FOO=one BAR=two")
+            .expect_err("assignment-only input must not create an empty command");
+        assert_eq!(error.kind, ParseErrorKind::MissingArgument);
+        assert!(error.message.contains("followed by a command"));
+    }
+
+    #[test]
+    fn parse_keeps_assignment_shaped_arguments_after_command() {
+        let ast = Parser::parse(":run echo FOO=one").unwrap();
+        let Ast::Command { argument, .. } = ast else {
+            panic!("expected command");
+        };
+        let Argument::Chain(chain) = argument else {
+            panic!("expected chain");
+        };
+        let pipeline = leaf_pipeline(&chain);
+        assert!(pipeline.segments[0].env.is_empty());
+        assert_eq!(pipeline.segments[0].command, vec!["echo", "FOO=one"]);
     }
 
     #[test]

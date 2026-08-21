@@ -48,6 +48,7 @@ Example:
 ```cue
 # comments are ignored
 cargo fmt --check
+RUST_LOG=debug cargo test -p cue-core
 cargo test -> cargo clippy
 :run(pty=false) cat Cargo.toml |> wc -l
 :cron in 5m cargo test
@@ -68,6 +69,9 @@ v1 file-specific lexical rules:
 - `#` inside quoted words is part of the word, not a comment.
 - Bare non-`:` items are resolved as `:run <item>` in JOB mode while preserving
   the original source text for `R<n>` script metadata.
+- A command may start with one or more `VAR=value` assignments. They apply only
+  to that command's process segment and do not mutate the script or session
+  scope; use `env set` when later top-level items should inherit a value.
 - Newline separates top-level items only when the current chain is syntactically
   complete.
 - Newline inside an unfinished chain is formatting whitespace.

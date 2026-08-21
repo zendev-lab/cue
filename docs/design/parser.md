@@ -157,6 +157,7 @@ struct Pipeline {
 }
 
 struct PipeSegment {
+    env: BTreeMap<String, String>, // process-local prefix assignments
     command: Vec<String>,        // ["cargo", "test", "--release"]
     pipe_to_next: Option<PipeOp>,
 }
@@ -193,7 +194,7 @@ parallel    = job_expr (parallel_op job_expr)*
 job_expr    = pipeline (("&&" | "||") pipeline)*
 pipeline    = atom (pipe_op atom)*
 atom        = "(" chain ")"
-            | word+
+            | assignment* word+
 
 serial_op   = "->" | "~>"
 parallel_op = "|||" | "|?|"
@@ -201,6 +202,8 @@ pipe_op     = "|>" | "|&>" | "|!>"
 
 id_ref      = [JCS] DIGITS
 word        = (raw_run | quoted_segment)+
+assignment  = env_name "=" word?
+env_name    = (ALPHA | "_") (ALPHA | DIGIT | "_")*
 raw_run     = <non-operator, non-delimiter, non-shell-syntax bytes>
 quoted_segment = "'" <literal bytes> "'"
             | '"' <bytes with \" \\ \n \t escapes> '"'
@@ -221,6 +224,10 @@ Notes:
   containing multiple resolved top-level items
 - adjacent raw runs and quoted segments form one `word`, so a quote never splits
   an argument
+- leading `VAR=value` words are typed process-local environment overrides for
+  that pipeline segment; later segments and the session scope are unchanged
+- assignment values use the same tilde and environment expansion as command
+  words, and an assignment-only segment is rejected because it has no process
 - unquoted shell syntax is not part of `word`; it becomes its own token and is
   rejected in command position
 
