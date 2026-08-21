@@ -1040,6 +1040,12 @@ struct ExpandedSegment {
     pipe_to_next: Option<cue_core::pipeline::PipeOp>,
 }
 
+struct PreparedSpawn {
+    program: String,
+    args: Vec<String>,
+    command: tokio::process::Command,
+}
+
 fn expand_pipeline_segments(
     job_id: JobId,
     pipeline: &cue_core::pipeline::Pipeline,
@@ -1087,6 +1093,46 @@ fn configure_command(
     cmd.env("PWD", &cwd);
     cmd.current_dir(cwd);
     cmd.kill_on_drop(true);
+}
+
+/// Build the one authoritative command image for a process segment.
+///
+/// Callers still own stream and process-group wiring because PTY and pipe
+/// children require different file descriptors, but argv, workspace view,
+/// wrapper application, environment, cwd, and kill-on-drop semantics must all
+/// pass through this function before `spawn`.
+fn prepare_spawn(
+    segment: &ExpandedSegment,
+    snapshot: &EnvSnapshot,
+    cwd_override: Option<&Path>,
+    workspace_view: Option<&crate::sandbox::PreparedSandbox>,
+    wrapper_enabled: bool,
+    sys: &ActorSystem,
+) -> PreparedSpawn {
+    let mut program = segment.program.clone();
+    let mut args = segment.args.clone();
+
+    if wrapper_enabled {
+        let wrapper = &sys.config.wrapper;
+        let is_foreground = command_prefers_foreground(&segment.command_line);
+        if wrapper.should_wrap(&program, is_foreground, Some(true)) {
+            let mut wrapped_args = Vec::with_capacity(1 + args.len());
+            wrapped_args.push(program);
+            wrapped_args.extend(args);
+            program = wrapper.binary.clone();
+            args = wrapped_args;
+        }
+    }
+
+    let mut command = tokio::process::Command::new(&program);
+    command.args(&args);
+    configure_command(&mut command, snapshot, cwd_override, workspace_view);
+
+    PreparedSpawn {
+        program,
+        args,
+        command,
+    }
 }
 
 #[cfg(unix)]
@@ -1292,19 +1338,18 @@ async fn spawn_single_pipe_job(
     use tokio::io::AsyncReadExt;
 
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
-    let segment = &segments[0];
-    let (program, args) = wrap_segment_if_enabled(&sys, options.wrapper_enabled, segment);
     let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
-
-    let mut cmd = tokio::process::Command::new(&program);
-    if !args.is_empty() {
-        cmd.args(&args);
-    }
-    configure_command(
-        &mut cmd,
+    let PreparedSpawn {
+        program,
+        args,
+        command: mut cmd,
+    } = prepare_spawn(
+        &segments[0],
         snapshot,
         options.cwd_override.as_deref(),
         sandbox.as_ref(),
+        options.wrapper_enabled,
+        &sys,
     );
     configure_process_group(&mut cmd);
     cmd.stdin(Stdio::null());
@@ -1509,19 +1554,18 @@ async fn spawn_single_pty_job(
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
-    let segment = &segments[0];
-    let (program, args) = wrap_segment_if_enabled(&sys, options.wrapper_enabled, segment);
     let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
-
-    let mut cmd = tokio::process::Command::new(&program);
-    if !args.is_empty() {
-        cmd.args(&args);
-    }
-    configure_command(
-        &mut cmd,
+    let PreparedSpawn {
+        program,
+        args,
+        command: mut cmd,
+    } = prepare_spawn(
+        &segments[0],
         snapshot,
         options.cwd_override.as_deref(),
         sandbox.as_ref(),
+        options.wrapper_enabled,
+        &sys,
     );
 
     let pty_pair = crate::pty::open_pty().map_err(|error| {
@@ -1648,29 +1692,6 @@ async fn spawn_single_pty_job(
         resize: Some(resize_file),
         foreground,
     })
-}
-
-fn wrap_segment_if_enabled(
-    sys: &ActorSystem,
-    wrapper_enabled: bool,
-    segment: &ExpandedSegment,
-) -> (String, Vec<String>) {
-    let program = segment.program.clone();
-    let args = segment.args.clone();
-    if !wrapper_enabled {
-        return (program, args);
-    }
-
-    let wrapper = &sys.config.wrapper;
-    let is_foreground = command_prefers_foreground(&segment.command_line);
-    if !wrapper.should_wrap(&program, is_foreground, Some(true)) {
-        return (program, args);
-    }
-
-    let mut wrapped_args = Vec::with_capacity(1 + args.len());
-    wrapped_args.push(program);
-    wrapped_args.extend(args);
-    (wrapper.binary.clone(), wrapped_args)
 }
 
 async fn spawn_native_pipeline_job(
@@ -1828,13 +1849,18 @@ async fn spawn_native_pipeline_with_hook(
             cleanup_partial_pipeline_spawn(job_id, children).await;
             return Err(());
         }
-        let (program, args) =
-            wrap_segment_if_enabled(options.sys, options.wrapper_enabled, segment);
-        let mut cmd = tokio::process::Command::new(&program);
-        if !args.is_empty() {
-            cmd.args(&args);
-        }
-        configure_command(&mut cmd, snapshot, options.cwd_override, options.sandbox);
+        let PreparedSpawn {
+            program,
+            args,
+            command: mut cmd,
+        } = prepare_spawn(
+            segment,
+            snapshot,
+            options.cwd_override,
+            options.sandbox,
+            options.wrapper_enabled,
+            options.sys,
+        );
         configure_process_group(&mut cmd);
 
         let spawn_result = (|| -> Result<tokio::process::Child, ()> {
