@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cron::{CronSchedule, CronStatus};
 use crate::event_channel::EventChannel;
-use crate::execution::{CancelMode, ExecutionSpec, ExecutionState, SourceMetadata, StepState};
-use crate::id::{ExecutionId, ScopeHash, StepId};
+use crate::execution::{CancelMode, ExecutionSpec, ExecutionState, StepState};
+use crate::id::{ExecutionId, ScheduleId, ScopeHash, StepId};
 use crate::job::JobStatus;
 use crate::mode::Mode;
 use crate::scope::EnvDelta;
@@ -192,14 +192,17 @@ pub enum RequestPayload {
         schedule: CronSchedule,
         execution: Box<ExecutionSpec>,
     },
+    ListSchedules {
+        limit: Option<usize>,
+    },
     PauseSchedule {
-        id: String,
+        id: ScheduleId,
     },
     ResumeSchedule {
-        id: String,
+        id: ScheduleId,
     },
     RemoveSchedule {
-        id: String,
+        id: ScheduleId,
     },
     StepAttach {
         id: StepId,
@@ -320,14 +323,18 @@ pub enum ResponsePayload {
 pub enum OkPayload {
     Ack {},
     ExecutionCreated {
-        execution: ExecutionInfo,
+        execution: Box<ExecutionInfo>,
     },
-    ExecutionInfo(ExecutionInfo),
+    ExecutionInfo(Box<ExecutionInfo>),
     ExecutionList(Vec<ExecutionInfo>),
     ExecutionOutput {
         id: ExecutionId,
         steps: Vec<StepOutput>,
     },
+    ScheduleCreated {
+        schedule: Box<ScheduleInfo>,
+    },
+    ScheduleList(Vec<ScheduleInfo>),
     ScriptCreated {
         script_id: String,
         source: ScriptSource,
@@ -463,7 +470,7 @@ fn default_pong_ready() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
     ExecutionCreated {
-        execution: ExecutionInfo,
+        execution: Box<ExecutionInfo>,
     },
     ExecutionStateChanged {
         id: ExecutionId,
@@ -476,7 +483,7 @@ pub enum EventPayload {
         new_state: StepState,
     },
     ExecutionFinished {
-        execution: ExecutionInfo,
+        execution: Box<ExecutionInfo>,
     },
     // Jobs channel
     JobStateChanged {
@@ -658,10 +665,8 @@ pub struct ExecutionInfo {
     pub id: ExecutionId,
     pub state: ExecutionState,
     pub steps: Vec<ExecutionStepInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<SourceMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_of: Option<ExecutionId>,
+    /// Original replayable contract with ephemeral launch leases removed.
+    pub spec: ExecutionSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,6 +684,19 @@ pub struct StepOutput {
     pub stdout: StreamText,
     pub stderr: StreamText,
     pub stderr_pty_merged: bool,
+}
+
+/// Durable trigger template. The execution contract never contains an
+/// ephemeral spawn adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleInfo {
+    pub id: ScheduleId,
+    pub schedule: CronSchedule,
+    pub execution: ExecutionSpec,
+    pub status: CronStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_trigger_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

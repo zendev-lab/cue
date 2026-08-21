@@ -170,6 +170,38 @@ impl CuedClient {
         self.send(RequestPayload::WaitExecution { id }).await
     }
 
+    pub async fn list_executions(&mut self, limit: Option<usize>) -> Result<u32> {
+        self.send(RequestPayload::ListExecutions { limit }).await
+    }
+
+    pub async fn create_schedule(
+        &mut self,
+        schedule: cue_core::cron::CronSchedule,
+        execution: cue_core::execution::ExecutionSpec,
+    ) -> Result<u32> {
+        self.send(RequestPayload::CreateSchedule {
+            schedule,
+            execution: Box::new(execution),
+        })
+        .await
+    }
+
+    pub async fn list_schedules(&mut self, limit: Option<usize>) -> Result<u32> {
+        self.send(RequestPayload::ListSchedules { limit }).await
+    }
+
+    pub async fn pause_schedule(&mut self, id: cue_core::ScheduleId) -> Result<u32> {
+        self.send(RequestPayload::PauseSchedule { id }).await
+    }
+
+    pub async fn resume_schedule(&mut self, id: cue_core::ScheduleId) -> Result<u32> {
+        self.send(RequestPayload::ResumeSchedule { id }).await
+    }
+
+    pub async fn remove_schedule(&mut self, id: cue_core::ScheduleId) -> Result<u32> {
+        self.send(RequestPayload::RemoveSchedule { id }).await
+    }
+
     pub async fn cancel_execution(
         &mut self,
         id: cue_core::ExecutionId,
@@ -832,6 +864,34 @@ impl MultiplexedClient {
 
     pub async fn list_executions(&self, limit: Option<usize>) -> Result<ResponsePayload> {
         self.call(RequestPayload::ListExecutions { limit }).await
+    }
+
+    pub async fn create_schedule(
+        &self,
+        schedule: cue_core::cron::CronSchedule,
+        execution: cue_core::execution::ExecutionSpec,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::CreateSchedule {
+            schedule,
+            execution: Box::new(execution),
+        })
+        .await
+    }
+
+    pub async fn list_schedules(&self, limit: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ListSchedules { limit }).await
+    }
+
+    pub async fn pause_schedule(&self, id: cue_core::ScheduleId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::PauseSchedule { id }).await
+    }
+
+    pub async fn resume_schedule(&self, id: cue_core::ScheduleId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ResumeSchedule { id }).await
+    }
+
+    pub async fn remove_schedule(&self, id: cue_core::ScheduleId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::RemoveSchedule { id }).await
     }
 
     pub async fn wait_execution(&self, id: cue_core::ExecutionId) -> Result<ResponsePayload> {

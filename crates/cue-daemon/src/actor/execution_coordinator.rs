@@ -17,8 +17,9 @@ use tracing::{error, warn};
 
 use super::{
     ActorSystem, ExecutionCoordinatorMsg, GatewayMsg, ProcessJobOptions, ProcessMgrMsg,
-    ProcessSpawnAdapter, ScopeStoreMsg, SessionBinding, publish_session_event,
+    ProcessSpawnAdapter, ResponseTarget, ScopeStoreMsg, SessionBinding, publish_session_event,
 };
+use crate::storage;
 
 const FIRST_EXECUTION_PROCESS_JOB: u32 = 0x8000_0000;
 const DEFAULT_OUTPUT_TAIL: usize = cue_core::ipc::MAX_MESSAGE_SIZE / 4;
@@ -34,7 +35,8 @@ struct ExecutionRecord {
     session_id: Option<String>,
     pty_default: bool,
     wrapper_default: bool,
-    direct_output_client: u64,
+    direct_output_client: Option<u64>,
+    adapter_required: bool,
     jobs: BTreeMap<StepId, JobId>,
     waiters: Vec<Waiter>,
     finished_published: bool,
@@ -66,12 +68,26 @@ impl ExecutionRecord {
                 })
             })
             .collect();
+        let mut spec = self.execution.spec().clone();
+        spec.launch_context.spawn_adapter = None;
         ExecutionInfo {
             id: self.execution.id(),
             state: self.execution.state(),
             steps,
-            source: self.execution.spec().source.clone(),
-            retry_of: self.execution.spec().retry_of,
+            spec,
+        }
+    }
+
+    fn stored(&self) -> storage::StoredExecution {
+        let mut snapshot = self.execution.snapshot();
+        snapshot.spec.launch_context.spawn_adapter = None;
+        storage::StoredExecution {
+            snapshot,
+            current_scope: self.current_scope,
+            session_id: self.session_id.clone(),
+            pty_default: self.pty_default,
+            wrapper_default: self.wrapper_default,
+            adapter_required: self.adapter_required,
         }
     }
 }
@@ -83,15 +99,18 @@ struct CoordinatorState {
 }
 
 impl CoordinatorState {
-    fn new() -> Self {
+    fn new(next_execution: u64, records: BTreeMap<ExecutionId, ExecutionRecord>) -> Self {
         Self {
-            next_execution: 1,
+            next_execution,
             next_process_job: FIRST_EXECUTION_PROCESS_JOB,
-            records: BTreeMap::new(),
+            records,
         }
     }
 
     fn alloc_execution(&mut self) -> Option<ExecutionId> {
+        if self.next_execution > i64::MAX as u64 {
+            return None;
+        }
         let id = ExecutionId(self.next_execution);
         self.next_execution = self.next_execution.checked_add(1)?;
         Some(id)
@@ -104,9 +123,42 @@ impl CoordinatorState {
     }
 }
 
-pub(super) fn spawn(mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>, sys: ActorSystem) {
+pub(super) async fn spawn(
+    mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>,
+    sys: ActorSystem,
+    db: storage::SharedConnection,
+) -> anyhow::Result<()> {
+    let stored = storage::with_connection(&db, storage::load_executions).await?;
+    let mut records = BTreeMap::new();
+    let mut next_execution = 1;
+    for stored in stored {
+        next_execution = next_execution.max(stored.snapshot.id.0.saturating_add(1));
+        let mut execution = Execution::restore(stored.snapshot)?;
+        if stored.adapter_required && !execution.state().is_terminal() {
+            execution
+                .fail_nonterminal("required spawn adapter lease did not survive daemon restart");
+        } else {
+            execution.interrupt_running("process interrupted by daemon restart");
+        }
+        let id = execution.id();
+        let finished_published = execution.state().is_terminal();
+        let record = ExecutionRecord {
+            execution,
+            current_scope: stored.current_scope,
+            session_id: stored.session_id,
+            pty_default: stored.pty_default,
+            wrapper_default: stored.wrapper_default,
+            direct_output_client: None,
+            adapter_required: stored.adapter_required,
+            jobs: BTreeMap::new(),
+            waiters: Vec::new(),
+            finished_published,
+        };
+        persist_record(&db, &record).await?;
+        records.insert(id, record);
+    }
     tokio::spawn(async move {
-        let mut state = CoordinatorState::new();
+        let mut state = CoordinatorState::new(next_execution, records);
         let mut admission_retry = tokio::time::interval(std::time::Duration::from_millis(250));
         admission_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -115,18 +167,21 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>, sys: ActorS
                 _ = admission_retry.tick() => {
                     let ids = state.records.keys().copied().collect::<Vec<_>>();
                     for id in ids {
-                        drive_execution(id, &mut state, &sys).await;
+                        drive_execution(id, &mut state, &sys, &db).await;
                     }
                 }
                 message = rx.recv() => {
                     let Some(message) = message else { break };
                     match message {
                         ExecutionCoordinatorMsg::Submit { client_id, request_id, spec, binding } => {
-                            submit(client_id, request_id, *spec, binding, &mut state, &sys).await;
+                            submit(client_id, Some(request_id), *spec, binding, &mut state, &sys, &db).await;
+                        }
+                        ExecutionCoordinatorMsg::SubmitTriggered { spec, binding } => {
+                            submit(0, None, *spec, binding, &mut state, &sys, &db).await;
                         }
                         ExecutionCoordinatorMsg::Get { client_id, request_id, id, named_session_id } => {
                             let response = visible_record(&state, id, named_session_id.as_deref())
-                                .map_or_else(not_found, |record| ResponsePayload::Ok(OkPayload::ExecutionInfo(record.info())));
+                                .map_or_else(not_found, |record| ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(record.info()))));
                             send_response(&sys, client_id, request_id, response).await;
                         }
                         ExecutionCoordinatorMsg::List { client_id, request_id, limit, named_session_id } => {
@@ -141,7 +196,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>, sys: ActorS
                         ExecutionCoordinatorMsg::Wait { client_id, request_id, id, named_session_id } => {
                             match visible_record_mut(&mut state, id, named_session_id.as_deref()) {
                                 Some(record) if record.execution.state().is_terminal() => {
-                                    let response = ResponsePayload::Ok(OkPayload::ExecutionInfo(record.info()));
+                                    let response = ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(record.info())));
                                     send_response(&sys, client_id, request_id, response).await;
                                 }
                                 Some(record) => record.waiters.push(Waiter { client_id, request_id }),
@@ -149,7 +204,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>, sys: ActorS
                             }
                         }
                         ExecutionCoordinatorMsg::Cancel { client_id, request_id, id, mode, named_session_id } => {
-                            cancel(client_id, request_id, id, mode, named_session_id.as_deref(), &mut state, &sys).await;
+                            cancel(ResponseTarget { client_id, request_id }, id, mode, named_session_id.as_deref(), &mut state, &sys, &db).await;
                         }
                         ExecutionCoordinatorMsg::ReadOutput { client_id, request_id, id, step_id, stdout_bytes, stderr_bytes, named_session_id } => {
                             let response = read_output(&state, id, step_id, stdout_bytes, stderr_bytes, named_session_id.as_deref()).await;
@@ -159,7 +214,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>, sys: ActorS
                             attach_step(client_id, request_id, id, role, named_session_id.as_deref(), &state, &sys).await;
                         }
                         ExecutionCoordinatorMsg::StepFinished { step_id, exit_code } => {
-                            step_finished(step_id, exit_code, &mut state, &sys).await;
+                            step_finished(step_id, exit_code, &mut state, &sys, &db).await;
                         }
                         ExecutionCoordinatorMsg::Shutdown => break,
                     }
@@ -167,6 +222,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ExecutionCoordinatorMsg>, sys: ActorS
             }
         }
     });
+    Ok(())
 }
 
 fn visible_record<'a>(
@@ -197,33 +253,40 @@ fn not_found() -> ResponsePayload {
 
 async fn submit(
     client_id: u64,
-    request_id: u32,
-    spec: cue_core::execution::ExecutionSpec,
+    request_id: Option<u32>,
+    mut spec: cue_core::execution::ExecutionSpec,
     binding: SessionBinding,
     state: &mut CoordinatorState,
     sys: &ActorSystem,
+    db: &storage::SharedConnection,
 ) {
     let Some(id) = state.alloc_execution() else {
-        send_response(
-            sys,
-            client_id,
-            request_id,
-            ResponsePayload::err(error_code::INTERNAL, "execution id space exhausted"),
-        )
-        .await;
-        return;
-    };
-    let start_scope = spec.start_scope.unwrap_or(binding.scope);
-    let execution = match Execution::new(id, spec) {
-        Ok(execution) => execution,
-        Err(error) => {
+        if let Some(request_id) = request_id {
             send_response(
                 sys,
                 client_id,
                 request_id,
-                ResponsePayload::err(error_code::INVALID_REQUEST, error.to_string()),
+                ResponsePayload::err(error_code::INTERNAL, "execution id space exhausted"),
             )
             .await;
+        }
+        return;
+    };
+    let start_scope = spec.start_scope.unwrap_or(binding.scope);
+    spec.start_scope = Some(start_scope);
+    let adapter_required = spec.launch_context.spawn_adapter.is_some();
+    let execution = match Execution::new(id, spec) {
+        Ok(execution) => execution,
+        Err(error) => {
+            if let Some(request_id) = request_id {
+                send_response(
+                    sys,
+                    client_id,
+                    request_id,
+                    ResponsePayload::err(error_code::INVALID_REQUEST, error.to_string()),
+                )
+                .await;
+            }
             return;
         }
     };
@@ -235,11 +298,27 @@ async fn submit(
         wrapper_default: binding
             .wrapper_default
             .unwrap_or(sys.config.wrapper.enabled),
-        direct_output_client: client_id,
+        direct_output_client: request_id.map(|_| client_id),
+        adapter_required,
         jobs: BTreeMap::new(),
         waiters: Vec::new(),
         finished_published: false,
     };
+    if let Err(error) = persist_record(db, &record).await {
+        if let Some(request_id) = request_id {
+            send_response(
+                sys,
+                client_id,
+                request_id,
+                ResponsePayload::err(
+                    error_code::INTERNAL,
+                    format!("persist execution before admission: {error}"),
+                ),
+            )
+            .await;
+        }
+        return;
+    }
     let created = record.info();
     let owner = record.session_id.clone();
     state.records.insert(id, record);
@@ -248,22 +327,31 @@ async fn submit(
         &sys.event_bus,
         EventChannel::Executions,
         cue_core::ipc::EventPayload::ExecutionCreated {
-            execution: created.clone(),
+            execution: Box::new(created.clone()),
         },
         owner,
     )
     .await;
-    send_response(
-        sys,
-        client_id,
-        request_id,
-        ResponsePayload::Ok(OkPayload::ExecutionCreated { execution: created }),
-    )
-    .await;
-    drive_execution(id, state, sys).await;
+    if let Some(request_id) = request_id {
+        send_response(
+            sys,
+            client_id,
+            request_id,
+            ResponsePayload::Ok(OkPayload::ExecutionCreated {
+                execution: Box::new(created),
+            }),
+        )
+        .await;
+    }
+    drive_execution(id, state, sys, db).await;
 }
 
-async fn drive_execution(id: ExecutionId, state: &mut CoordinatorState, sys: &ActorSystem) {
+async fn drive_execution(
+    id: ExecutionId,
+    state: &mut CoordinatorState,
+    sys: &ActorSystem,
+    db: &storage::SharedConnection,
+) {
     let Some(mut record) = state.records.remove(&id) else {
         return;
     };
@@ -381,6 +469,32 @@ async fn drive_execution(id: ExecutionId, state: &mut CoordinatorState, sys: &Ac
                     )
                     .await;
                     publish_execution_state_change(&record, old_execution_state, sys).await;
+                    if let Err(error) = persist_record(db, &record).await {
+                        sys.resources.release(job_id);
+                        record.jobs.remove(&step_id);
+                        let old_execution_state = record.execution.state();
+                        let failure = NodeOutcome::Failed(StepFailure::Infrastructure {
+                            message: format!("persist running step before spawn: {error}"),
+                        });
+                        if let Ok(transition) = record.execution.mark_finished(node_id, failure) {
+                            stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+                        }
+                        let new_step_state = record
+                            .execution
+                            .step_state(step_id)
+                            .cloned()
+                            .expect("failed step state");
+                        publish_step_state_change(
+                            &record,
+                            step_id,
+                            StepState::Running,
+                            new_step_state,
+                            sys,
+                        )
+                        .await;
+                        publish_execution_state_change(&record, old_execution_state, sys).await;
+                        continue;
+                    }
                     let launch = &record.execution.spec().launch_context;
                     let options = ProcessJobOptions {
                         cwd_override: None,
@@ -390,7 +504,7 @@ async fn drive_execution(id: ExecutionId, state: &mut CoordinatorState, sys: &Ac
                             .map(crate::sandbox::SandboxConfig::from),
                         wrapper_enabled: launch.wrapper_enabled.unwrap_or(record.wrapper_default),
                         pty_enabled: launch.pty.unwrap_or(record.pty_default),
-                        direct_output_client: Some(record.direct_output_client),
+                        direct_output_client: record.direct_output_client,
                         session_id: record.session_id.clone(),
                         spawn_adapter: launch.spawn_adapter.clone().map(|handle| {
                             ProcessSpawnAdapter {
@@ -444,6 +558,9 @@ async fn drive_execution(id: ExecutionId, state: &mut CoordinatorState, sys: &Ac
     }
 
     finish_if_terminal(&mut record, sys).await;
+    if let Err(error) = persist_record(db, &record).await {
+        error!(%id, %error, "execution coordinator: failed to persist reducer state");
+    }
     state.records.insert(id, record);
 }
 
@@ -487,6 +604,7 @@ async fn step_finished(
     exit_code: i32,
     state: &mut CoordinatorState,
     sys: &ActorSystem,
+    db: &storage::SharedConnection,
 ) {
     let id = step_id.execution;
     let Some(mut record) = state.records.remove(&id) else {
@@ -521,18 +639,22 @@ async fn step_finished(
         }
     }
     state.records.insert(id, record);
-    drive_execution(id, state, sys).await;
+    drive_execution(id, state, sys, db).await;
 }
 
 async fn cancel(
-    client_id: u64,
-    request_id: u32,
+    response: ResponseTarget,
     id: ExecutionId,
     mode: cue_core::execution::CancelMode,
     named_session_id: Option<&str>,
     state: &mut CoordinatorState,
     sys: &ActorSystem,
+    db: &storage::SharedConnection,
 ) {
+    let ResponseTarget {
+        client_id,
+        request_id,
+    } = response;
     let Some(mut record) = state.records.remove(&id) else {
         send_response(sys, client_id, request_id, not_found()).await;
         return;
@@ -549,6 +671,9 @@ async fn cancel(
     publish_changed_step_states(&record, &old_step_states, sys).await;
     publish_execution_state_change(&record, old_state, sys).await;
     finish_if_terminal(&mut record, sys).await;
+    if let Err(error) = persist_record(db, &record).await {
+        error!(%id, %error, "execution coordinator: failed to persist cancellation");
+    }
     state.records.insert(id, record);
     send_response(sys, client_id, request_id, ResponsePayload::ack()).await;
 }
@@ -562,11 +687,25 @@ async fn attach_step(
     state: &CoordinatorState,
     sys: &ActorSystem,
 ) {
-    let job_id = visible_record(state, id.execution, named_session_id).and_then(|record| {
+    let Some(record) = visible_record(state, id.execution, named_session_id) else {
+        send_response(sys, client_id, request_id, not_found()).await;
+        return;
+    };
+    if record.execution.step_state(id).is_none() {
+        send_response(
+            sys,
+            client_id,
+            request_id,
+            ResponsePayload::err(error_code::NOT_FOUND, "execution step not found"),
+        )
+        .await;
+        return;
+    }
+    let job_id = {
         matches!(record.execution.step_state(id), Some(StepState::Running))
             .then(|| record.jobs.get(&id).copied())
             .flatten()
-    });
+    };
     let Some(job_id) = job_id else {
         send_response(
             sys,
@@ -661,7 +800,7 @@ async fn finish_if_terminal(record: &mut ExecutionRecord, sys: &ActorSystem) {
         &sys.event_bus,
         EventChannel::Executions,
         cue_core::ipc::EventPayload::ExecutionFinished {
-            execution: info.clone(),
+            execution: Box::new(info.clone()),
         },
         record.session_id.clone(),
     )
@@ -671,7 +810,7 @@ async fn finish_if_terminal(record: &mut ExecutionRecord, sys: &ActorSystem) {
             sys,
             waiter.client_id,
             waiter.request_id,
-            ResponsePayload::Ok(OkPayload::ExecutionInfo(info.clone())),
+            ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(info.clone()))),
         )
         .await;
     }
@@ -776,10 +915,11 @@ async fn read_output(
         );
     }
     let selected = record
-        .jobs
-        .iter()
-        .filter(|(step, _)| requested_step.is_none_or(|requested| requested == **step))
-        .map(|(step, job)| (*step, *job))
+        .info()
+        .steps
+        .into_iter()
+        .map(|step| step.id)
+        .filter(|step| requested_step.is_none_or(|requested| requested == *step))
         .collect::<Vec<_>>();
     if requested_step.is_some() && selected.is_empty() {
         return ResponsePayload::err(error_code::NOT_FOUND, "step output not found");
@@ -789,14 +929,15 @@ async fn read_output(
         Err(error) => return ResponsePayload::err(error_code::INTERNAL, error.to_string()),
     };
     let mut steps = Vec::with_capacity(selected.len());
-    for (step_id, job_id) in selected {
+    for step_id in selected {
+        let stem = super::process_output_stem(JobId(0), Some(step_id));
         let stdout = read_stream_tail(
-            output_dir.join(format!("{job_id}.log")),
+            output_dir.join(format!("{stem}.log")),
             stdout_bytes.unwrap_or(DEFAULT_OUTPUT_TAIL),
         )
         .await;
         let stderr = read_stream_tail(
-            output_dir.join(format!("{job_id}.stderr")),
+            output_dir.join(format!("{stem}.stderr")),
             stderr_bytes.unwrap_or(DEFAULT_OUTPUT_TAIL),
         )
         .await;
@@ -813,6 +954,18 @@ async fn read_output(
         });
     }
     ResponsePayload::Ok(OkPayload::ExecutionOutput { id, steps })
+}
+
+async fn persist_record(
+    db: &storage::SharedConnection,
+    record: &ExecutionRecord,
+) -> anyhow::Result<()> {
+    let stored = record.stored();
+    let steps = record.info().steps;
+    storage::with_connection(db, move |connection| {
+        storage::store_execution(connection, &stored, &steps)
+    })
+    .await
 }
 
 async fn read_stream_tail(path: std::path::PathBuf, limit: usize) -> StreamText {

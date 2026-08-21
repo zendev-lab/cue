@@ -8,25 +8,30 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use cue_core::command::{ModeParams, ParamValue};
-use cue_core::cron::CronSchedule;
 use cue_core::execution::{ExecutionPlan, ExecutionSpec, LaunchContext, SourceMetadata};
+use cue_core::ipc::RequestPayload;
 use cue_core::job::{SandboxMode, SandboxSettings, SandboxUpper};
 use cue_core::mode::Mode;
 use cue_core::pipeline::{ChainNode, JobPlan, ParallelOp, SerialOp};
 use cue_core::scope::EnvDelta;
+use cue_core::{ExecutionId, ScheduleId, StepId};
 
 use crate::{ParseError, ResolvedCommand, parse_command, parse_file_script_command};
 
 #[derive(Debug, Clone)]
 pub enum CompiledCommand {
-    Submit(ExecutionSpec),
-    CreateSchedule {
-        schedule: CronSchedule,
-        execution: ExecutionSpec,
-    },
-    ApplyScopeDelta(EnvDelta),
-    /// Connection-local commands and typed queries remain frontend actions.
-    Frontend(ResolvedCommand),
+    Daemon(RequestPayload),
+    Frontend(FrontendAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendAction {
+    Help { topic: Option<String> },
+    Clear,
+    Quit,
+    Restart,
+    Retry { id: ExecutionId },
+    Unsupported { message: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +47,17 @@ pub fn compile_command(
     mode: Mode,
     source_name: impl Into<String>,
 ) -> Result<CompiledCommand, CompileError> {
-    compile_resolved(parse_command(input, mode)?, source_name.into())
+    if let Some(compiled) = compile_v3_builtin(input)? {
+        return Ok(compiled);
+    }
+    let normalized = input
+        .trim_start()
+        .strip_prefix(":schedule ")
+        .map(|rest| format!(":cron {rest}"));
+    compile_resolved(
+        parse_command(normalized.as_deref().unwrap_or(input), mode)?,
+        source_name.into(),
+    )
 }
 
 pub fn compile_file(
@@ -51,7 +66,7 @@ pub fn compile_file(
 ) -> Result<ExecutionSpec, CompileError> {
     let source_name = source_name.into();
     match compile_resolved(parse_file_script_command(input)?, source_name)? {
-        CompiledCommand::Submit(spec) => Ok(spec),
+        CompiledCommand::Daemon(RequestPayload::SubmitExecution { spec }) => Ok(*spec),
         _ => Err(CompileError::Invalid(
             "a .cue file must compile to one execution".into(),
         )),
@@ -65,11 +80,9 @@ fn compile_resolved(
     match command {
         ResolvedCommand::Run { chain, params } => {
             let (plan, launch_context) = compile_run(chain, &params)?;
-            Ok(CompiledCommand::Submit(execution_spec(
-                plan,
-                launch_context,
-                source_name,
-            )))
+            Ok(CompiledCommand::Daemon(RequestPayload::SubmitExecution {
+                spec: Box::new(execution_spec(plan, launch_context, source_name)),
+            }))
         }
         ResolvedCommand::Script { items, .. } => {
             if items.is_empty() {
@@ -98,11 +111,13 @@ fn compile_resolved(
                     right: Box::new(right),
                 })
                 .expect("non-empty script checked above");
-            Ok(CompiledCommand::Submit(execution_spec(
-                plan,
-                launch_context.unwrap_or_default(),
-                source_name,
-            )))
+            Ok(CompiledCommand::Daemon(RequestPayload::SubmitExecution {
+                spec: Box::new(execution_spec(
+                    plan,
+                    launch_context.unwrap_or_default(),
+                    source_name,
+                )),
+            }))
         }
         ResolvedCommand::Cron {
             schedule,
@@ -115,23 +130,233 @@ fn compile_resolved(
                     "scheduled executions cannot carry an ephemeral spawn adapter".into(),
                 ));
             }
-            Ok(CompiledCommand::CreateSchedule {
+            Ok(CompiledCommand::Daemon(RequestPayload::CreateSchedule {
                 schedule,
-                execution: execution_spec(plan, launch_context, source_name),
-            })
+                execution: Box::new(execution_spec(plan, launch_context, source_name)),
+            }))
         }
-        ResolvedCommand::Cd { path } => Ok(CompiledCommand::ApplyScopeDelta(EnvDelta {
-            set: BTreeMap::new(),
-            unset: Vec::new(),
-            cwd: Some(PathBuf::from(path)),
-        })),
+        ResolvedCommand::Cd { path } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ApplyScopeDelta {
+                base: None,
+                delta: EnvDelta {
+                    set: BTreeMap::new(),
+                    unset: Vec::new(),
+                    cwd: Some(PathBuf::from(path)),
+                },
+            }))
+        }
         ResolvedCommand::Env { subcommand } => match compile_env_delta(subcommand.as_deref())? {
-            Some(delta) => Ok(CompiledCommand::ApplyScopeDelta(delta)),
-            None => Ok(CompiledCommand::Frontend(ResolvedCommand::Env {
-                subcommand,
+            Some(delta) => Ok(CompiledCommand::Daemon(RequestPayload::ApplyScopeDelta {
+                base: None,
+                delta,
+            })),
+            None => Ok(CompiledCommand::Daemon(RequestPayload::ShowEnv {
+                tail_bytes: None,
             })),
         },
-        command => Ok(CompiledCommand::Frontend(command)),
+        ResolvedCommand::Jobs | ResolvedCommand::ListJobs { .. } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ListExecutions {
+                limit: None,
+            }))
+        }
+        ResolvedCommand::Crons | ResolvedCommand::ListCrons { .. } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ListSchedules {
+                limit: None,
+            }))
+        }
+        ResolvedCommand::Scopes
+        | ResolvedCommand::ListScopes { .. }
+        | ResolvedCommand::Scope { subcommand: None } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ListScopes {
+                limit: None,
+            }))
+        }
+        ResolvedCommand::ShowEnv { tail_bytes } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ShowEnv {
+                tail_bytes,
+            }))
+        }
+        ResolvedCommand::Config { subcommand }
+            if subcommand
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty() || value == "show") =>
+        {
+            Ok(CompiledCommand::Daemon(RequestPayload::ShowConfig {
+                tail_bytes: None,
+            }))
+        }
+        ResolvedCommand::ShowConfig { tail_bytes } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ShowConfig {
+                tail_bytes,
+            }))
+        }
+        ResolvedCommand::Help { topic } => {
+            Ok(CompiledCommand::Frontend(FrontendAction::Help { topic }))
+        }
+        ResolvedCommand::Clear => Ok(CompiledCommand::Frontend(FrontendAction::Clear)),
+        ResolvedCommand::Quit => Ok(CompiledCommand::Frontend(FrontendAction::Quit)),
+        command => Ok(CompiledCommand::Frontend(FrontendAction::Unsupported {
+            message: format!(
+                "command {command:?} has no IPC v3 frontend mapping; use E<n>, E<n>/S<n>, or T<n> typed targets"
+            ),
+        })),
+    }
+}
+
+fn compile_v3_builtin(input: &str) -> Result<Option<CompiledCommand>, CompileError> {
+    let trimmed = input.trim();
+    let Some(body) = trimmed.strip_prefix(':') else {
+        return Ok(None);
+    };
+    let mut words = body.split_whitespace();
+    let Some(command) = words.next() else {
+        return Ok(None);
+    };
+    let rest = words.collect::<Vec<_>>();
+    let daemon = |payload| Some(CompiledCommand::Daemon(payload));
+    let invalid =
+        |expected: &str| CompileError::Invalid(format!("`:{command}` expects {expected}"));
+    let compiled = match command {
+        "executions" => daemon(RequestPayload::ListExecutions { limit: None }),
+        "schedules" => daemon(RequestPayload::ListSchedules { limit: None }),
+        "wait" if rest.len() == 1 && rest[0].starts_with('E') => {
+            daemon(RequestPayload::WaitExecution {
+                id: rest[0]
+                    .parse::<ExecutionId>()
+                    .map_err(|_| invalid("an execution ID such as E1"))?,
+            })
+        }
+        "cancel" if rest.len() == 1 && rest[0].starts_with('E') => {
+            daemon(RequestPayload::CancelExecution {
+                id: rest[0]
+                    .parse::<ExecutionId>()
+                    .map_err(|_| invalid("an execution ID such as E1"))?,
+                mode: cue_core::execution::CancelMode::Graceful,
+            })
+        }
+        "kill" if rest.len() == 1 && rest[0].starts_with('E') => {
+            daemon(RequestPayload::CancelExecution {
+                id: rest[0]
+                    .parse::<ExecutionId>()
+                    .map_err(|_| invalid("an execution ID such as E1"))?,
+                mode: cue_core::execution::CancelMode::Force,
+            })
+        }
+        "kill" | "remove" if rest.len() == 1 && rest[0].starts_with('T') => {
+            daemon(RequestPayload::RemoveSchedule {
+                id: rest[0]
+                    .parse::<ScheduleId>()
+                    .map_err(|_| invalid("a schedule ID such as T1"))?,
+            })
+        }
+        "retry" if rest.len() == 1 && rest[0].starts_with('E') => {
+            Some(CompiledCommand::Frontend(FrontendAction::Retry {
+                id: rest[0]
+                    .parse::<ExecutionId>()
+                    .map_err(|_| invalid("an execution ID such as E1"))?,
+            }))
+        }
+        "fg" | "watch" if rest.len() == 1 && rest[0].starts_with('E') => {
+            let id = rest[0]
+                .parse::<StepId>()
+                .map_err(|_| invalid("a step ID such as E1/S1"))?;
+            daemon(if command == "fg" {
+                RequestPayload::StepAttach { id }
+            } else {
+                RequestPayload::StepWatch { id }
+            })
+        }
+        "out" | "err" if rest.len() == 1 && rest[0].starts_with('E') => {
+            let (id, step_id) = execution_output_target(rest[0])
+                .ok_or_else(|| invalid("an execution or step ID such as E1 or E1/S1"))?;
+            daemon(RequestPayload::ReadExecutionOutput {
+                id,
+                step_id,
+                stdout_bytes: (command == "err").then_some(0),
+                stderr_bytes: (command == "out").then_some(0),
+            })
+        }
+        "tail" if matches!(rest.len(), 1 | 2) && rest[0].starts_with('E') => {
+            let (id, step_id) = execution_output_target(rest[0])
+                .ok_or_else(|| invalid("an execution or step ID such as E1 or E1/S1"))?;
+            let bytes = rest
+                .get(1)
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| invalid("an execution or step ID followed by a byte count"))?
+                .unwrap_or(8192);
+            daemon(RequestPayload::ReadExecutionOutput {
+                id,
+                step_id,
+                stdout_bytes: Some(bytes),
+                stderr_bytes: Some(0),
+            })
+        }
+        "pause" | "resume" if rest.len() == 1 && rest[0].starts_with('T') => {
+            let id = rest[0]
+                .parse::<ScheduleId>()
+                .map_err(|_| invalid("a schedule ID such as T1"))?;
+            daemon(if command == "pause" {
+                RequestPayload::PauseSchedule { id }
+            } else {
+                RequestPayload::ResumeSchedule { id }
+            })
+        }
+        "log" if rest.is_empty() => daemon(RequestPayload::ListExecutions { limit: None }),
+        "log" if rest.len() == 1 && rest[0].starts_with('E') => {
+            daemon(RequestPayload::GetExecution {
+                id: rest[0]
+                    .parse::<ExecutionId>()
+                    .map_err(|_| invalid("an execution ID such as E1"))?,
+            })
+        }
+        _ => return Ok(None),
+    };
+    Ok(compiled)
+}
+
+fn execution_output_target(input: &str) -> Option<(ExecutionId, Option<StepId>)> {
+    if input.contains("/S") {
+        let step = input.parse::<StepId>().ok()?;
+        Some((step.execution, Some(step)))
+    } else {
+        Some((input.parse::<ExecutionId>().ok()?, None))
+    }
+}
+
+pub fn render_help(topic: Option<&str>) -> String {
+    match topic.map(str::trim).filter(|topic| !topic.is_empty()) {
+        Some("schedule" | "schedules" | "cron") => [
+            "Cue schedules",
+            "",
+            "- `:schedule every 5m <command>` creates a durable typed template.",
+            "- `:schedules` lists templates; `:pause T1`, `:resume T1`, and `:remove T1` control one.",
+            "- Every trigger creates a fresh execution ID; ephemeral spawn adapters are forbidden.",
+        ]
+        .join("\n"),
+        Some("execution" | "executions" | "job") => [
+            "Cue executions",
+            "",
+            "- Bare input submits one typed execution (`E<n>`).",
+            "- Process leaves have stable step IDs (`E<n>/S<n>`).",
+            "- `:wait E1`, `:cancel E1`, `:kill E1`, `:retry E1` control an execution.",
+            "- `:out E1`, `:tail E1/S1`, `:fg E1/S1`, `:watch E1/S1` inspect a step.",
+            "- Prefix assignments such as `VAR=value script` affect only that process segment.",
+        ]
+        .join("\n"),
+        Some(topic) => format!(
+            "Unknown help topic `{topic}`. Available topics: execution, schedule."
+        ),
+        None => [
+            "Cue unified execution runtime",
+            "",
+            "Bare input is compiled locally and submitted as a typed execution plan.",
+            "Use `:help execution` or `:help schedule` for command details.",
+            "Composition: `&&`, `||`, `->`, `~>`, `|||`, `|?|`; pipelines: `|>`, `|&>`, `|!>`.",
+            "Scope: `:cd <dir>`, `:env set KEY=value`, `:env unset KEY`.",
+        ]
+        .join("\n"),
     }
 }
 
@@ -392,7 +617,7 @@ mod tests {
 
     fn compiled(input: &str) -> ExecutionSpec {
         match compile_command(input, Mode::Job, "<test>").unwrap() {
-            CompiledCommand::Submit(spec) => spec,
+            CompiledCommand::Daemon(RequestPayload::SubmitExecution { spec }) => *spec,
             other => panic!("expected execution, got {other:?}"),
         }
     }
@@ -440,5 +665,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("one shared launch context"));
+    }
+
+    #[test]
+    fn typed_execution_step_and_schedule_commands_bypass_legacy_ids() {
+        assert!(matches!(
+            compile_command(":fg E7/S2", Mode::Job, "<test>").unwrap(),
+            CompiledCommand::Daemon(RequestPayload::StepAttach {
+                id: StepId {
+                    execution: ExecutionId(7),
+                    index: 2
+                }
+            })
+        ));
+        assert!(matches!(
+            compile_command(":pause T3", Mode::Job, "<test>").unwrap(),
+            CompiledCommand::Daemon(RequestPayload::PauseSchedule { id: ScheduleId(3) })
+        ));
+        assert!(matches!(
+            compile_command(":retry E4", Mode::Job, "<test>").unwrap(),
+            CompiledCommand::Frontend(FrontendAction::Retry { id: ExecutionId(4) })
+        ));
     }
 }

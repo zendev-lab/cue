@@ -28,7 +28,7 @@ use super::operation_ledger::{BeginOutcome, OperationLedger, OperationWaiter};
 use super::{
     ActorSystem, CLIENT_EVENT_CAP, ClientEvent, ClientEventAudience, EventBusMsg,
     ExecutionCoordinatorMsg, ForegroundRoleUpdate, GatewayMsg, SchedulerMsg, ScopeStoreMsg,
-    SessionBinding, SessionCommand,
+    SessionBinding, SessionCommand, TriggerServiceMsg,
 };
 
 /// Next client id counter (global, atomic).
@@ -1306,21 +1306,106 @@ async fn route_request(
                 .context("send typed scope query response")?;
         }
 
-        RequestPayload::CreateSchedule { .. }
-        | RequestPayload::PauseSchedule { .. }
-        | RequestPayload::ResumeSchedule { .. }
-        | RequestPayload::RemoveSchedule { .. } => {
-            sys.gateway
-                .send(GatewayMsg::SendResponse {
+        RequestPayload::CreateSchedule {
+            schedule,
+            execution,
+        } => {
+            if lifecycle.execution_admission_closed() {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: draining_response(),
+                    })
+                    .await
+                    .context("send draining schedule rejection")?;
+                return Ok(None);
+            }
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Create {
                     client_id,
                     request_id,
-                    payload: ResponsePayload::err(
-                        error_code::NOT_SUPPORTED,
-                        "typed IPC v3 operation is not initialized",
-                    ),
+                    schedule: Box::new(schedule),
+                    execution,
+                    binding,
                 })
                 .await
-                .context("send typed v3 initialization error")?;
+                .context("send schedule creation")?;
+        }
+        RequestPayload::ListSchedules { limit } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::List {
+                    client_id,
+                    request_id,
+                    limit,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule list")?;
+        }
+        RequestPayload::PauseSchedule { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Pause {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule pause")?;
+        }
+        RequestPayload::ResumeSchedule { id } => {
+            if lifecycle.execution_admission_closed() {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: draining_response(),
+                    })
+                    .await
+                    .context("send draining schedule resume rejection")?;
+                return Ok(None);
+            }
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Resume {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule resume")?;
+        }
+        RequestPayload::RemoveSchedule { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Remove {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule removal")?;
         }
 
         RequestPayload::RemoveCron { id } => {
@@ -1605,13 +1690,22 @@ async fn route_request(
             let ticket = lifecycle.request_restart(client_id, request_id)?;
             if ticket.first_request {
                 let (reply, accepted) = tokio::sync::oneshot::channel();
-                if sys
+                let scheduler_closed = sys
                     .scheduler
                     .send(SchedulerMsg::BeginDrain { reply })
                     .await
                     .is_err()
-                    || accepted.await.is_err()
-                {
+                    || accepted.await.is_err();
+                let (trigger_reply, trigger_accepted) = tokio::sync::oneshot::channel();
+                let triggers_closed = sys
+                    .triggers
+                    .send(TriggerServiceMsg::BeginDrain {
+                        reply: trigger_reply,
+                    })
+                    .await
+                    .is_err()
+                    || trigger_accepted.await.is_err();
+                if scheduler_closed || triggers_closed {
                     // The scheduler may already have closed admission before
                     // dropping its acknowledgement. Never reopen only one side
                     // of that boundary: cancel the durable successor fence and
@@ -1623,7 +1717,7 @@ async fn route_request(
                             request_id,
                             payload: ResponsePayload::err(
                                 error_code::INTERNAL,
-                                "scheduler could not begin daemon drain",
+                                "execution owners could not begin daemon drain",
                             ),
                         })
                         .await?;
@@ -2267,6 +2361,7 @@ mod tests {
             gateway,
             scheduler,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus,
@@ -2481,6 +2576,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus: event_bus_tx,
@@ -2554,6 +2650,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus: event_bus_tx,

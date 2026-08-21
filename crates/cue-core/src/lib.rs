@@ -22,7 +22,9 @@ pub mod tui_debug;
 
 // Re-export commonly used types at crate root.
 pub use event_channel::EventChannel;
-pub use id::{ChainId, CronId, EntityRef, ExecutionId, JobId, ScopeHash, ScriptId, StepId};
+pub use id::{
+    ChainId, CronId, EntityRef, ExecutionId, JobId, ScheduleId, ScopeHash, ScriptId, StepId,
+};
 pub use job::{LaunchOptions, SandboxMode, SandboxSettings, SandboxUpper};
 pub use mode::Mode;
 pub use resource::{

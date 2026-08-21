@@ -204,6 +204,7 @@ fn decode_binary_output_chunk(base64: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use cue_core::ExecutionId;
+    use cue_core::execution::{ExecutionPlan, ExecutionSpec, LaunchContext};
     use cue_core::ipc::{
         MAX_MESSAGE_SIZE, RequestPayload, SessionInfo, SessionScopeState, encode_message,
     };
@@ -244,8 +245,15 @@ mod tests {
             id,
             state,
             steps: Vec::new(),
-            source: None,
-            retry_of: None,
+            spec: ExecutionSpec {
+                plan: ExecutionPlan::pipeline(cue_core::pipeline::Pipeline::simple(vec![
+                    "true".into(),
+                ])),
+                start_scope: None,
+                launch_context: LaunchContext::default(),
+                source: None,
+                retry_of: None,
+            },
         }
     }
 
@@ -356,7 +364,7 @@ mod tests {
             Message::Response {
                 id: submit_id,
                 payload: ResponsePayload::Ok(OkPayload::ExecutionCreated {
-                    execution: execution_info(execution_id, ExecutionState::Running),
+                    execution: Box::new(execution_info(execution_id, ExecutionState::Running)),
                 }),
             },
         )
@@ -376,10 +384,10 @@ mod tests {
             &mut server_stream,
             Message::Response {
                 id: wait_id,
-                payload: ResponsePayload::Ok(OkPayload::ExecutionInfo(execution_info(
+                payload: ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(execution_info(
                     execution_id,
                     ExecutionState::Succeeded,
-                ))),
+                )))),
             },
         )
         .await;
@@ -474,7 +482,7 @@ mod tests {
             Message::Response {
                 id: 1,
                 payload: ResponsePayload::Ok(OkPayload::ExecutionCreated {
-                    execution: execution_info(execution_id, ExecutionState::Succeeded),
+                    execution: Box::new(execution_info(execution_id, ExecutionState::Succeeded)),
                 }),
             },
         )
@@ -494,10 +502,10 @@ mod tests {
             &mut server_stream,
             Message::Response {
                 id: wait_id,
-                payload: ResponsePayload::Ok(OkPayload::ExecutionInfo(execution_info(
+                payload: ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(execution_info(
                     execution_id,
                     ExecutionState::Succeeded,
-                ))),
+                )))),
             },
         )
         .await;

@@ -576,11 +576,10 @@ fn scheduler_is_idle_for_restart(state: &SchedulerState) -> bool {
 /// Restore durable Scheduler state and spawn the actor task.
 pub(super) async fn spawn(
     mut rx: mpsc::Receiver<SchedulerMsg>,
-    conn: Connection,
+    db: storage::SharedConnection,
     sys: ActorSystem,
     lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> anyhow::Result<()> {
-    let db = storage::shared_connection(conn);
     let config = sys.config.clone();
     let mut state = SchedulerState::new();
     restore_named_sessions(&db, &mut state).await?;
@@ -7252,6 +7251,7 @@ mod tests {
             gateway: gw_tx,
             scheduler: sched_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: pm_tx,
             scope_store: ss_tx,
             event_bus: eb_tx,

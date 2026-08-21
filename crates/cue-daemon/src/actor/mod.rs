@@ -19,6 +19,7 @@ mod process_mgr;
 mod scheduler;
 mod scope_store;
 mod script_record;
+mod trigger_service;
 
 use anyhow::Result;
 use std::collections::HashSet;
@@ -38,6 +39,12 @@ pub(crate) struct SessionBinding {
     pub incarnation: u64,
     pub pty_default: Option<bool>,
     pub wrapper_default: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseTarget {
+    pub client_id: u64,
+    pub request_id: u32,
 }
 
 #[derive(Debug)]
@@ -136,6 +143,16 @@ pub(crate) struct ProcessSpawnAdapter {
     pub step_id: cue_core::StepId,
 }
 
+pub(crate) fn process_output_stem(
+    job_id: cue_core::JobId,
+    step: Option<cue_core::StepId>,
+) -> String {
+    step.map_or_else(
+        || job_id.to_string(),
+        |step| format!("E{}-S{}", step.execution.0, step.index),
+    )
+}
+
 // ── Per-actor message types ──
 
 /// Messages handled by the Gateway actor.
@@ -225,6 +242,10 @@ pub(crate) enum ExecutionCoordinatorMsg {
         spec: Box<cue_core::execution::ExecutionSpec>,
         binding: SessionBinding,
     },
+    SubmitTriggered {
+        spec: Box<cue_core::execution::ExecutionSpec>,
+        binding: SessionBinding,
+    },
     Get {
         client_id: u64,
         request_id: u32,
@@ -269,6 +290,44 @@ pub(crate) enum ExecutionCoordinatorMsg {
     StepFinished {
         step_id: cue_core::StepId,
         exit_code: i32,
+    },
+    Shutdown,
+}
+
+pub(crate) enum TriggerServiceMsg {
+    Create {
+        client_id: u64,
+        request_id: u32,
+        schedule: Box<cue_core::cron::CronSchedule>,
+        execution: Box<cue_core::execution::ExecutionSpec>,
+        binding: SessionBinding,
+    },
+    List {
+        client_id: u64,
+        request_id: u32,
+        limit: Option<usize>,
+        named_session_id: Option<String>,
+    },
+    Pause {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ScheduleId,
+        named_session_id: Option<String>,
+    },
+    Resume {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ScheduleId,
+        named_session_id: Option<String>,
+    },
+    Remove {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ScheduleId,
+        named_session_id: Option<String>,
+    },
+    BeginDrain {
+        reply: tokio::sync::oneshot::Sender<()>,
     },
     Shutdown,
 }
@@ -578,6 +637,7 @@ pub(crate) struct ActorSystem {
     gateway: mpsc::Sender<GatewayMsg>,
     scheduler: mpsc::Sender<SchedulerMsg>,
     execution: mpsc::Sender<ExecutionCoordinatorMsg>,
+    triggers: mpsc::Sender<TriggerServiceMsg>,
     process_mgr: mpsc::Sender<ProcessMgrMsg>,
     scope_store: mpsc::Sender<ScopeStoreMsg>,
     event_bus: mpsc::Sender<EventBusMsg>,
@@ -627,6 +687,12 @@ impl ActorSystem {
             ExecutionCoordinatorMsg::Shutdown,
         )
         .await;
+        send_shutdown(
+            "trigger_service",
+            &self.triggers,
+            TriggerServiceMsg::Shutdown,
+        )
+        .await;
         send_shutdown("process_mgr", &self.process_mgr, ProcessMgrMsg::Shutdown).await;
         send_shutdown("scope_store", &self.scope_store, ScopeStoreMsg::Shutdown).await;
         send_shutdown("event_bus", &self.event_bus, EventBusMsg::Shutdown).await;
@@ -651,16 +717,19 @@ pub(crate) async fn spawn_all(
     let (gw_tx, gw_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
     let (sched_tx, sched_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
     let (execution_tx, execution_rx) = mpsc::channel::<ExecutionCoordinatorMsg>(ACTOR_CHANNEL_CAP);
+    let (trigger_tx, trigger_rx) = mpsc::channel::<TriggerServiceMsg>(ACTOR_CHANNEL_CAP);
     let (pm_tx, pm_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
     let (ss_tx, ss_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
     let (eb_tx, eb_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
 
     let resources = Arc::new(crate::resource::registry_from_config(&config.resources)?);
+    let runtime_db = crate::storage::shared_connection(scheduler_db);
 
     let sys = ActorSystem {
         gateway: gw_tx,
         scheduler: sched_tx,
         execution: execution_tx,
+        triggers: trigger_tx,
         process_mgr: pm_tx,
         scope_store: ss_tx,
         event_bus: eb_tx,
@@ -672,9 +741,15 @@ pub(crate) async fn spawn_all(
     scope_store::spawn(ss_rx, scope_db, sys.clone()).await?;
     event_bus::spawn(eb_rx);
     process_mgr::spawn(pm_rx, sys.clone());
-    execution_coordinator::spawn(execution_rx, sys.clone());
-    if let Err(error) =
-        scheduler::spawn(sched_rx, scheduler_db, sys.clone(), lifecycle.clone()).await
+    execution_coordinator::spawn(execution_rx, sys.clone(), runtime_db.clone()).await?;
+    trigger_service::spawn(
+        trigger_rx,
+        sys.clone(),
+        runtime_db.clone(),
+        lifecycle.clone(),
+    )
+    .await?;
+    if let Err(error) = scheduler::spawn(sched_rx, runtime_db, sys.clone(), lifecycle.clone()).await
     {
         send_shutdown("scope_store", &sys.scope_store, ScopeStoreMsg::Shutdown).await;
         send_shutdown("process_mgr", &sys.process_mgr, ProcessMgrMsg::Shutdown).await;
@@ -711,6 +786,7 @@ mod tests {
             gateway,
             scheduler,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus,

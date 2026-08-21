@@ -17,7 +17,9 @@ mod tokenizer;
 use cue_core::mode::Mode;
 
 pub use assistance::{complete_input, highlight_input};
-pub use compiler::{CompileError, CompiledCommand, compile_command, compile_file};
+pub use compiler::{
+    CompileError, CompiledCommand, FrontendAction, compile_command, compile_file, render_help,
+};
 pub use completion::{CompletionScope, completion_candidates, completion_replacement};
 pub use parse::ParseError;
 pub use parse::ParseErrorKind;

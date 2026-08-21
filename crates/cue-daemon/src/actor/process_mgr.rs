@@ -667,7 +667,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         continue;
                     }
 
-                    clear_job_logs(job_id).await;
+                    clear_job_logs(job_id, effective_options.execution_step).await;
 
                     if effective_options.spawn_adapter.is_some()
                         && !matches!(plan, JobPlan::Pipeline(_))
@@ -1481,7 +1481,7 @@ async fn emit_spawn_setup_stderr(
     session_id: Option<&str>,
 ) {
     let line = format!("{message}\n");
-    let stderr_log = Arc::new(Mutex::new(open_stderr_log(job_id).await));
+    let stderr_log = Arc::new(Mutex::new(open_stderr_log(job_id, execution_step).await));
     write_log(job_id, LogStream::Stderr, &stderr_log, line.as_bytes()).await;
     emit_output(
         sys,
@@ -1593,7 +1593,7 @@ async fn spawn_single_pipe_job(
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
 
     // Read stdout and stderr concurrently, wait for exit.
-    let log_file = open_output_log(job_id).await;
+    let log_file = open_output_log(job_id, execution_step).await;
     let reader_handle = tokio::spawn(async move {
         let _sandbox = sandbox;
         let log = Arc::new(Mutex::new(log_file));
@@ -1631,7 +1631,7 @@ async fn spawn_single_pipe_job(
             }
         });
 
-        let stderr_log = open_stderr_log(job_id).await;
+        let stderr_log = open_stderr_log(job_id, execution_step).await;
         let stderr_log = Arc::new(Mutex::new(stderr_log));
         let stderr_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
@@ -1869,7 +1869,7 @@ async fn spawn_single_pty_job(
 
     info!(%job_id, pid = ?child.id(), "process_mgr: child spawned");
 
-    let log_file = open_output_log(job_id).await;
+    let log_file = open_output_log(job_id, options.execution_step).await;
     let input = match AsyncFd::new(input_file) {
         Ok(file) => Arc::new(file),
         Err(error) => {
@@ -1972,8 +1972,8 @@ async fn spawn_native_pipeline_job(
         .collect();
     info!(%job_id, ?pids, "process_mgr: native pipeline spawned");
 
-    let log_file = open_output_log(job_id).await;
-    let stderr_log = open_stderr_log(job_id).await;
+    let log_file = open_output_log(job_id, options.execution_step).await;
+    let stderr_log = open_stderr_log(job_id, options.execution_step).await;
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
@@ -2025,8 +2025,8 @@ async fn spawn_logical_job(
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
     let sandbox = prepare_job_sandbox_or_emit(job_id, &snapshot, options, &sys).await?;
-    let log_file = open_output_log(job_id).await;
-    let stderr_log = open_stderr_log(job_id).await;
+    let log_file = open_output_log(job_id, options.execution_step).await;
+    let stderr_log = open_stderr_log(job_id, options.execution_step).await;
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
@@ -2261,7 +2261,7 @@ fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
 ///
 /// Runs on the blocking thread pool so filesystem syscalls do not stall the
 /// Tokio runtime thread.
-async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
+async fn open_output_log(job_id: JobId, execution_step: Option<StepId>) -> Option<std::fs::File> {
     match tokio::task::spawn_blocking(move || {
         let dir = match crate::dirs::output_dir() {
             Ok(dir) => dir,
@@ -2274,7 +2274,10 @@ async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
             error!(%job_id, err = %e, "process_mgr: cannot create output dir");
             return None;
         }
-        let path = dir.join(format!("{job_id}.log"));
+        let path = dir.join(format!(
+            "{}.log",
+            super::process_output_stem(job_id, execution_step)
+        ));
         match crate::dirs::open_private_append(&path) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -2293,7 +2296,7 @@ async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
     }
 }
 
-async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
+async fn open_stderr_log(job_id: JobId, execution_step: Option<StepId>) -> Option<std::fs::File> {
     match tokio::task::spawn_blocking(move || {
         let dir = match crate::dirs::output_dir() {
             Ok(dir) => dir,
@@ -2306,7 +2309,10 @@ async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
             error!(%job_id, err = %e, "process_mgr: cannot create output dir");
             return None;
         }
-        let path = dir.join(format!("{job_id}.stderr"));
+        let path = dir.join(format!(
+            "{}.stderr",
+            super::process_output_stem(job_id, execution_step)
+        ));
         match crate::dirs::open_private_append(&path) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -2325,7 +2331,7 @@ async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
     }
 }
 
-async fn clear_job_logs(job_id: JobId) {
+async fn clear_job_logs(job_id: JobId, execution_step: Option<StepId>) {
     if let Err(error) = tokio::task::spawn_blocking(move || {
         let dir = match crate::dirs::output_dir() {
             Ok(dir) => dir,
@@ -2334,8 +2340,9 @@ async fn clear_job_logs(job_id: JobId) {
                 return;
             }
         };
+        let stem = super::process_output_stem(job_id, execution_step);
         for suffix in [".log", ".stderr"] {
-            let path = dir.join(format!("{job_id}{suffix}"));
+            let path = dir.join(format!("{stem}{suffix}"));
             if let Err(error) = std::fs::remove_file(&path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -3989,6 +3996,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4061,6 +4069,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4109,6 +4118,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4155,6 +4165,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4216,6 +4227,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4265,6 +4277,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4586,6 +4599,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4662,6 +4676,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4898,6 +4913,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -5129,6 +5145,7 @@ mod tests {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
             execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
