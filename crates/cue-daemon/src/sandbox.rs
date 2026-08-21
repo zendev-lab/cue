@@ -6,6 +6,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::{Result, bail};
+#[cfg(test)]
 use cue_core::command::{ModeParams, ParamValue};
 #[cfg(target_os = "linux")]
 use tracing::debug;
@@ -132,6 +133,7 @@ impl From<&cue_core::job::SandboxSettings> for SandboxConfig {
 }
 
 impl SandboxConfig {
+    #[cfg(test)]
     pub fn from_params(params: &ModeParams) -> Result<Option<Self>, String> {
         let mode = match params.get("sandbox") {
             None => {

@@ -12,6 +12,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use cue_core::EventChannel;
 use cue_core::ipc::{
     EventPayload, ForegroundAttachmentInfo, IPC_CAPABILITY_EXECUTION_V3,
     IPC_CAPABILITY_FOREGROUND_OBSERVERS, IPC_CAPABILITY_NAMED_SESSIONS,
@@ -19,7 +20,6 @@ use cue_core::ipc::{
     IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
     SessionInfo, SessionScopeState, encode_message,
 };
-use cue_core::{EventChannel, Mode};
 
 /// Client handle for a single connection to the cued daemon.
 pub struct CuedClient {
@@ -134,24 +134,6 @@ impl CuedClient {
         read_message(&mut self.stream).await
     }
 
-    /// Convenience: send an Eval request.
-    pub async fn eval(&mut self, input: &str, mode: Mode) -> Result<u32> {
-        self.send(RequestPayload::Eval {
-            input: input.to_string(),
-            mode,
-        })
-        .await
-    }
-
-    /// Convenience: send a file-script request.
-    pub async fn run_script(&mut self, path: &str, input: &str) -> Result<u32> {
-        self.send(RequestPayload::RunScript {
-            path: path.to_string(),
-            input: input.to_string(),
-        })
-        .await
-    }
-
     pub async fn submit_execution(
         &mut self,
         spec: cue_core::execution::ExecutionSpec,
@@ -211,16 +193,6 @@ impl CuedClient {
             .await
     }
 
-    /// Acquire the controller lease for a foreground-capable job.
-    pub async fn fg_attach(&mut self, id: impl Into<String>) -> Result<u32> {
-        self.send(RequestPayload::FgAttach { id: id.into() }).await
-    }
-
-    /// Observe a foreground-capable job without taking its controller lease.
-    pub async fn fg_watch(&mut self, id: impl Into<String>) -> Result<u32> {
-        self.send(RequestPayload::FgWatch { id: id.into() }).await
-    }
-
     /// Acquire the controller lease for a typed execution step.
     pub async fn step_attach(&mut self, id: cue_core::StepId) -> Result<u32> {
         self.send(RequestPayload::StepAttach { id }).await
@@ -232,49 +204,29 @@ impl CuedClient {
     }
 
     /// Claim the free controller lease for the currently watched job.
-    pub async fn fg_claim_control(&mut self) -> Result<u32> {
-        self.send(RequestPayload::FgClaimControl {}).await
+    pub async fn step_claim_control(&mut self) -> Result<u32> {
+        self.send(RequestPayload::StepClaimControl {}).await
     }
 
     /// Release the controller lease while remaining attached as an observer.
-    pub async fn fg_release_control(&mut self) -> Result<u32> {
-        self.send(RequestPayload::FgReleaseControl {}).await
+    pub async fn step_release_control(&mut self) -> Result<u32> {
+        self.send(RequestPayload::StepReleaseControl {}).await
     }
 
     /// Detach this connection from its current foreground job.
-    pub async fn fg_detach(&mut self) -> Result<u32> {
-        self.send(RequestPayload::FgDetach {}).await
+    pub async fn step_detach(&mut self) -> Result<u32> {
+        self.send(RequestPayload::StepDetach {}).await
     }
 
     /// Send terminal input while this connection owns the controller lease.
-    pub async fn fg_input(&mut self, data: impl Into<Vec<u8>>) -> Result<u32> {
-        self.send(RequestPayload::FgInput { data: data.into() })
+    pub async fn step_input(&mut self, data: impl Into<Vec<u8>>) -> Result<u32> {
+        self.send(RequestPayload::StepInput { data: data.into() })
             .await
     }
 
     /// Resize the PTY while this connection owns the controller lease.
-    pub async fn fg_resize(&mut self, cols: u16, rows: u16) -> Result<u32> {
-        self.send(RequestPayload::FgResize { cols, rows }).await
-    }
-
-    /// Acquire a foreground controller lease and return its atomic snapshot.
-    pub async fn fg_attach_roundtrip(
-        &mut self,
-        id: impl Into<String>,
-    ) -> Result<ForegroundAttachmentInfo> {
-        let request_id = self.fg_attach(id).await?;
-        self.wait_for_foreground_attachment(request_id, "attach foreground")
-            .await
-    }
-
-    /// Watch a foreground job and return its atomic snapshot.
-    pub async fn fg_watch_roundtrip(
-        &mut self,
-        id: impl Into<String>,
-    ) -> Result<ForegroundAttachmentInfo> {
-        let request_id = self.fg_watch(id).await?;
-        self.wait_for_foreground_attachment(request_id, "watch foreground")
-            .await
+    pub async fn step_resize(&mut self, cols: u16, rows: u16) -> Result<u32> {
+        self.send(RequestPayload::StepResize { cols, rows }).await
     }
 
     /// Watch a typed execution step and return its atomic snapshot.
@@ -826,28 +778,6 @@ impl MultiplexedClient {
         }
     }
 
-    /// Convenience: send an Eval request and wait for its response.
-    pub async fn eval(&self, input: &str, mode: Mode) -> Result<ResponsePayload> {
-        self.call(RequestPayload::Eval {
-            input: input.to_string(),
-            mode,
-        })
-        .await
-    }
-
-    /// Convenience: send a file-script request and wait for its response.
-    pub async fn run_script(
-        &self,
-        path: impl Into<String>,
-        input: impl Into<String>,
-    ) -> Result<ResponsePayload> {
-        self.call(RequestPayload::RunScript {
-            path: path.into(),
-            input: input.into(),
-        })
-        .await
-    }
-
     pub async fn submit_execution(
         &self,
         spec: cue_core::execution::ExecutionSpec,
@@ -914,40 +844,38 @@ impl MultiplexedClient {
         .await
     }
 
-    /// Acquire the controller lease for a foreground-capable job.
-    pub async fn fg_attach(&self, id: impl Into<String>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgAttach { id: id.into() }).await
+    pub async fn step_attach(&self, id: cue_core::StepId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepAttach { id }).await
     }
 
-    /// Observe a foreground-capable job without taking its controller lease.
-    pub async fn fg_watch(&self, id: impl Into<String>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgWatch { id: id.into() }).await
+    pub async fn step_watch(&self, id: cue_core::StepId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepWatch { id }).await
     }
 
-    /// Claim the free controller lease for the currently watched job.
-    pub async fn fg_claim_control(&self) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgClaimControl {}).await
+    /// Claim the free controller lease for the currently watched step.
+    pub async fn step_claim_control(&self) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepClaimControl {}).await
     }
 
     /// Release the controller lease while remaining attached as an observer.
-    pub async fn fg_release_control(&self) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgReleaseControl {}).await
+    pub async fn step_release_control(&self) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepReleaseControl {}).await
     }
 
     /// Detach this connection from its current foreground job.
-    pub async fn fg_detach(&self) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgDetach {}).await
+    pub async fn step_detach(&self) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepDetach {}).await
     }
 
     /// Send terminal input while this connection owns the controller lease.
-    pub async fn fg_input(&self, data: impl Into<Vec<u8>>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgInput { data: data.into() })
+    pub async fn step_input(&self, data: impl Into<Vec<u8>>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepInput { data: data.into() })
             .await
     }
 
     /// Resize the PTY while this connection owns the controller lease.
-    pub async fn fg_resize(&self, cols: u16, rows: u16) -> Result<ResponsePayload> {
-        self.call(RequestPayload::FgResize { cols, rows }).await
+    pub async fn step_resize(&self, cols: u16, rows: u16) -> Result<ResponsePayload> {
+        self.call(RequestPayload::StepResize { cols, rows }).await
     }
 
     /// List archived durable named sessions.
@@ -976,54 +904,9 @@ impl MultiplexedClient {
         .await
     }
 
-    /// List jobs with optional server-side limit and pagination metadata.
-    pub async fn list_jobs(&self, limit: Option<usize>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::ListJobs { limit }).await
-    }
-
-    /// List crons with optional server-side limit and pagination metadata.
-    pub async fn list_crons(&self, limit: Option<usize>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::ListCrons { limit }).await
-    }
-
     /// List scopes with optional server-side limit and pagination metadata.
     pub async fn list_scopes(&self, limit: Option<usize>) -> Result<ResponsePayload> {
         self.call(RequestPayload::ListScopes { limit }).await
-    }
-
-    /// Show log/history with optional target id, line limit, and byte tail.
-    pub async fn show_log(
-        &self,
-        id: Option<String>,
-        limit: Option<usize>,
-        tail_bytes: Option<usize>,
-    ) -> Result<ResponsePayload> {
-        self.call(RequestPayload::ShowLog {
-            id,
-            limit,
-            tail_bytes,
-        })
-        .await
-    }
-
-    /// Get stdout and stderr for one job with independent byte tails.
-    pub async fn job_output(
-        &self,
-        id: impl Into<String>,
-        stdout_bytes: Option<usize>,
-        stderr_bytes: Option<usize>,
-    ) -> Result<ResponsePayload> {
-        self.call(RequestPayload::JobOutput {
-            id: id.into(),
-            stdout_bytes,
-            stderr_bytes,
-        })
-        .await
-    }
-
-    /// Kill a job ID only; cron IDs are rejected by the daemon.
-    pub async fn kill_job(&self, id: impl Into<String>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::KillJob { id: id.into() }).await
     }
 
     /// Idempotently cancel an execution and wait for its running steps to stop.
@@ -1033,12 +916,6 @@ impl MultiplexedClient {
         mode: cue_core::execution::CancelMode,
     ) -> Result<ResponsePayload> {
         self.call(RequestPayload::CancelExecution { id, mode })
-            .await
-    }
-
-    /// Remove a cron ID only; job IDs are rejected by the daemon.
-    pub async fn remove_cron(&self, id: impl Into<String>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::RemoveCron { id: id.into() })
             .await
     }
 
@@ -1084,10 +961,12 @@ fn required_request_capability(payload: &RequestPayload) -> Option<&'static str>
         | RequestPayload::CancelExecution { .. }
         | RequestPayload::ReadExecutionOutput { .. }
         | RequestPayload::StepAttach { .. }
-        | RequestPayload::StepWatch { .. } => Some(IPC_CAPABILITY_EXECUTION_V3),
-        RequestPayload::FgWatch { .. }
-        | RequestPayload::FgClaimControl {}
-        | RequestPayload::FgReleaseControl {} => Some(IPC_CAPABILITY_FOREGROUND_OBSERVERS),
+        | RequestPayload::StepWatch { .. }
+        | RequestPayload::StepClaimControl {}
+        | RequestPayload::StepReleaseControl {}
+        | RequestPayload::StepDetach {}
+        | RequestPayload::StepInput { .. }
+        | RequestPayload::StepResize { .. } => Some(IPC_CAPABILITY_EXECUTION_V3),
         RequestPayload::CreateSession { .. }
         | RequestPayload::ListSessions {}
         | RequestPayload::AttachSession { .. }
@@ -1096,19 +975,8 @@ fn required_request_capability(payload: &RequestPayload) -> Option<&'static str>
         | RequestPayload::ListAllSessions {}
         | RequestPayload::ArchiveSession { .. }
         | RequestPayload::RestoreSession { .. } => Some(IPC_CAPABILITY_SESSION_ARCHIVE),
-        RequestPayload::Eval { input, .. } if eval_command_name(input) == Some("watch") => {
-            Some(IPC_CAPABILITY_FOREGROUND_OBSERVERS)
-        }
         _ => None,
     }
-}
-
-fn eval_command_name(input: &str) -> Option<&str> {
-    let command = input.trim_start().strip_prefix(':')?;
-    let end = command
-        .find(|character: char| character.is_whitespace() || character == '(')
-        .unwrap_or(command.len());
-    Some(&command[..end])
 }
 
 fn unsupported_capability_message(capability: &'static str) -> String {
@@ -1324,11 +1192,11 @@ mod tests {
         stream.write_all(&encoded).await.unwrap();
     }
 
-    fn enable_shared_foreground(client: &mut CuedClient) {
+    fn enable_execution_v3(client: &mut CuedClient) {
         client
             .daemon_capabilities
             .get_or_insert_default()
-            .insert(IPC_CAPABILITY_FOREGROUND_OBSERVERS.into());
+            .insert(IPC_CAPABILITY_EXECUTION_V3.into());
     }
 
     fn enable_named_sessions(client: &mut CuedClient) {
@@ -1445,32 +1313,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cued_client_foreground_helpers_emit_typed_requests() {
+    async fn cued_client_step_helpers_emit_typed_requests() {
         let (client_stream, mut server_stream) = duplex(4096);
         let mut client = CuedClient::from_stream(client_stream);
-        enable_shared_foreground(&mut client);
+        enable_execution_v3(&mut client);
+        let first = cue_core::StepId {
+            execution: cue_core::ExecutionId(1),
+            index: 1,
+        };
+        let second = cue_core::StepId {
+            execution: cue_core::ExecutionId(2),
+            index: 3,
+        };
 
-        assert_eq!(client.fg_attach("J1").await.unwrap(), 1);
-        assert_eq!(client.fg_watch("J2").await.unwrap(), 2);
-        assert_eq!(client.fg_claim_control().await.unwrap(), 3);
-        assert_eq!(client.fg_release_control().await.unwrap(), 4);
-        assert_eq!(client.fg_input(b"whoami\r".to_vec()).await.unwrap(), 5);
-        assert_eq!(client.fg_resize(120, 40).await.unwrap(), 6);
-        assert_eq!(client.fg_detach().await.unwrap(), 7);
+        assert_eq!(client.step_attach(first).await.unwrap(), 1);
+        assert_eq!(client.step_watch(second).await.unwrap(), 2);
+        assert_eq!(client.step_claim_control().await.unwrap(), 3);
+        assert_eq!(client.step_release_control().await.unwrap(), 4);
+        assert_eq!(client.step_input(b"whoami\r".to_vec()).await.unwrap(), 5);
+        assert_eq!(client.step_resize(120, 40).await.unwrap(), 6);
+        assert_eq!(client.step_detach().await.unwrap(), 7);
 
         let expected = [
-            RequestPayload::FgAttach { id: "J1".into() },
-            RequestPayload::FgWatch { id: "J2".into() },
-            RequestPayload::FgClaimControl {},
-            RequestPayload::FgReleaseControl {},
-            RequestPayload::FgInput {
+            RequestPayload::StepAttach { id: first },
+            RequestPayload::StepWatch { id: second },
+            RequestPayload::StepClaimControl {},
+            RequestPayload::StepReleaseControl {},
+            RequestPayload::StepInput {
                 data: b"whoami\r".to_vec(),
             },
-            RequestPayload::FgResize {
+            RequestPayload::StepResize {
                 cols: 120,
                 rows: 40,
             },
-            RequestPayload::FgDetach {},
+            RequestPayload::StepDetach {},
         ];
 
         for (index, expected_payload) in expected.into_iter().enumerate() {
@@ -1488,32 +1364,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_foreground_requests_are_gated_before_writing_to_an_old_daemon() {
+    async fn step_requests_are_gated_before_writing_to_an_old_daemon() {
         let (client_stream, mut server_stream) = duplex(4096);
         let mut client =
             CuedClient::from_stream_with_capabilities(client_stream, std::iter::empty::<&str>());
-
-        assert_eq!(client.fg_attach("J1").await.unwrap(), 1);
-        assert!(matches!(
-            read_message(&mut server_stream).await.unwrap(),
-            Message::Request {
-                payload: RequestPayload::FgAttach { .. },
-                ..
-            }
-        ));
+        let step = cue_core::StepId {
+            execution: cue_core::ExecutionId(1),
+            index: 1,
+        };
 
         for error in [
-            client.fg_watch("J1").await.unwrap_err(),
-            client.fg_claim_control().await.unwrap_err(),
-            client.fg_release_control().await.unwrap_err(),
-            client.eval(":watch J1", Mode::Job).await.unwrap_err(),
-            client
-                .eval(":watch(read_only=true) J1", Mode::Job)
-                .await
-                .unwrap_err(),
+            client.step_attach(step).await.unwrap_err(),
+            client.step_watch(step).await.unwrap_err(),
+            client.step_claim_control().await.unwrap_err(),
+            client.step_release_control().await.unwrap_err(),
         ] {
             let message = error.to_string();
-            assert!(message.contains(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
+            assert!(message.contains(IPC_CAPABILITY_EXECUTION_V3));
             assert!(message.contains("upgrade/restart cued"));
         }
 
@@ -1535,7 +1402,7 @@ mod tests {
             assert!(client.supports_capability(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
             let (_reader, writer) = client.into_reader_and_writer_handle();
             assert!(writer.supports_capability(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
-            writer.try_send(RequestPayload::FgReleaseControl {})
+            writer.try_send(RequestPayload::StepReleaseControl {})
         });
 
         let ping_id = match read_message(&mut server_stream).await.unwrap() {
@@ -1571,32 +1438,36 @@ mod tests {
             read_message(&mut server_stream).await.unwrap(),
             Message::Request {
                 id,
-                payload: RequestPayload::FgReleaseControl {},
+                payload: RequestPayload::StepReleaseControl {},
                 ..
             } if id == release_id
         ));
     }
 
     #[tokio::test]
-    async fn fg_watch_roundtrip_returns_atomic_attachment_snapshot() {
+    async fn step_watch_roundtrip_returns_atomic_attachment_snapshot() {
         let (client_stream, mut server_stream) = duplex(4096);
         let mut client = CuedClient::from_stream(client_stream);
-        enable_shared_foreground(&mut client);
-        let watching = tokio::spawn(async move { client.fg_watch_roundtrip("J9").await });
+        enable_execution_v3(&mut client);
+        let step = cue_core::StepId {
+            execution: cue_core::ExecutionId(9),
+            index: 1,
+        };
+        let watching = tokio::spawn(async move { client.step_watch_roundtrip(step).await });
 
         let request_id = match read_message(&mut server_stream).await.unwrap() {
             Message::Request {
-                id,
-                payload: RequestPayload::FgWatch { id: job_id },
+                id: request_id,
+                payload: RequestPayload::StepWatch { id: step_id },
                 ..
             } => {
-                assert_eq!(job_id, "J9");
-                id
+                assert_eq!(step_id, step);
+                request_id
             }
             other => panic!("unexpected request: {other:?}"),
         };
         let attachment = ForegroundAttachmentInfo {
-            id: "J9".into(),
+            id: "E9/S1".into(),
             attachment_id: 9,
             role: ForegroundRole::Observer,
             control_available: false,
@@ -2110,98 +1981,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiplexed_client_matches_concurrent_eval_responses_by_request_id() {
+    async fn multiplexed_client_matches_concurrent_typed_responses_by_request_id() {
         let (client_stream, mut server_stream) = duplex(4096);
         let client = CuedClient::from_stream(client_stream);
         let (reader, writer) = client.into_split();
         let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
 
         let mut tasks = Vec::new();
-        for index in 0..3usize {
+        for _ in 0..3usize {
             let client = Arc::clone(&client);
             tasks.push(tokio::spawn(async move {
-                let response = client
-                    .eval(&format!("job-{index}"), Mode::Job)
-                    .await
-                    .unwrap();
+                let response = client.call(RequestPayload::Ping {}).await.unwrap();
                 match response {
-                    ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => {
-                        assert_eq!(job_id, format!("J{index}"));
-                    }
+                    ResponsePayload::Ok(OkPayload::Pong { version, .. }) => version,
                     other => panic!("unexpected response: {other:?}"),
                 }
             }));
         }
 
-        let mut request_inputs = Vec::new();
+        let mut request_ids = Vec::new();
         for _ in 0..3 {
             let message = read_message(&mut server_stream).await.unwrap();
             match message {
                 Message::Request {
                     id,
-                    payload: RequestPayload::Eval { input, mode },
+                    payload: RequestPayload::Ping {},
                     ..
                 } => {
-                    assert_eq!(mode, Mode::Job);
-                    request_inputs.push((id, input));
+                    request_ids.push(id);
                 }
                 other => panic!("unexpected request: {other:?}"),
             }
         }
 
-        let unique_request_ids = request_inputs
-            .iter()
-            .map(|(id, _)| *id)
-            .collect::<HashSet<_>>();
+        let unique_request_ids = request_ids.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique_request_ids.len(), 3);
 
-        for (request_id, input) in request_inputs.iter().rev() {
-            let job_suffix = input
-                .strip_prefix("job-")
-                .expect("test eval input should have job- prefix");
+        for (index, request_id) in request_ids.iter().rev().enumerate() {
             write_message(
                 &mut server_stream,
                 &Message::Response {
                     id: *request_id,
-                    payload: ResponsePayload::Ok(OkPayload::JobCreated {
-                        job_id: format!("J{job_suffix}"),
-                        start_scope: None,
-                        open_hint: cue_core::ipc::JobOpenHint::Stream,
-                        chain_id: None,
-                        chain_index: None,
-                        chain_total: None,
-                        warnings: Vec::new(),
+                    payload: ResponsePayload::Ok(OkPayload::Pong {
+                        version: (2 - index).to_string(),
+                        instance_id: String::new(),
+                        generation_id: String::new(),
+                        ready: true,
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        capabilities: Vec::new(),
                     }),
                 },
             )
             .await;
         }
 
+        let mut versions = Vec::new();
         for task in tasks {
-            task.await.unwrap();
+            versions.push(task.await.unwrap());
         }
+        versions.sort();
+        assert_eq!(versions, ["0", "1", "2"]);
     }
 
     #[tokio::test]
-    async fn multiplexed_foreground_watch_routes_atomic_attachment_response() {
+    async fn multiplexed_step_watch_routes_atomic_attachment_response() {
         let (client_stream, mut server_stream) = duplex(4096);
         let mut client = CuedClient::from_stream(client_stream);
-        enable_shared_foreground(&mut client);
+        enable_execution_v3(&mut client);
         let (reader, writer) = client.into_split();
         let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
+        let step = cue_core::StepId {
+            execution: cue_core::ExecutionId(12),
+            index: 1,
+        };
 
         let watching = tokio::spawn({
             let client = Arc::clone(&client);
-            async move { client.fg_watch("J12").await }
+            async move { client.step_watch(step).await }
         });
         let request_id = match read_message(&mut server_stream).await.unwrap() {
             Message::Request {
-                id,
-                payload: RequestPayload::FgWatch { id: job_id },
+                id: request_id,
+                payload: RequestPayload::StepWatch { id: step_id },
                 ..
             } => {
-                assert_eq!(job_id, "J12");
-                id
+                assert_eq!(step_id, step);
+                request_id
             }
             other => panic!("unexpected request: {other:?}"),
         };
@@ -2211,7 +2076,7 @@ mod tests {
                 id: request_id,
                 payload: ResponsePayload::Ok(OkPayload::FgAttached(Box::new(
                     ForegroundAttachmentInfo {
-                        id: "J12".into(),
+                        id: "E12/S1".into(),
                         attachment_id: 12,
                         role: ForegroundRole::Observer,
                         control_available: false,
@@ -2225,7 +2090,7 @@ mod tests {
 
         match watching.await.unwrap().unwrap() {
             ResponsePayload::Ok(OkPayload::FgAttached(attachment)) => {
-                assert_eq!(attachment.id, "J12");
+                assert_eq!(attachment.id, "E12/S1");
                 assert_eq!(attachment.role, ForegroundRole::Observer);
                 assert_eq!(attachment.snapshot, b"shared output");
             }
@@ -2234,21 +2099,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiplexed_client_gates_shared_foreground_before_allocating_or_writing() {
+    async fn multiplexed_client_gates_step_requests_before_allocating_or_writing() {
         let (client_stream, mut server_stream) = duplex(4096);
         let client =
             CuedClient::from_stream_with_capabilities(client_stream, std::iter::empty::<&str>());
         let (reader, writer) = client.into_split();
         let client = MultiplexedClient::new(reader, spawn_writer_task(writer));
 
-        for error in [
-            client.fg_watch("J4").await.unwrap_err(),
-            client.eval(":watch J4", Mode::Job).await.unwrap_err(),
-        ] {
-            let message = error.to_string();
-            assert!(message.contains(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
-            assert!(message.contains("upgrade/restart cued"));
-        }
+        let error = client
+            .step_watch(cue_core::StepId {
+                execution: cue_core::ExecutionId(4),
+                index: 1,
+            })
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(IPC_CAPABILITY_EXECUTION_V3));
+        assert!(message.contains("upgrade/restart cued"));
         let named_error = client
             .call(RequestPayload::ListSessions {})
             .await

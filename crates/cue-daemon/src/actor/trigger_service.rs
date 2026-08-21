@@ -129,6 +129,15 @@ pub(super) async fn spawn(
                             state.draining = true;
                             let _ = reply.send(());
                         }
+                        TriggerServiceMsg::SessionArchiveBlocker { session_id, reply } => {
+                            let blocker = state.entries.values().find(|entry| {
+                                entry.stored.session_id.as_deref() == Some(&session_id)
+                            }).map(|entry| format!(
+                                "named session owns schedule {}; remove it before archiving",
+                                entry.stored.id
+                            ));
+                            let _ = reply.send(blocker);
+                        }
                         TriggerServiceMsg::Shutdown => break,
                     }
                 }

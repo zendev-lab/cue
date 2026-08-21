@@ -388,7 +388,6 @@ dependencies = [
  "bpaf",
  "chrono",
  "cue-core",
- "cue-language",
  "insta",
  "libc",
  "nvml-wrapper",

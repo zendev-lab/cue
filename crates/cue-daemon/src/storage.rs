@@ -3,17 +3,23 @@
 //! Uses WAL mode for concurrent reads.  The schema is migrated on open.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use cue_core::cron::{CronSchedule, CronStatus};
 use cue_core::execution::{ExecutionSnapshot, ExecutionSpec};
 use cue_core::ipc::ExecutionStepInfo;
+#[cfg(test)]
 use cue_core::job::JobStatus;
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
-use cue_core::{CronId, JobId, ScheduleId, ScopeHash, ScriptId};
+#[cfg(test)]
+use cue_core::{CronId, JobId, ScriptId};
+use cue_core::{ScheduleId, ScopeHash};
 use rusqlite::Connection;
 
 pub type SharedConnection = Arc<Mutex<Connection>>;
@@ -710,6 +716,7 @@ fn durable_scope_reference(conn: &Connection, scope: Option<ScopeHash>) -> Resul
 /// closure. Durable job, cron, and named-session references are checked inside
 /// the transaction; a missing root therefore fails the sweep instead of
 /// creating dangling data.
+#[cfg(test)]
 pub fn sweep_scopes(conn: &Connection, reachable: &HashSet<ScopeHash>) -> Result<usize> {
     let tx = conn
         .unchecked_transaction()
@@ -1096,6 +1103,7 @@ fn unix_time_ms() -> Result<i64> {
     i64::try_from(millis).context("system clock exceeds SQLite integer range")
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredJob {
     pub id: String,
@@ -1110,6 +1118,7 @@ pub struct StoredJob {
     pub stderr: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCron {
     pub id: String,
@@ -1123,12 +1132,14 @@ pub struct StoredCron {
     pub wrapper_enabled: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedCron {
     pub record: StoredCron,
     pub elapsed: Duration,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredScriptRun {
     pub id: String,
@@ -1142,6 +1153,7 @@ pub struct StoredScriptRun {
     pub failed_item_index: Option<usize>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredScriptRunStatus {
     Submitted,
@@ -1150,6 +1162,7 @@ pub enum StoredScriptRunStatus {
     Failed,
 }
 
+#[cfg(test)]
 impl StoredScriptRunStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -1165,6 +1178,7 @@ impl StoredScriptRunStatus {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredScriptItem {
     pub script_id: String,
@@ -1286,6 +1300,7 @@ pub fn load_sessions(conn: &Connection) -> Result<Vec<StoredSession>> {
     Ok(sessions)
 }
 
+#[cfg(test)]
 pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
     let status_json = serde_json::to_string(&job.status).context("serialize job status")?;
     let start_scope = durable_scope_reference(conn, job.start_scope)?;
@@ -1327,6 +1342,7 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
     let mut stmt = conn.prepare(
         "SELECT id, session_id, pipeline, status, exit_code, start_scope, end_scope,
@@ -1397,6 +1413,7 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
     Ok(jobs.into_iter().map(|(_, job)| job).collect())
 }
 
+#[cfg(test)]
 pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
     let volatile_scope = cron
         .scope_hash
@@ -1452,6 +1469,7 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn upsert_script_run(
     conn: &Connection,
     script: &StoredScriptRun,
@@ -1521,6 +1539,7 @@ pub fn upsert_script_run(
     tx.commit().context("commit script run upsert")
 }
 
+#[cfg(test)]
 pub fn max_script_run_id(conn: &Connection) -> Result<Option<u32>> {
     let mut stmt = conn.prepare("SELECT id FROM script_runs")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1533,6 +1552,7 @@ pub fn max_script_run_id(conn: &Connection) -> Result<Option<u32>> {
     Ok(max_id)
 }
 
+#[cfg(test)]
 pub fn prune_job_history(conn: &Connection, keep: usize) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT id, status FROM jobs_history")?;
     let rows = stmt.query_map([], |row| {
@@ -1566,6 +1586,7 @@ pub fn prune_job_history(conn: &Connection, keep: usize) -> Result<Vec<String>> 
     Ok(removed)
 }
 
+#[cfg(test)]
 pub fn prune_script_runs(conn: &Connection, keep: usize) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT id, status FROM script_runs")?;
     let rows = stmt.query_map([], |row| {
@@ -1599,11 +1620,7 @@ pub fn prune_script_runs(conn: &Connection, keep: usize) -> Result<Vec<String>> 
     Ok(removed)
 }
 
-pub fn delete_cron(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM crons WHERE id = ?1", rusqlite::params![id])?;
-    Ok(())
-}
-
+#[cfg(test)]
 pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
     let mut stmt = conn.prepare(&format!(
         "WITH now_ms(value) AS (SELECT {CRON_CREATED_AT_MS_EXPR})
@@ -1683,15 +1700,18 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
 
 // ── Helpers ──
 
+#[cfg(test)]
 fn duration_from_nonnegative_millis(millis: i64) -> Result<Duration> {
     let millis = u64::try_from(millis).context("cron created_at is in the future")?;
     Ok(Duration::from_millis(millis))
 }
 
+#[cfg(test)]
 fn parse_job_status(text: &str) -> Result<JobStatus> {
     serde_json::from_str(text).with_context(|| format!("unknown job status encoding: {text}"))
 }
 
+#[cfg(test)]
 fn parse_script_run_status(text: &str) -> Result<StoredScriptRunStatus> {
     match text.trim_matches('"') {
         "submitted" => Ok(StoredScriptRunStatus::Submitted),
@@ -1702,22 +1722,26 @@ fn parse_script_run_status(text: &str) -> Result<StoredScriptRunStatus> {
     }
 }
 
+#[cfg(test)]
 fn parse_cron_status(text: &str) -> Result<CronStatus> {
     serde_json::from_str(text).with_context(|| format!("unknown cron status encoding: {text}"))
 }
 
+#[cfg(test)]
 fn parse_cron_id(id: &str) -> Result<u32> {
     id.parse::<CronId>()
         .map(|id| id.0)
         .with_context(|| format!("invalid cron id {id}"))
 }
 
+#[cfg(test)]
 fn parse_job_history_id(id: &str) -> Result<u32> {
     id.parse::<JobId>()
         .map(|id| id.0)
         .with_context(|| format!("invalid job history id {id}"))
 }
 
+#[cfg(test)]
 fn parse_script_run_id(id: &str) -> Result<u32> {
     id.parse::<ScriptId>()
         .map(|id| id.0)

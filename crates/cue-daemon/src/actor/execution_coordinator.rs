@@ -96,6 +96,8 @@ struct CoordinatorState {
     next_execution: u64,
     next_process_job: u32,
     records: BTreeMap<ExecutionId, ExecutionRecord>,
+    draining: bool,
+    drain_waiters: Vec<oneshot::Sender<()>>,
 }
 
 impl CoordinatorState {
@@ -104,6 +106,8 @@ impl CoordinatorState {
             next_execution,
             next_process_job: FIRST_EXECUTION_PROCESS_JOB,
             records,
+            draining: false,
+            drain_waiters: Vec::new(),
         }
     }
 
@@ -169,15 +173,25 @@ pub(super) async fn spawn(
                     for id in ids {
                         drive_execution(id, &mut state, &sys, &db).await;
                     }
+                    finish_drain_if_idle(&mut state);
                 }
                 message = rx.recv() => {
                     let Some(message) = message else { break };
                     match message {
                         ExecutionCoordinatorMsg::Submit { client_id, request_id, spec, binding } => {
-                            submit(client_id, Some(request_id), *spec, binding, &mut state, &sys, &db).await;
+                            if state.draining {
+                                send_response(&sys, client_id, request_id, ResponsePayload::err(
+                                    error_code::DAEMON_DRAINING,
+                                    "daemon is draining; new execution admission is closed",
+                                )).await;
+                            } else {
+                                submit(client_id, Some(request_id), *spec, binding, &mut state, &sys, &db).await;
+                            }
                         }
                         ExecutionCoordinatorMsg::SubmitTriggered { spec, binding } => {
-                            submit(0, None, *spec, binding, &mut state, &sys, &db).await;
+                            if !state.draining {
+                                submit(0, None, *spec, binding, &mut state, &sys, &db).await;
+                            }
                         }
                         ExecutionCoordinatorMsg::Get { client_id, request_id, id, named_session_id } => {
                             let response = visible_record(&state, id, named_session_id.as_deref())
@@ -216,13 +230,42 @@ pub(super) async fn spawn(
                         ExecutionCoordinatorMsg::StepFinished { step_id, exit_code } => {
                             step_finished(step_id, exit_code, &mut state, &sys, &db).await;
                         }
+                        ExecutionCoordinatorMsg::SessionArchiveBlocker { session_id, reply } => {
+                            let blocker = state.records.values().find(|record| {
+                                record.session_id.as_deref() == Some(&session_id)
+                                    && !record.execution.state().is_terminal()
+                            }).map(|record| format!(
+                                "named session has non-terminal execution {}; wait for or cancel it before archiving",
+                                record.execution.id()
+                            ));
+                            let _ = reply.send(blocker);
+                        }
+                        ExecutionCoordinatorMsg::BeginDrain { reply } => {
+                            state.draining = true;
+                            state.drain_waiters.push(reply);
+                        }
                         ExecutionCoordinatorMsg::Shutdown => break,
                     }
+                    finish_drain_if_idle(&mut state);
                 }
             }
         }
     });
     Ok(())
+}
+
+fn finish_drain_if_idle(state: &mut CoordinatorState) {
+    if !state.draining
+        || state
+            .records
+            .values()
+            .any(|record| !record.execution.state().is_terminal())
+    {
+        return;
+    }
+    for waiter in std::mem::take(&mut state.drain_waiters) {
+        let _ = waiter.send(());
+    }
 }
 
 fn visible_record<'a>(
@@ -357,6 +400,9 @@ async fn drive_execution(
     };
     if record.execution.state().is_terminal() {
         finish_if_terminal(&mut record, sys).await;
+        if let Err(error) = persist_record(db, &record).await {
+            error!(%id, %error, "execution coordinator: failed to persist terminal state");
+        }
         state.records.insert(id, record);
         return;
     }

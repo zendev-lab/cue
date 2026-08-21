@@ -13,7 +13,6 @@ use crate::event_channel::EventChannel;
 use crate::execution::{CancelMode, ExecutionSpec, ExecutionState, StepState};
 use crate::id::{ExecutionId, ScheduleId, ScopeHash, StepId};
 use crate::job::JobStatus;
-use crate::mode::Mode;
 use crate::scope::EnvDelta;
 
 /// IPC protocol version required by sessionized clients.
@@ -86,23 +85,11 @@ pub enum Message {
 
 // ── Requests (Client → cued) ──
 
-/// All user commands go through `Eval`. Structured requests are only for
-/// protocol-level operations not typed by the user.
 /// Daemon input boundary. Unknown request fields are rejected so typed clients
 /// cannot accidentally depend on parameters the daemon silently ignores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum RequestPayload {
-    // User commands (raw string, parsed by cued)
-    Eval {
-        input: String,
-        mode: Mode,
-    },
-    RunScript {
-        path: String,
-        input: String,
-    },
-
     // Connection management
     Handshake {
         /// Exact wire version. v3 is a hard cut; older clients receive an
@@ -211,72 +198,27 @@ pub enum RequestPayload {
         id: StepId,
     },
 
-    // :fg proxy
-    FgAttach {
-        id: String,
-    },
-    /// Observe a PTY job without acquiring its input/controller lease.
-    FgWatch {
-        id: String,
-    },
     /// Acquire the free controller lease for the currently observed PTY job.
-    FgClaimControl {},
+    StepClaimControl {},
     /// Release the controller lease while remaining an observer.
-    FgReleaseControl {},
-    FgDetach {},
-    FgInput {
+    StepReleaseControl {},
+    StepDetach {},
+    StepInput {
         #[serde(with = "serde_bytes_base64")]
         data: Vec<u8>,
     },
-    FgResize {
+    StepResize {
         cols: u16,
         rows: u16,
     },
-    // Editor services
-    Complete {
-        input: String,
-        cursor: usize,
-    },
-    Highlight {
-        input: String,
-    },
 
-    // Typed query/control APIs for non-interactive clients.
-    ListJobs {
-        limit: Option<usize>,
-    },
-    ListCrons {
-        limit: Option<usize>,
-    },
+    // Typed scope/configuration queries.
     ListScopes {
         limit: Option<usize>,
     },
-    /// Recover the authoritative state of a daemon-lifetime file-script run.
-    ScriptInfo {
-        id: String,
-    },
-    ShowLog {
-        id: Option<String>,
-        limit: Option<usize>,
-        tail_bytes: Option<usize>,
-    },
-    JobOutput {
-        id: String,
-        stdout_bytes: Option<usize>,
-        stderr_bytes: Option<usize>,
-    },
-    KillJob {
-        id: String,
-    },
-    /// Idempotently cancel a foreground execution by job (`J<n>`), chain
-    /// (`CH<n>`), or script-run (`R<n>`) id. The acknowledgement is sent only
-    /// after any currently running child processes have stopped.
     CancelExecution {
         id: ExecutionId,
         mode: CancelMode,
-    },
-    RemoveCron {
-        id: String,
     },
     ShowEnv {
         tail_bytes: Option<usize>,
@@ -978,13 +920,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_eval_request() {
+    fn roundtrip_typed_execution_request() {
         let msg = Message::Request {
             id: 1,
-            operation_id: Some("tool-call-1:eval".into()),
-            payload: RequestPayload::Eval {
-                input: ":run cargo test".into(),
-                mode: Mode::Job,
+            operation_id: Some("tool-call-1:execute".into()),
+            payload: RequestPayload::SubmitExecution {
+                spec: Box::new(ExecutionSpec {
+                    plan: crate::execution::ExecutionPlan::pipeline(
+                        crate::pipeline::Pipeline::simple(vec!["true".into()]),
+                    ),
+                    start_scope: None,
+                    launch_context: Default::default(),
+                    source: None,
+                    retry_of: None,
+                }),
             },
         };
         let encoded = encode_message(&msg).unwrap();
@@ -996,13 +945,12 @@ mod tests {
         if let Message::Request {
             id,
             operation_id,
-            payload: RequestPayload::Eval { input, mode },
+            payload: RequestPayload::SubmitExecution { spec },
         } = decoded
         {
             assert_eq!(id, 1);
-            assert_eq!(operation_id.as_deref(), Some("tool-call-1:eval"));
-            assert_eq!(input, ":run cargo test");
-            assert_eq!(mode, Mode::Job);
+            assert_eq!(operation_id.as_deref(), Some("tool-call-1:execute"));
+            assert_eq!(spec.plan.node_count(), 1);
         } else {
             panic!("wrong variant");
         }
@@ -1074,14 +1022,18 @@ mod tests {
     }
 
     #[test]
-    fn typed_query_payloads_roundtrip() {
+    fn typed_output_query_roundtrips() {
         let msg = Message::Request {
             id: 7,
             operation_id: None,
-            payload: RequestPayload::ShowLog {
-                id: Some("J1".into()),
-                limit: Some(20),
-                tail_bytes: Some(4096),
+            payload: RequestPayload::ReadExecutionOutput {
+                id: ExecutionId(1),
+                step_id: Some(StepId {
+                    execution: ExecutionId(1),
+                    index: 2,
+                }),
+                stdout_bytes: Some(20),
+                stderr_bytes: Some(4096),
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -1089,16 +1041,18 @@ mod tests {
         match decoded {
             Message::Request {
                 payload:
-                    RequestPayload::ShowLog {
+                    RequestPayload::ReadExecutionOutput {
                         id,
-                        limit,
-                        tail_bytes,
+                        step_id,
+                        stdout_bytes,
+                        stderr_bytes,
                     },
                 ..
             } => {
-                assert_eq!(id.as_deref(), Some("J1"));
-                assert_eq!(limit, Some(20));
-                assert_eq!(tail_bytes, Some(4096));
+                assert_eq!(id, ExecutionId(1));
+                assert_eq!(step_id.expect("step").index, 2);
+                assert_eq!(stdout_bytes, Some(20));
+                assert_eq!(stderr_bytes, Some(4096));
             }
             _ => panic!("wrong variant"),
         }
@@ -1235,73 +1189,6 @@ mod tests {
             ResponsePayload::Ok(OkPayload::JobOutput { stdout, .. }) => {
                 assert_eq!(stdout.encoding, OutputEncoding::Base64);
                 assert_eq!(stdout.base64.as_deref(), Some("/2Jpbg=="));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn run_script_request_roundtrips() {
-        let msg = Message::Request {
-            id: 9,
-            operation_id: None,
-            payload: RequestPayload::RunScript {
-                path: "scripts/build.cue".into(),
-                input: ":run cargo build".into(),
-            },
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let decoded: Message = serde_json::from_str(&json).unwrap();
-        match decoded {
-            Message::Request {
-                id,
-                payload: RequestPayload::RunScript { path, input },
-                ..
-            } => {
-                assert_eq!(id, 9);
-                assert_eq!(path, "scripts/build.cue");
-                assert_eq!(input, ":run cargo build");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn run_script_request_rejects_unknown_fields() {
-        let json = r#"{"type":"request","id":9,"payload":{"RunScript":{"path":"scripts/build.cue","input":":run cargo build","mode":"job"}}}"#;
-
-        let error = serde_json::from_str::<Message>(json)
-            .expect_err("unknown request fields must not be ignored");
-
-        assert!(
-            error.to_string().contains("unknown field `mode`"),
-            "wrong error: {error}"
-        );
-    }
-
-    #[test]
-    fn complete_request_roundtrips_without_mode() {
-        let msg = Message::Request {
-            id: 3,
-            operation_id: None,
-            payload: RequestPayload::Complete {
-                input: ":ru".into(),
-                cursor: 3,
-            },
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("mode"));
-
-        let decoded: Message = serde_json::from_str(&json).unwrap();
-        match decoded {
-            Message::Request {
-                id,
-                payload: RequestPayload::Complete { input, cursor },
-                ..
-            } => {
-                assert_eq!(id, 3);
-                assert_eq!(input, ":ru");
-                assert_eq!(cursor, 3);
             }
             _ => panic!("wrong variant"),
         }
@@ -1486,9 +1373,14 @@ mod tests {
     #[test]
     fn shared_foreground_requests_and_control_event_roundtrip() {
         for payload in [
-            RequestPayload::FgWatch { id: "J7".into() },
-            RequestPayload::FgClaimControl {},
-            RequestPayload::FgReleaseControl {},
+            RequestPayload::StepWatch {
+                id: StepId {
+                    execution: ExecutionId(7),
+                    index: 1,
+                },
+            },
+            RequestPayload::StepClaimControl {},
+            RequestPayload::StepReleaseControl {},
         ] {
             let json = serde_json::to_string(&payload).unwrap();
             serde_json::from_str::<RequestPayload>(&json).unwrap();

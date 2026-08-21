@@ -15,20 +15,17 @@ use cue_core::EventChannel;
 #[cfg(test)]
 use cue_core::ipc::EventPayload;
 use cue_core::ipc::{
-    ForegroundRole, IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload,
-    ResponsePayload, current_protocol_capabilities, encode_message, error_code,
+    ForegroundRole, IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, OutputEncoding,
+    PageInfo, RequestPayload, ResponsePayload, current_protocol_capabilities, encode_message,
+    error_code,
 };
 use cue_core::scope::EnvSnapshot;
-
-use cue_language::{
-    ResolvedCommand, complete_input, highlight_input, parse_command, parse_file_script_command,
-};
 
 use super::operation_ledger::{BeginOutcome, OperationLedger, OperationWaiter};
 use super::{
     ActorSystem, CLIENT_EVENT_CAP, ClientEvent, ClientEventAudience, EventBusMsg,
-    ExecutionCoordinatorMsg, ForegroundRoleUpdate, GatewayMsg, SchedulerMsg, ScopeStoreMsg,
-    SessionBinding, SessionCommand, TriggerServiceMsg,
+    ExecutionCoordinatorMsg, ForegroundRoleUpdate, GatewayMsg, ScopeStoreMsg, SessionBinding,
+    SessionCommand, SessionCoordinatorMsg, TriggerServiceMsg,
 };
 
 /// Next client id counter (global, atomic).
@@ -74,6 +71,7 @@ where
 const CLIENT_RESPONSE_CAP: usize = 64;
 const MAX_INFLIGHT_REQUESTS_PER_CLIENT: usize = 1_024;
 const CLIENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_OUTPUT_TAIL_BYTES: usize = MAX_MESSAGE_SIZE / 4;
 
 #[derive(Clone)]
 struct ClientQueues {
@@ -453,7 +451,6 @@ async fn handle_client(
                             session_namespace,
                             operation_id.as_deref(),
                             &payload,
-                            &sys.config.aliases,
                             waiter,
                         );
                         let should_route = match outcome {
@@ -591,12 +588,12 @@ async fn handle_client(
         debug!(%client_id, "gateway: foreground cleanup failed: {error}");
     }
     if sys
-        .scheduler
-        .send(SchedulerMsg::Disconnect { client_id })
+        .sessions
+        .send(SessionCoordinatorMsg::Disconnect { client_id })
         .await
         .is_err()
     {
-        debug!(%client_id, "gateway: scheduler unavailable during client cleanup");
+        debug!(%client_id, "gateway: session coordinator unavailable during client cleanup");
     }
 }
 
@@ -605,18 +602,11 @@ fn idempotency_outcome(
     session_namespace: Option<[u8; 32]>,
     operation_id: Option<&str>,
     payload: &RequestPayload,
-    aliases: &crate::config::AliasConfig,
     waiter: OperationWaiter,
 ) -> Result<BeginOutcome> {
     let Some(operation_id) = operation_id else {
         return Ok(BeginOutcome::Route);
     };
-    if eval_resolves_to_connection_local_foreground(payload, aliases) {
-        return Ok(BeginOutcome::respond(ResponsePayload::err(
-            error_code::INVALID_REQUEST,
-            "operation_id is not supported for connection-local :fg or :watch requests",
-        )));
-    }
     if !is_side_effecting_request(payload) {
         return Ok(BeginOutcome::respond(ResponsePayload::err(
             error_code::INVALID_REQUEST,
@@ -633,28 +623,6 @@ fn idempotency_outcome(
     Ok(operation_ledger(operations).begin(session_namespace, operation_id, fingerprint, waiter))
 }
 
-fn eval_resolves_to_connection_local_foreground(
-    payload: &RequestPayload,
-    aliases: &crate::config::AliasConfig,
-) -> bool {
-    let RequestPayload::Eval { input, mode } = payload else {
-        return false;
-    };
-    let input = aliases.apply(input);
-    parse_command(&input, *mode)
-        .is_ok_and(|command| command_contains_connection_local_foreground(&command))
-}
-
-fn command_contains_connection_local_foreground(command: &ResolvedCommand) -> bool {
-    match command {
-        ResolvedCommand::Fg { .. } => true,
-        ResolvedCommand::Script { items, .. } => items
-            .iter()
-            .any(|item| command_contains_connection_local_foreground(&item.command)),
-        _ => false,
-    }
-}
-
 fn is_side_effecting_request(payload: &RequestPayload) -> bool {
     matches!(
         payload,
@@ -665,25 +633,10 @@ fn is_side_effecting_request(payload: &RequestPayload) -> bool {
             | RequestPayload::PauseSchedule { .. }
             | RequestPayload::ResumeSchedule { .. }
             | RequestPayload::RemoveSchedule { .. }
-            | RequestPayload::Eval { .. }
-            | RequestPayload::RunScript { .. }
-            | RequestPayload::KillJob { .. }
-            | RequestPayload::RemoveCron { .. }
             | RequestPayload::ArchiveSession { .. }
             | RequestPayload::RestoreSession { .. }
             | RequestPayload::Restart {}
             | RequestPayload::Shutdown {}
-    )
-}
-
-fn command_starts_execution(command: &ResolvedCommand) -> bool {
-    matches!(
-        command,
-        ResolvedCommand::Script { .. }
-            | ResolvedCommand::Run { .. }
-            | ResolvedCommand::Cron { .. }
-            | ResolvedCommand::Retry { .. }
-            | ResolvedCommand::Resume { .. }
     )
 }
 
@@ -752,8 +705,8 @@ async fn route_request(
                 cwd: PathBuf::from(cwd),
             };
             let (reply, result) = tokio::sync::oneshot::channel();
-            sys.scheduler
-                .send(SchedulerMsg::Connect {
+            sys.sessions
+                .send(SessionCoordinatorMsg::Connect {
                     client_id,
                     session_id,
                     snapshot,
@@ -761,7 +714,7 @@ async fn route_request(
                     reply,
                 })
                 .await
-                .context("send session handshake to scheduler")?;
+                .context("send session handshake")?;
             match result.await {
                 Ok(Ok(binding)) => {
                     prepare_client_binding(sys, event_state, client_id, request_id, &binding)
@@ -893,206 +846,38 @@ async fn route_request(
             .await;
         }
 
-        RequestPayload::Eval { input, mode } => {
-            let input = sys.config.aliases.apply(&input);
-            match parse_command(&input, mode) {
-                Ok(command) => {
-                    if lifecycle.execution_admission_closed() && command_starts_execution(&command)
-                    {
-                        sys.gateway
-                            .send(GatewayMsg::SendResponse {
-                                client_id,
-                                request_id,
-                                payload: draining_response(),
-                            })
-                            .await
-                            .context("send draining rejection")?;
-                        return Ok(None);
-                    }
-                    if matches!(
-                        command,
-                        ResolvedCommand::Script {
-                            source: cue_core::ipc::ScriptSource::Inline,
-                            ..
-                        }
-                    ) {
-                        sys.gateway
-                            .send(GatewayMsg::SendResponse {
-                                client_id,
-                                request_id,
-                                payload: inline_script_disabled_response(),
-                            })
-                            .await
-                            .context("send inline script rejection")?;
-                        return Ok(None);
-                    }
-                    if matches!(command, ResolvedCommand::Fg { .. }) {
-                        begin_client_event_hold_fence(event_state, request_id);
-                    }
-                    send_scheduler_eval(sys, client_id, request_id, command, "send to scheduler")
-                        .await?;
-                }
-                Err(e) => {
-                    sys.gateway
-                        .send(GatewayMsg::SendResponse {
-                            client_id,
-                            request_id,
-                            payload: ResponsePayload::err(
-                                error_code::INVALID_SYNTAX,
-                                e.to_string(),
-                            ),
-                        })
-                        .await
-                        .context("send error response")?;
-                }
-            }
-        }
-
-        RequestPayload::RunScript { path, input } => {
-            if lifecycle.execution_admission_closed() {
-                sys.gateway
-                    .send(GatewayMsg::SendResponse {
-                        client_id,
-                        request_id,
-                        payload: draining_response(),
-                    })
-                    .await
-                    .context("send draining script rejection")?;
+        RequestPayload::ListScopes { limit } => {
+            if current_binding(sys, client_id).await?.is_none() {
+                send_handshake_required(sys, client_id, request_id).await?;
                 return Ok(None);
             }
-            match parse_file_script_command(&input) {
-                Ok(mut command) => {
-                    if command_contains_connection_local_foreground(&command) {
-                        sys.gateway
-                            .send(GatewayMsg::SendResponse {
-                                client_id,
-                                request_id,
-                                payload: ResponsePayload::err(
-                                    error_code::NOT_SUPPORTED,
-                                    "file scripts cannot use connection-local :fg or :watch commands; attach to the job interactively instead",
-                                ),
-                            })
-                            .await
-                            .context("send file script foreground rejection")?;
-                        return Ok(None);
-                    }
-                    if let ResolvedCommand::Script { source, .. } = &mut command {
-                        *source = cue_core::ipc::ScriptSource::File { path };
-                    }
-                    send_scheduler_eval(
-                        sys,
-                        client_id,
-                        request_id,
-                        command,
-                        "send script to scheduler",
-                    )
-                    .await?;
-                }
-                Err(e) => {
-                    sys.gateway
-                        .send(GatewayMsg::SendResponse {
-                            client_id,
-                            request_id,
-                            payload: ResponsePayload::err(
-                                error_code::INVALID_SYNTAX,
-                                e.to_string(),
-                            ),
-                        })
-                        .await
-                        .context("send error response")?;
-                }
-            }
-        }
-
-        RequestPayload::ListJobs { limit } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::ListJobs { limit },
-                "send list jobs to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::ListCrons { limit } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::ListCrons { limit },
-                "send list crons to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::ListScopes { limit } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::ListScopes { limit },
-                "send list scopes to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::ScriptInfo { id } => {
-            sys.scheduler
-                .send(SchedulerMsg::ScriptInfo {
-                    client_id,
-                    request_id,
-                    id,
-                })
+            let (reply, scopes) = tokio::sync::oneshot::channel();
+            sys.scope_store
+                .send(ScopeStoreMsg::ListScopes { reply })
                 .await
-                .context("send script info query to scheduler")?;
-        }
-
-        RequestPayload::ShowLog {
-            id,
-            limit,
-            tail_bytes,
-        } => {
-            send_scheduler_eval(
+                .context("send typed scope list")?;
+            let payload = match scopes.await.context("typed scope list reply dropped")? {
+                Ok(scopes) => {
+                    let total = scopes.len();
+                    let shown = limit.map_or(total, |limit| limit.min(total));
+                    ResponsePayload::Ok(OkPayload::ScopeListPage {
+                        scopes: scopes.into_iter().take(shown).collect(),
+                        page: PageInfo {
+                            total,
+                            shown,
+                            limit,
+                            truncated: shown < total,
+                        },
+                    })
+                }
+                Err(error) => ResponsePayload::err(error_code::INTERNAL, error.to_string()),
+            };
+            send_typed_response(
                 sys,
                 client_id,
                 request_id,
-                ResolvedCommand::ShowLog {
-                    id,
-                    limit,
-                    tail_bytes,
-                },
-                "send show log to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::JobOutput {
-            id,
-            stdout_bytes,
-            stderr_bytes,
-        } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::JobOutput {
-                    id,
-                    stdout_bytes,
-                    stderr_bytes,
-                },
-                "send job output to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::KillJob { id } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::KillJob { id },
-                "send kill job to scheduler",
+                payload,
+                "send typed scope list response",
             )
             .await?;
         }
@@ -1246,8 +1031,8 @@ async fn route_request(
 
         RequestPayload::ApplyScopeDelta { base, delta } => {
             let (reply, response) = tokio::sync::oneshot::channel();
-            sys.scheduler
-                .send(SchedulerMsg::ApplyScopeDelta {
+            sys.sessions
+                .send(SessionCoordinatorMsg::ApplyScopeDelta {
                     client_id,
                     base,
                     delta,
@@ -1408,35 +1193,64 @@ async fn route_request(
                 .context("send schedule removal")?;
         }
 
-        RequestPayload::RemoveCron { id } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::RemoveCron { id },
-                "send remove cron to scheduler",
-            )
-            .await?;
-        }
-
         RequestPayload::ShowEnv { tail_bytes } => {
-            send_scheduler_eval(
+            let payload = if let Some(response) = invalid_tail_bytes_response(tail_bytes) {
+                response
+            } else if let Some(binding) = current_binding(sys, client_id).await? {
+                let (reply, scope) = tokio::sync::oneshot::channel();
+                sys.scope_store
+                    .send(ScopeStoreMsg::GetScope {
+                        hash: binding.scope,
+                        reply,
+                    })
+                    .await
+                    .context("send typed environment scope query")?;
+                match scope
+                    .await
+                    .context("typed environment scope reply dropped")?
+                {
+                    Ok(Some(scope)) => match scope.snapshot {
+                        Some(snapshot) => {
+                            text_output_response(format_snapshot_env(&snapshot), tail_bytes)
+                        }
+                        None => ResponsePayload::err(
+                            error_code::INVALID_STATE,
+                            format!("scope {} has no snapshot", binding.scope),
+                        ),
+                    },
+                    Ok(None) => ResponsePayload::err(
+                        error_code::NOT_FOUND,
+                        format!("scope {} not found", binding.scope),
+                    ),
+                    Err(error) => ResponsePayload::err(error_code::INTERNAL, error.to_string()),
+                }
+            } else {
+                handshake_required_response()
+            };
+            send_typed_response(
                 sys,
                 client_id,
                 request_id,
-                ResolvedCommand::ShowEnv { tail_bytes },
-                "send show env to scheduler",
+                payload,
+                "send typed environment response",
             )
             .await?;
         }
 
         RequestPayload::ShowConfig { tail_bytes } => {
-            send_scheduler_eval(
+            let payload = if current_binding(sys, client_id).await?.is_none() {
+                handshake_required_response()
+            } else if let Some(response) = invalid_tail_bytes_response(tail_bytes) {
+                response
+            } else {
+                text_output_response(sys.config.display_text(), tail_bytes)
+            };
+            send_typed_response(
                 sys,
                 client_id,
                 request_id,
-                ResolvedCommand::ShowConfig { tail_bytes },
-                "send show config to scheduler",
+                payload,
+                "send typed config response",
             )
             .await?;
         }
@@ -1504,37 +1318,7 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::FgAttach { id } => {
-            begin_client_event_hold_fence(event_state, request_id);
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::Fg {
-                    id,
-                    role: ForegroundRole::Controller,
-                },
-                "send fg attach to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::FgWatch { id } => {
-            begin_client_event_hold_fence(event_state, request_id);
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::Fg {
-                    id,
-                    role: ForegroundRole::Observer,
-                },
-                "send fg watch to scheduler",
-            )
-            .await?;
-        }
-
-        RequestPayload::FgClaimControl {} => {
+        RequestPayload::StepClaimControl {} => {
             begin_client_event_hold_fence(event_state, request_id);
             let (tx, rx) = tokio::sync::oneshot::channel();
             sys.process_mgr
@@ -1554,7 +1338,7 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::FgReleaseControl {} => {
+        RequestPayload::StepReleaseControl {} => {
             begin_client_event_hold_fence(event_state, request_id);
             let (tx, rx) = tokio::sync::oneshot::channel();
             sys.process_mgr
@@ -1574,7 +1358,7 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::FgDetach {} => {
+        RequestPayload::StepDetach {} => {
             detach_client_foreground(sys, client_id, "detached").await?;
             sys.gateway
                 .send(GatewayMsg::SendResponse {
@@ -1585,7 +1369,7 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::FgInput { data } => {
+        RequestPayload::StepInput { data } => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             sys.process_mgr
                 .send(super::ProcessMgrMsg::FgInput {
@@ -1609,7 +1393,7 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::FgResize { cols, rows } => {
+        RequestPayload::StepResize { cols, rows } => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             sys.process_mgr
                 .send(super::ProcessMgrMsg::FgResize {
@@ -1630,30 +1414,6 @@ async fn route_request(
                     client_id,
                     request_id,
                     payload,
-                })
-                .await?;
-        }
-
-        RequestPayload::Complete { input, cursor } => {
-            sys.gateway
-                .send(GatewayMsg::SendResponse {
-                    client_id,
-                    request_id,
-                    payload: ResponsePayload::Ok(OkPayload::CompletionList {
-                        items: complete_input(&input, cursor),
-                    }),
-                })
-                .await?;
-        }
-
-        RequestPayload::Highlight { input } => {
-            sys.gateway
-                .send(GatewayMsg::SendResponse {
-                    client_id,
-                    request_id,
-                    payload: ResponsePayload::Ok(OkPayload::HighlightResult {
-                        spans: highlight_input(&input),
-                    }),
                 })
                 .await?;
         }
@@ -1689,13 +1449,15 @@ async fn route_request(
             }
             let ticket = lifecycle.request_restart(client_id, request_id)?;
             if ticket.first_request {
-                let (reply, accepted) = tokio::sync::oneshot::channel();
-                let scheduler_closed = sys
-                    .scheduler
-                    .send(SchedulerMsg::BeginDrain { reply })
+                let (execution_reply, execution_accepted) = tokio::sync::oneshot::channel();
+                let execution_closed = sys
+                    .execution
+                    .send(ExecutionCoordinatorMsg::BeginDrain {
+                        reply: execution_reply,
+                    })
                     .await
                     .is_err()
-                    || accepted.await.is_err();
+                    || execution_accepted.await.is_err();
                 let (trigger_reply, trigger_accepted) = tokio::sync::oneshot::channel();
                 let triggers_closed = sys
                     .triggers
@@ -1705,8 +1467,8 @@ async fn route_request(
                     .await
                     .is_err()
                     || trigger_accepted.await.is_err();
-                if scheduler_closed || triggers_closed {
-                    // The scheduler may already have closed admission before
+                if execution_closed || triggers_closed {
+                    // An execution owner may already have closed admission before
                     // dropping its acknowledgement. Never reopen only one side
                     // of that boundary: cancel the durable successor fence and
                     // fail-stop the daemon through the coordinated signal path.
@@ -1723,6 +1485,7 @@ async fn route_request(
                         .await?;
                     return Ok(None);
                 }
+                lifecycle.mark_drained();
             }
             sys.gateway
                 .send(GatewayMsg::SendResponse {
@@ -1759,8 +1522,8 @@ async fn route_request(
 
 async fn current_binding(sys: &ActorSystem, client_id: u64) -> Result<Option<SessionBinding>> {
     let (reply, binding) = tokio::sync::oneshot::channel();
-    sys.scheduler
-        .send(SchedulerMsg::CurrentBinding { client_id, reply })
+    sys.sessions
+        .send(SessionCoordinatorMsg::CurrentBinding { client_id, reply })
         .await
         .context("query current session binding")?;
     binding.await.context("session binding reply dropped")
@@ -1788,17 +1551,15 @@ async fn route_session_command(
     event_state: &SharedClientEventState,
 ) -> Result<Option<[u8; 32]>> {
     let (reply, result) = tokio::sync::oneshot::channel();
-    sys.scheduler
-        .send(SchedulerMsg::Session {
+    sys.sessions
+        .send(SessionCoordinatorMsg::Session {
             client_id,
             command,
             reply,
         })
         .await
-        .context("send named-session request to scheduler")?;
-    let result = result
-        .await
-        .context("scheduler named-session reply dropped")?;
+        .context("send named-session request")?;
+    let result = result.await.context("session coordinator reply dropped")?;
     let namespace = result.binding.as_ref().map(|binding| {
         OperationLedger::session_incarnation_namespace(&binding.session_id, binding.incarnation)
     });
@@ -1863,21 +1624,77 @@ async fn bind_client_event_session(
         .context("bind client event session")
 }
 
-async fn send_scheduler_eval(
+async fn send_typed_response(
     sys: &ActorSystem,
     client_id: u64,
     request_id: u32,
-    command: ResolvedCommand,
+    payload: ResponsePayload,
     context: &'static str,
 ) -> Result<()> {
-    sys.scheduler
-        .send(SchedulerMsg::Eval {
+    sys.gateway
+        .send(GatewayMsg::SendResponse {
             client_id,
             request_id,
-            command: Box::new(command),
+            payload,
         })
         .await
         .context(context)
+}
+
+fn handshake_required_response() -> ResponsePayload {
+    ResponsePayload::err(
+        error_code::INVALID_REQUEST,
+        "client session handshake required",
+    )
+}
+
+fn invalid_tail_bytes_response(tail_bytes: Option<usize>) -> Option<ResponsePayload> {
+    tail_bytes
+        .filter(|bytes| *bytes > MAX_OUTPUT_TAIL_BYTES)
+        .map(|_| {
+            ResponsePayload::err(
+                error_code::INVALID_SYNTAX,
+                format!("tail_bytes must be <= {MAX_OUTPUT_TAIL_BYTES} bytes"),
+            )
+        })
+}
+
+fn text_output_response(text: String, tail_bytes: Option<usize>) -> ResponsePayload {
+    let (text, truncated) = match tail_bytes {
+        Some(limit) => tail_utf8(&text, limit),
+        None => (text, false),
+    };
+    ResponsePayload::Ok(OkPayload::TextOutput {
+        text,
+        truncated,
+        encoding: OutputEncoding::Utf8,
+        base64: None,
+    })
+}
+
+fn tail_utf8(text: &str, max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 {
+        return (String::new(), !text.is_empty());
+    }
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (text[start..].to_owned(), true)
+}
+
+fn format_snapshot_env(snapshot: &EnvSnapshot) -> String {
+    let mut lines = vec![format!("cwd={}", snapshot.cwd.display())];
+    lines.extend(
+        snapshot
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={}", value.escape_default())),
+    );
+    lines.join("\n")
 }
 
 fn queue_response_for_client(
@@ -1934,13 +1751,6 @@ fn evict_client(clients: &ClientMap, client_id: u64) {
     if let Some(client) = client {
         let _ = client.disconnect.send(true);
     }
-}
-
-fn inline_script_disabled_response() -> ResponsePayload {
-    ResponsePayload::err(
-        error_code::NOT_SUPPORTED,
-        "interactive multiline script submissions have been removed; write the items to a .cue file and run `cue run path/to/file.cue`",
-    )
 }
 
 fn invalid_event_channel_response(channel: &str) -> ResponsePayload {
@@ -2354,12 +2164,12 @@ mod tests {
         event_bus: mpsc::Sender<EventBusMsg>,
         gateway: mpsc::Sender<GatewayMsg>,
     ) -> ActorSystem {
-        let (scheduler, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (sessions, _sessions_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (scope_store, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         ActorSystem {
             gateway,
-            scheduler,
+            sessions,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr,
@@ -2479,250 +2289,5 @@ mod tests {
             }
             _ => panic!("expected invalid subscription response"),
         }
-    }
-
-    #[test]
-    fn inline_multiline_script_rejection_points_to_cue_run() {
-        let command = parse_command("cargo test\n:run cargo clippy", cue_core::Mode::Job).unwrap();
-        assert!(matches!(
-            command,
-            ResolvedCommand::Script {
-                source: cue_core::ipc::ScriptSource::Inline,
-                ..
-            }
-        ));
-        let response = inline_script_disabled_response();
-        match response {
-            ResponsePayload::Err { code, message } => {
-                assert_eq!(code, error_code::NOT_SUPPORTED);
-                assert!(message.contains("cue run path/to/file.cue"));
-            }
-            _ => panic!("expected error response"),
-        }
-    }
-
-    #[test]
-    fn foreground_eval_operation_id_is_rejected_before_ledger_after_alias_resolution() {
-        let operations: SharedOperationLedger = Arc::new(Mutex::new(OperationLedger::default()));
-        let aliases = crate::config::AliasConfig {
-            entries: vec![crate::config::AliasEntry {
-                from: "observe".into(),
-                to: ":watch".into(),
-            }],
-        };
-        let namespace = Some(OperationLedger::session_namespace("session-foreground"));
-
-        for (index, input) in [":fg J1", ":watch J1", "observe J1"]
-            .into_iter()
-            .enumerate()
-        {
-            let operation_id = format!("foreground-{index}");
-            let outcome = idempotency_outcome(
-                &operations,
-                namespace,
-                Some(&operation_id),
-                &RequestPayload::Eval {
-                    input: input.into(),
-                    mode: cue_core::Mode::Job,
-                },
-                &aliases,
-                OperationWaiter {
-                    client_id: 7,
-                    request_id: index as u32,
-                },
-            )
-            .unwrap();
-
-            let BeginOutcome::Respond(response) = outcome else {
-                panic!("foreground Eval with operation_id must not route: {input}");
-            };
-            assert!(matches!(
-                response.as_ref(),
-                ResponsePayload::Err { code, message }
-                    if code == error_code::INVALID_REQUEST
-                        && message.contains("connection-local :fg or :watch")
-            ));
-
-            // Reusing the same operation id for a genuine side effect must be
-            // admitted, proving the rejected foreground request never entered
-            // the operation ledger.
-            let ordinary = idempotency_outcome(
-                &operations,
-                namespace,
-                Some(&operation_id),
-                &RequestPayload::Eval {
-                    input: format!("echo admitted-{index}"),
-                    mode: cue_core::Mode::Job,
-                },
-                &aliases,
-                OperationWaiter {
-                    client_id: 7,
-                    request_id: 100 + index as u32,
-                },
-            )
-            .unwrap();
-            assert!(matches!(ordinary, BeginOutcome::Route));
-        }
-    }
-
-    #[tokio::test]
-    async fn run_script_requests_are_resolved_with_job_mode() {
-        let (event_bus_tx, _event_bus_rx) = mpsc::channel(1);
-        let (gateway_tx, mut gateway_rx) = mpsc::channel(1);
-        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (scope_store, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let sys = ActorSystem {
-            gateway: gateway_tx,
-            scheduler: scheduler_tx,
-            execution: mpsc::channel(1).0,
-            triggers: mpsc::channel(1).0,
-            process_mgr,
-            scope_store,
-            event_bus: event_bus_tx,
-            config: crate::config::Config::default(),
-            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
-        };
-        let (evt_tx, _evt_rx) = mpsc::channel(1);
-        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-        let event_state = Arc::new(Mutex::new(ClientEventState::default()));
-        let lifecycle = crate::lifecycle::DaemonLifecycle::new(
-            PathBuf::from("/tmp/cued-gateway-run-script.sock"),
-            crate::lifecycle::RestartOwnership::Standalone,
-        );
-
-        route_request(
-            7,
-            42,
-            RequestPayload::RunScript {
-                path: "build.cue".into(),
-                input: "every 5m echo hi".into(),
-            },
-            &sys,
-            ClientEventSink {
-                sender: &evt_tx,
-                disconnect: &disconnect_tx,
-            },
-            &lifecycle,
-            &event_state,
-        )
-        .await
-        .unwrap();
-
-        assert!(gateway_rx.try_recv().is_err());
-        match scheduler_rx.recv().await.unwrap() {
-            SchedulerMsg::Eval {
-                client_id,
-                request_id,
-                command,
-            } => {
-                assert_eq!(client_id, 7);
-                assert_eq!(request_id, 42);
-                match *command {
-                    ResolvedCommand::Script { source, items, .. } => {
-                        assert_eq!(
-                            source,
-                            cue_core::ipc::ScriptSource::File {
-                                path: "build.cue".into(),
-                            }
-                        );
-                        assert_eq!(items.len(), 1);
-                        assert!(matches!(
-                            *items.into_iter().next().unwrap().command,
-                            ResolvedCommand::Run { .. }
-                        ));
-                    }
-                    other => panic!("expected file script command, got {other:?}"),
-                }
-            }
-            _ => panic!("expected scheduler eval"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_script_rejects_connection_local_foreground_commands() {
-        let (event_bus_tx, _event_bus_rx) = mpsc::channel(1);
-        let (gateway_tx, mut gateway_rx) = mpsc::channel(2);
-        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (scope_store, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let sys = ActorSystem {
-            gateway: gateway_tx,
-            scheduler: scheduler_tx,
-            execution: mpsc::channel(1).0,
-            triggers: mpsc::channel(1).0,
-            process_mgr,
-            scope_store,
-            event_bus: event_bus_tx,
-            config: crate::config::Config::default(),
-            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
-        };
-        let (evt_tx, _evt_rx) = mpsc::channel(1);
-        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-        let event_state = Arc::new(Mutex::new(ClientEventState::default()));
-        let lifecycle = crate::lifecycle::DaemonLifecycle::new(
-            PathBuf::from("/tmp/cued-gateway-run-script-foreground.sock"),
-            crate::lifecycle::RestartOwnership::Standalone,
-        );
-
-        for (request_id, input) in [":run echo before\n:fg J1", ":watch J1"]
-            .into_iter()
-            .enumerate()
-        {
-            route_request(
-                7,
-                request_id as u32,
-                RequestPayload::RunScript {
-                    path: "foreground.cue".into(),
-                    input: input.into(),
-                },
-                &sys,
-                ClientEventSink {
-                    sender: &evt_tx,
-                    disconnect: &disconnect_tx,
-                },
-                &lifecycle,
-                &event_state,
-            )
-            .await
-            .unwrap();
-
-            match gateway_rx.recv().await.unwrap() {
-                GatewayMsg::SendResponse {
-                    client_id,
-                    request_id: actual_request_id,
-                    payload: ResponsePayload::Err { code, message },
-                } => {
-                    assert_eq!(client_id, 7);
-                    assert_eq!(actual_request_id, request_id as u32);
-                    assert_eq!(code, error_code::NOT_SUPPORTED);
-                    assert!(message.contains("file scripts"));
-                    assert!(message.contains(":fg or :watch"));
-                    assert!(message.contains("interactively"));
-                }
-                _ => panic!("expected foreground script rejection"),
-            }
-        }
-
-        assert!(
-            scheduler_rx.try_recv().is_err(),
-            "foreground file scripts must not reach the scheduler"
-        );
-    }
-
-    #[test]
-    fn unsupported_shell_syntax_is_reported_without_generic_hints() {
-        // The old advisory-hint block guessed at bash constructs from raw text
-        // because the tokenizer accepted them silently. Now the parser names the
-        // exact construct, so the response needs no second-guessing layer.
-        let error = parse_command("echo hi > out.txt", cue_core::mode::Mode::Job)
-            .expect_err("redirection must be rejected");
-
-        assert_eq!(
-            error.kind,
-            cue_language::ParseErrorKind::UnsupportedShellSyntax
-        );
-        assert!(error.to_string().contains("redirection"));
-        assert!(!error.to_string().contains("Possible bash syntax issue"));
     }
 }

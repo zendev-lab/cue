@@ -2353,21 +2353,32 @@ mod tests {
             crate::storage::insert_scope(&setup, &scope).expect("insert cron scope"),
             crate::storage::ScopePersistence::Persisted
         );
-        crate::storage::upsert_cron(
+        crate::storage::store_schedule(
             &setup,
-            &crate::storage::StoredCron {
-                id: "C1".into(),
-                session_id: None,
-                schedule: "every 100ms".into(),
-                command: format!("/usr/bin/touch {}", cron_marker.display()),
+            &crate::storage::StoredSchedule {
+                id: cue_core::ScheduleId(1),
+                schedule: cue_core::cron::CronSchedule::Interval(Duration::from_millis(100)),
+                execution: cue_core::execution::ExecutionSpec {
+                    plan: cue_core::execution::ExecutionPlan::pipeline(
+                        cue_core::pipeline::Pipeline::simple(vec![
+                            "/usr/bin/touch".into(),
+                            cron_marker.display().to_string(),
+                        ]),
+                    ),
+                    start_scope: Some(scope.hash),
+                    launch_context: cue_core::execution::LaunchContext::default(),
+                    source: None,
+                    retry_of: None,
+                },
                 status: cue_core::cron::CronStatus::Scheduled,
-                scope_hash: Some(scope.hash),
-                cwd_override: None,
-                scope_enabled: false,
-                wrapper_enabled: false,
+                next_trigger_at_ms: Some(0),
+                scope_hash: scope.hash,
+                session_id: None,
+                pty_default: false,
+                wrapper_default: false,
             },
         )
-        .expect("insert startup cron");
+        .expect("insert startup schedule");
         drop(setup);
         (
             crate::storage::open_db(&db_path).expect("open scope database"),
@@ -2404,6 +2415,26 @@ mod tests {
         }
     }
 
+    fn typed_touch_request(marker: &Path) -> cue_core::ipc::RequestPayload {
+        cue_core::ipc::RequestPayload::SubmitExecution {
+            spec: Box::new(cue_core::execution::ExecutionSpec {
+                plan: cue_core::execution::ExecutionPlan::pipeline(
+                    cue_core::pipeline::Pipeline::simple(vec![
+                        "/usr/bin/touch".into(),
+                        marker.display().to_string(),
+                    ]),
+                ),
+                start_scope: None,
+                launch_context: cue_core::execution::LaunchContext {
+                    pty: Some(false),
+                    ..Default::default()
+                },
+                source: None,
+                retry_of: None,
+            }),
+        }
+    }
+
     async fn connect_starting_successor(socket: &Path, cwd: &Path) -> tokio::net::UnixStream {
         let mut stream = tokio::net::UnixStream::connect(socket)
             .await
@@ -2437,22 +2468,17 @@ mod tests {
     }
 
     async fn assert_startup_execution_rejected(stream: &mut tokio::net::UnixStream, marker: &Path) {
-        let response = startup_roundtrip(
-            stream,
-            2,
-            cue_core::ipc::RequestPayload::Eval {
-                input: format!("/usr/bin/touch {}", marker.display()),
-                mode: cue_core::mode::Mode::Job,
-            },
-        )
-        .await;
+        let response = startup_roundtrip(stream, 2, typed_touch_request(marker)).await;
         match response {
             cue_core::ipc::ResponsePayload::Err { code, .. } => {
                 assert_eq!(code, cue_core::ipc::error_code::DAEMON_DRAINING);
             }
             other => panic!("startup execution must be rejected, got {other:?}"),
         }
-        assert!(!marker.exists(), "rejected Eval must not create its marker");
+        assert!(
+            !marker.exists(),
+            "rejected execution must not create its marker"
+        );
 
         let restart =
             startup_roundtrip(stream, 20, cue_core::ipc::RequestPayload::Restart {}).await;
@@ -2574,18 +2600,10 @@ mod tests {
         assert_eq!(sync_readiness(&socket).await, (true, true));
         wait_for_marker(&cron_marker).await;
 
-        let response = startup_roundtrip(
-            &mut stream,
-            3,
-            cue_core::ipc::RequestPayload::Eval {
-                input: format!("/usr/bin/touch {}", eval_marker.display()),
-                mode: cue_core::mode::Mode::Job,
-            },
-        )
-        .await;
+        let response = startup_roundtrip(&mut stream, 3, typed_touch_request(&eval_marker)).await;
         assert!(matches!(
             response,
-            cue_core::ipc::ResponsePayload::Ok(cue_core::ipc::OkPayload::JobCreated { .. })
+            cue_core::ipc::ResponsePayload::Ok(cue_core::ipc::OkPayload::ExecutionCreated { .. })
         ));
         wait_for_marker(&eval_marker).await;
 
