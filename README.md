@@ -47,17 +47,14 @@ crates/
 ├── cue-tui/    — Interactive TUI frontend plus `cue-tui` CLI
 ├── cue-cli/    — `cue` aggregator entrypoint for explicit namespaces and extensions
 skills/
-└── spark-cue/  — Spark integration guidance maintained with cue-shell contracts
+└── cue/        — Agent guidance maintained with cue-shell contracts
 ```
 
-## Integration skills
+## Agent skill
 
-The repository owns the canonical [`spark-cue` Skill](skills/spark-cue/SKILL.md)
-used by Spark's cue-shell adapter. Keeping the guidance here lets changes to
-cue-shell grammar, commands, transport, and lifecycle update their downstream
-agent instructions in the same review. cue-shell binaries do not load this
-Skill and continue to contain no agent-runtime policy; downstream products pin
-and package a verified snapshot for their own hosts.
+[`skills/cue/SKILL.md`](skills/cue/SKILL.md) is the canonical agent-facing Cue
+Skill. cue-shell binaries do not load it; downstream products pin verified
+snapshots for their own hosts.
 
 ## Installation
 
