@@ -13,10 +13,11 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use cue_core::ipc::{
-    EventPayload, ForegroundAttachmentInfo, IPC_CAPABILITY_FOREGROUND_OBSERVERS,
-    IPC_CAPABILITY_NAMED_SESSIONS, IPC_CAPABILITY_SESSION_ARCHIVE,
-    IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED, IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message,
-    OkPayload, RequestPayload, ResponsePayload, SessionInfo, SessionScopeState, encode_message,
+    EventPayload, ForegroundAttachmentInfo, IPC_CAPABILITY_EXECUTION_V3,
+    IPC_CAPABILITY_FOREGROUND_OBSERVERS, IPC_CAPABILITY_NAMED_SESSIONS,
+    IPC_CAPABILITY_SESSION_ARCHIVE, IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
+    IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
+    SessionInfo, SessionScopeState, encode_message,
 };
 use cue_core::{EventChannel, Mode};
 
@@ -84,6 +85,7 @@ impl CuedClient {
         let env = std::env::vars().collect::<BTreeMap<_, _>>();
         let request_id = self
             .send(RequestPayload::Handshake {
+                protocol_version: IPC_PROTOCOL_VERSION,
                 session_id,
                 cwd,
                 env,
@@ -148,6 +150,33 @@ impl CuedClient {
             input: input.to_string(),
         })
         .await
+    }
+
+    pub async fn submit_execution(
+        &mut self,
+        spec: cue_core::execution::ExecutionSpec,
+    ) -> Result<u32> {
+        self.send(RequestPayload::SubmitExecution {
+            spec: Box::new(spec),
+        })
+        .await
+    }
+
+    pub async fn get_execution(&mut self, id: cue_core::ExecutionId) -> Result<u32> {
+        self.send(RequestPayload::GetExecution { id }).await
+    }
+
+    pub async fn wait_execution(&mut self, id: cue_core::ExecutionId) -> Result<u32> {
+        self.send(RequestPayload::WaitExecution { id }).await
+    }
+
+    pub async fn cancel_execution(
+        &mut self,
+        id: cue_core::ExecutionId,
+        mode: cue_core::execution::CancelMode,
+    ) -> Result<u32> {
+        self.send(RequestPayload::CancelExecution { id, mode })
+            .await
     }
 
     /// Acquire the controller lease for a foreground-capable job.
@@ -469,10 +498,15 @@ impl CuedClient {
         if !snapshot.ready {
             bail!("daemon startup is not ready; retry after restart handoff completes");
         }
-        if snapshot.protocol_version < IPC_PROTOCOL_VERSION {
+        if snapshot.protocol_version != IPC_PROTOCOL_VERSION {
             bail!(
-                "daemon IPC protocol version {} is older than required {IPC_PROTOCOL_VERSION}; upgrade/restart cued",
+                "daemon IPC protocol version {} is incompatible with required version {IPC_PROTOCOL_VERSION}; upgrade/restart cued",
                 snapshot.protocol_version
+            );
+        }
+        if !self.supports_capability(IPC_CAPABILITY_EXECUTION_V3) {
+            bail!(
+                "daemon IPC protocol is missing required capability {IPC_CAPABILITY_EXECUTION_V3}; upgrade/restart cued"
             );
         }
         if !self.supports_capability(IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED) {
@@ -762,6 +796,44 @@ impl MultiplexedClient {
         .await
     }
 
+    pub async fn submit_execution(
+        &self,
+        spec: cue_core::execution::ExecutionSpec,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::SubmitExecution {
+            spec: Box::new(spec),
+        })
+        .await
+    }
+
+    pub async fn get_execution(&self, id: cue_core::ExecutionId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::GetExecution { id }).await
+    }
+
+    pub async fn list_executions(&self, limit: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ListExecutions { limit }).await
+    }
+
+    pub async fn wait_execution(&self, id: cue_core::ExecutionId) -> Result<ResponsePayload> {
+        self.call(RequestPayload::WaitExecution { id }).await
+    }
+
+    pub async fn read_execution_output(
+        &self,
+        id: cue_core::ExecutionId,
+        step_id: Option<cue_core::StepId>,
+        stdout_bytes: Option<usize>,
+        stderr_bytes: Option<usize>,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ReadExecutionOutput {
+            id,
+            step_id,
+            stdout_bytes,
+            stderr_bytes,
+        })
+        .await
+    }
+
     /// Acquire the controller lease for a foreground-capable job.
     pub async fn fg_attach(&self, id: impl Into<String>) -> Result<ResponsePayload> {
         self.call(RequestPayload::FgAttach { id: id.into() }).await
@@ -874,10 +946,13 @@ impl MultiplexedClient {
         self.call(RequestPayload::KillJob { id: id.into() }).await
     }
 
-    /// Idempotently cancel a job, chain, or script and wait for its running
-    /// child processes to stop.
-    pub async fn cancel_execution(&self, id: impl Into<String>) -> Result<ResponsePayload> {
-        self.call(RequestPayload::CancelExecution { id: id.into() })
+    /// Idempotently cancel an execution and wait for its running steps to stop.
+    pub async fn cancel_execution(
+        &self,
+        id: cue_core::ExecutionId,
+        mode: cue_core::execution::CancelMode,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::CancelExecution { id, mode })
             .await
     }
 
@@ -922,6 +997,14 @@ impl Drop for MultiplexedClient {
 
 fn required_request_capability(payload: &RequestPayload) -> Option<&'static str> {
     match payload {
+        RequestPayload::SubmitExecution { .. }
+        | RequestPayload::GetExecution { .. }
+        | RequestPayload::ListExecutions { .. }
+        | RequestPayload::WaitExecution { .. }
+        | RequestPayload::CancelExecution { .. }
+        | RequestPayload::ReadExecutionOutput { .. }
+        | RequestPayload::StepAttach { .. }
+        | RequestPayload::StepWatch { .. } => Some(IPC_CAPABILITY_EXECUTION_V3),
         RequestPayload::FgWatch { .. }
         | RequestPayload::FgClaimControl {}
         | RequestPayload::FgReleaseControl {} => Some(IPC_CAPABILITY_FOREGROUND_OBSERVERS),

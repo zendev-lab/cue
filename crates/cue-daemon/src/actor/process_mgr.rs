@@ -26,7 +26,7 @@ use cue_core::pipeline::{JobPlan, command_prefers_foreground};
 use cue_core::process_status::exit_code_from_status;
 use cue_core::scope::EnvSnapshot;
 use cue_core::spawn_adapter::{SpawnAdapterRequest, SpawnResult};
-use cue_core::{EventChannel, JobId};
+use cue_core::{EventChannel, JobId, StepId};
 
 use super::{
     ActorSystem, ForegroundRoleUpdate, OutputSnapshot, ProcessJobOptions, ProcessMgrMsg,
@@ -43,6 +43,8 @@ use crate::word_expansion::{expand_command_line, expand_environment};
 
 struct ProcessEntry {
     job_id: JobId,
+    /// Stable public identity for IPC v3 executions. Legacy jobs leave this unset.
+    execution_step: Option<StepId>,
     /// Named session that owns this process, or `None` for legacy anonymous jobs.
     session_id: Option<String>,
     status: JobStatus,
@@ -60,6 +62,12 @@ struct ProcessEntry {
     resize: Option<Arc<std::fs::File>>,
     /// Shared foreground observer set and exclusive controller lease.
     foreground: Arc<Mutex<ForegroundState>>,
+}
+
+impl ProcessEntry {
+    fn public_id(&self) -> String {
+        process_public_id(self.job_id, self.execution_step)
+    }
 }
 
 /// Runtime-only attachment state for one job's foreground stream.
@@ -277,6 +285,7 @@ struct ProcessTaskRuntime {
     foreground: Arc<Mutex<ForegroundState>>,
     direct_output_client: Option<u64>,
     session_id: Option<String>,
+    execution_step: Option<cue_core::StepId>,
     cleanup_tx: mpsc::Sender<JobId>,
 }
 
@@ -368,13 +377,13 @@ fn attach_foreground(
     client_id: u64,
     requested_role: ForegroundRole,
 ) -> Result<(ForegroundAttachmentInfo, Option<Vec<ForegroundRecipient>>), String> {
+    let public_id = entry.public_id();
     if entry.status != JobStatus::Running {
-        return Err(format!("job {} is not running", entry.job_id));
+        return Err(format!("step {public_id} is not running"));
     }
     if entry.resize.is_none() {
         return Err(format!(
-            "job {} does not support foreground attach",
-            entry.job_id
+            "step {public_id} does not support foreground attach"
         ));
     }
 
@@ -383,18 +392,17 @@ fn attach_foreground(
         .attach(client_id, requested_role)
         .map_err(|error| match error {
             ForegroundAttachError::Closed => {
-                format!("job {} foreground is closed", entry.job_id)
+                format!("step {public_id} foreground is closed")
             }
             ForegroundAttachError::AlreadyAttached => {
-                format!("client is already foreground-attached to {}", entry.job_id)
+                format!("client is already foreground-attached to {public_id}")
             }
             ForegroundAttachError::ControlHeld => {
-                format!("job {} foreground control is already held", entry.job_id)
+                format!("step {public_id} foreground control is already held")
             }
-            ForegroundAttachError::AttachmentIdExhausted => format!(
-                "job {} foreground attachment id space is exhausted",
-                entry.job_id
-            ),
+            ForegroundAttachError::AttachmentIdExhausted => {
+                format!("step {public_id} foreground attachment id space is exhausted")
+            }
         })?;
     let control_available = foreground.control_available();
     let (snapshot, snapshot_truncated) = entry
@@ -405,7 +413,7 @@ fn attach_foreground(
 
     Ok((
         ForegroundAttachmentInfo {
-            id: entry.job_id.to_string(),
+            id: public_id,
             attachment_id: outcome.attachment_id,
             role: outcome.role,
             control_available,
@@ -436,8 +444,8 @@ fn claim_foreground_control(
     {
         return (
             Err(format!(
-                "job {} foreground control is already held",
-                entry.job_id
+                "step {} foreground control is already held",
+                entry.public_id()
             )),
             None,
         );
@@ -445,7 +453,7 @@ fn claim_foreground_control(
     match foreground.claim_control(client_id) {
         Ok(false) => (
             Ok(ForegroundRoleUpdate {
-                id: entry.job_id.to_string(),
+                id: entry.public_id(),
                 attachment_id,
                 role: ForegroundRole::Controller,
                 control_available: false,
@@ -456,7 +464,7 @@ fn claim_foreground_control(
             let recipients = foreground.recipients();
             (
                 Ok(ForegroundRoleUpdate {
-                    id: entry.job_id.to_string(),
+                    id: entry.public_id(),
                     attachment_id,
                     role: ForegroundRole::Controller,
                     control_available: false,
@@ -489,7 +497,7 @@ fn release_foreground_control(
     let recipients = released.then(|| foreground.recipients());
     (
         Ok(ForegroundRoleUpdate {
-            id: entry.job_id.to_string(),
+            id: entry.public_id(),
             attachment_id,
             role: ForegroundRole::Observer,
             control_available,
@@ -569,7 +577,13 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         {
                             error!(%job_id, "process_mgr: scope_store channel closed");
                             // Fail the job instead of continuing with the daemon environment.
-                            fail_pending_spawn(&sys, job_id, options.session_id.as_deref()).await;
+                            fail_pending_spawn(
+                                &sys,
+                                job_id,
+                                options.session_id.as_deref(),
+                                options.execution_step,
+                            )
+                            .await;
                             continue;
                         }
                         match rx.await {
@@ -577,7 +591,12 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                                 Some(snapshot) => snapshot,
                                 None => {
                                     error!(%job_id, %scope_hash, "process_mgr: scope has no snapshot");
-                                    fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                    fail_pending_spawn(
+                                        &sys,
+                                        job_id,
+                                        options.session_id.as_deref(),
+                                        options.execution_step,
+                                    )
                                         .await;
                                     continue;
                                 }
@@ -585,20 +604,35 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             Ok(Ok(None)) => {
                                 // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, %scope_hash, "process_mgr: scope not found");
-                                fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                fail_pending_spawn(
+                                    &sys,
+                                    job_id,
+                                    options.session_id.as_deref(),
+                                    options.execution_step,
+                                )
                                     .await;
                                 continue;
                             }
                             Ok(Err(error)) => {
                                 error!(%job_id, %scope_hash, "process_mgr: scope lookup failed: {error}");
-                                fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                fail_pending_spawn(
+                                    &sys,
+                                    job_id,
+                                    options.session_id.as_deref(),
+                                    options.execution_step,
+                                )
                                     .await;
                                 continue;
                             }
                             Err(_) => {
                                 // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, "process_mgr: scope_store reply dropped");
-                                fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                fail_pending_spawn(
+                                    &sys,
+                                    job_id,
+                                    options.session_id.as_deref(),
+                                    options.execution_step,
+                                )
                                     .await;
                                 continue;
                             }
@@ -619,10 +653,17 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             job_id,
                             JobStatus::Pending,
                             JobStatus::Failed,
+                            effective_options.execution_step,
                             effective_options.session_id.as_deref(),
                         )
                         .await;
-                        emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+                        emit_job_finished(
+                            &sys,
+                            job_id,
+                            EXIT_CODE_UNAVAILABLE,
+                            effective_options.execution_step,
+                        )
+                        .await;
                         continue;
                     }
 
@@ -636,6 +677,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             &sys,
                             job_id,
                             effective_options.session_id.as_deref(),
+                            effective_options.execution_step,
                         )
                         .await;
                         continue;
@@ -658,6 +700,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                                 job_id,
                                 JobStatus::Pending,
                                 JobStatus::Running,
+                                effective_options.execution_step,
                                 effective_options.session_id.as_deref(),
                             )
                             .await;
@@ -669,10 +712,17 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                                 job_id,
                                 JobStatus::Pending,
                                 JobStatus::Failed,
+                                effective_options.execution_step,
                                 effective_options.session_id.as_deref(),
                             )
                             .await;
-                            emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+                            emit_job_finished(
+                                &sys,
+                                job_id,
+                                EXIT_CODE_UNAVAILABLE,
+                                effective_options.execution_step,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -770,9 +820,15 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     let _ = reply.send(handled);
                 }
 
-                ProcessMgrMsg::AttachFg { client_id, job_id, role, reply } => {
+                ProcessMgrMsg::AttachFg {
+                    client_id,
+                    job_id,
+                    role,
+                    legacy_snapshot_event,
+                    reply,
+                } => {
                     let current_job = foreground_job_for_client(&children, client_id);
-                    let (result, control_recipients, session_id) =
+                    let (result, control_recipients, session_id, execution_step) =
                         if current_job.is_some_and(|current| current != job_id) {
                             (
                                 Err(format!(
@@ -781,15 +837,18 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                                 )),
                                 None,
                                 None,
+                                None,
                             )
                         } else if let Some(entry) = children.get(&job_id.0) {
                             let session_id = entry.session_id.clone();
                             match attach_foreground(entry, client_id, role) {
-                                Ok((info, recipients)) => (Ok(info), recipients, session_id),
-                                Err(error) => (Err(error), None, session_id),
+                                Ok((info, recipients)) => {
+                                    (Ok(info), recipients, session_id, entry.execution_step)
+                                }
+                                Err(error) => (Err(error), None, session_id, entry.execution_step),
                             }
                         } else {
-                            (Err(format!("job {job_id} not found")), None, None)
+                            (Err(format!("job {job_id} not found")), None, None, None)
                         };
                     // Daemons predating shared foreground mode delivered the
                     // retained snapshot as an FgOutput event after the
@@ -797,12 +856,15 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     // controller entry point: current clients reject epoch 0
                     // for a non-zero attachment, while old clients recover
                     // their history instead of starting from an empty screen.
-                    let legacy_snapshot = if role == ForegroundRole::Controller {
+                    let legacy_snapshot = if legacy_snapshot_event
+                        && role == ForegroundRole::Controller
+                    {
                         result.as_ref().ok().map(|info| info.snapshot.clone())
                     } else {
                         None
                     }
                     .filter(|snapshot| !snapshot.is_empty());
+                    let public_id = process_public_id(job_id, execution_step);
                     let _ = reply.send(result);
                     if let Some(snapshot) = legacy_snapshot {
                         send_actor_gateway_event(
@@ -810,7 +872,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             &sys,
                             client_id,
                             EventPayload::FgOutput {
-                                id: job_id.to_string(),
+                                id: public_id,
                                 attachment_id: 0,
                                 data: snapshot,
                             },
@@ -823,6 +885,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             &sys,
                             recipients,
                             job_id,
+                            execution_step,
                             false,
                             session_id.as_deref(),
                         )
@@ -839,6 +902,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         .get(&job_id.0)
                         .expect("foreground lookup returned a live job");
                     let session_id = entry.session_id.clone();
+                    let execution_step = entry.execution_step;
                     let (result, recipients) = claim_foreground_control(entry, client_id);
                     let _ = reply.send(result);
                     if let Some(recipients) = recipients {
@@ -846,6 +910,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             &sys,
                             recipients,
                             job_id,
+                            execution_step,
                             false,
                             session_id.as_deref(),
                         )
@@ -862,6 +927,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         .get(&job_id.0)
                         .expect("foreground lookup returned a live job");
                     let session_id = entry.session_id.clone();
+                    let execution_step = entry.execution_step;
                     let (result, recipients) = release_foreground_control(entry, client_id);
                     let _ = reply.send(result);
                     if let Some(recipients) = recipients {
@@ -869,6 +935,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             &sys,
                             recipients,
                             job_id,
+                            execution_step,
                             true,
                             session_id.as_deref(),
                         )
@@ -885,19 +952,20 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         {
                             detached_jobs.push((
                                 entry.job_id,
+                                entry.execution_step,
                                 attachment_id,
                                 entry.session_id.clone(),
                                 control_recipients,
                             ));
                         }
                     }
-                    for (job_id, attachment_id, session_id, control_recipients) in detached_jobs {
+                    for (job_id, execution_step, attachment_id, session_id, control_recipients) in detached_jobs {
                         send_actor_gateway_event(
                             "process_mgr",
                             &sys,
                             client_id,
                             EventPayload::FgExited {
-                                id: job_id.to_string(),
+                                id: process_public_id(job_id, execution_step),
                                 attachment_id,
                                 reason: reason.clone(),
                             },
@@ -909,6 +977,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                                 &sys,
                                 recipients,
                                 job_id,
+                                execution_step,
                                 true,
                                 session_id.as_deref(),
                             )
@@ -1393,6 +1462,7 @@ async fn prepare_job_sandbox_or_emit(
                 sys,
                 job_id,
                 &message,
+                options.execution_step,
                 options.direct_output_client,
                 options.session_id.as_deref(),
             )
@@ -1406,6 +1476,7 @@ async fn emit_spawn_setup_stderr(
     sys: &ActorSystem,
     job_id: JobId,
     message: &str,
+    execution_step: Option<cue_core::StepId>,
     direct_output_client: Option<u64>,
     session_id: Option<&str>,
 ) {
@@ -1415,13 +1486,21 @@ async fn emit_spawn_setup_stderr(
     emit_output(
         sys,
         job_id,
+        execution_step,
         OutputStream::Stderr,
         line.as_bytes(),
         direct_output_client,
         session_id,
     )
     .await;
-    emit_output_eof(sys, job_id, direct_output_client, session_id).await;
+    emit_output_eof(
+        sys,
+        job_id,
+        execution_step,
+        direct_output_client,
+        session_id,
+    )
+    .await;
 }
 
 /// Spawn a single-segment job with pipes (stdout/stderr piped, no PTY).
@@ -1508,6 +1587,7 @@ async fn spawn_single_pipe_job(
     let foreground_clone = foreground.clone();
     let cleanup_tx_clone = cleanup_tx.clone();
     let direct_output_client = options.direct_output_client;
+    let execution_step = options.execution_step;
     let session_id = options.session_id.clone();
     let entry_session_id = session_id.clone();
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
@@ -1535,6 +1615,7 @@ async fn spawn_single_pipe_job(
                         emit_output(
                             &sys_emit,
                             job_id,
+                            execution_step,
                             OutputStream::Stdout,
                             &chunk,
                             direct_output_client,
@@ -1564,6 +1645,7 @@ async fn spawn_single_pipe_job(
                         emit_output(
                             &sys_stderr_emit,
                             job_id,
+                            execution_step,
                             OutputStream::Stderr,
                             &chunk,
                             direct_output_client,
@@ -1621,6 +1703,7 @@ async fn spawn_single_pipe_job(
         emit_output_eof(
             &sys_clone,
             job_id,
+            execution_step,
             direct_output_client,
             session_id.as_deref(),
         )
@@ -1648,6 +1731,7 @@ async fn spawn_single_pipe_job(
             job_id,
             JobStatus::Running,
             new_state,
+            execution_step,
             session_id.as_deref(),
         )
         .await;
@@ -1655,16 +1739,18 @@ async fn spawn_single_pipe_job(
             &sys_clone,
             &foreground_clone,
             job_id,
+            execution_step,
             &fg_reason,
             session_id.as_deref(),
         )
         .await;
-        emit_job_finished(&sys_clone, job_id, reported_exit_code).await;
+        emit_job_finished(&sys_clone, job_id, reported_exit_code, execution_step).await;
         notify_cleanup(&cleanup_tx_clone, job_id).await;
     });
 
     Ok(ProcessEntry {
         job_id,
+        execution_step: options.execution_step,
         session_id: entry_session_id,
         status: JobStatus::Running,
         reader_handle,
@@ -1829,12 +1915,14 @@ async fn spawn_single_pty_job(
             foreground: foreground.clone(),
             direct_output_client,
             session_id: options.session_id.clone(),
+            execution_step: options.execution_step,
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
 
     Ok(ProcessEntry {
         job_id,
+        execution_step: options.execution_step,
         session_id: options.session_id.clone(),
         status: JobStatus::Running,
         reader_handle,
@@ -1908,12 +1996,14 @@ async fn spawn_native_pipeline_job(
             foreground: foreground.clone(),
             direct_output_client,
             session_id: options.session_id.clone(),
+            execution_step: options.execution_step,
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
 
     Ok(ProcessEntry {
         job_id,
+        execution_step: options.execution_step,
         session_id: options.session_id.clone(),
         status: JobStatus::Running,
         reader_handle,
@@ -1960,12 +2050,14 @@ async fn spawn_logical_job(
             foreground: foreground.clone(),
             direct_output_client,
             session_id: options.session_id.clone(),
+            execution_step: options.execution_step,
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
 
     Ok(ProcessEntry {
         job_id,
+        execution_step: options.execution_step,
         session_id: options.session_id.clone(),
         status: JobStatus::Running,
         reader_handle,
@@ -2337,6 +2429,7 @@ async fn reader_task(task: PtyReaderTask) {
                     job_id,
                     JobStatus::Running,
                     JobStatus::Killed,
+                    runtime.execution_step,
                     runtime.session_id.as_deref(),
                 )
                 .await;
@@ -2344,11 +2437,18 @@ async fn reader_task(task: PtyReaderTask) {
                     &runtime.sys,
                     &runtime.foreground,
                     job_id,
+                    runtime.execution_step,
                     "killed",
                     runtime.session_id.as_deref(),
                 )
                 .await;
-                emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+                emit_job_finished(
+                    &runtime.sys,
+                    job_id,
+                    EXIT_CODE_UNAVAILABLE,
+                    runtime.execution_step,
+                )
+                .await;
                 let _ = settle_spawn_result(
                     job_id,
                     settlement.as_ref(),
@@ -2372,6 +2472,7 @@ async fn reader_task(task: PtyReaderTask) {
                         emit_output(
                             &runtime.sys,
                             job_id,
+                            runtime.execution_step,
                             OutputStream::Stdout,
                             chunk,
                             runtime.direct_output_client,
@@ -2382,6 +2483,7 @@ async fn reader_task(task: PtyReaderTask) {
                             &runtime.sys,
                             foreground_recipients,
                             job_id,
+                            runtime.execution_step,
                             chunk,
                             runtime.session_id.as_deref(),
                         )
@@ -2449,6 +2551,7 @@ async fn reader_task(task: PtyReaderTask) {
     emit_output_eof(
         &runtime.sys,
         job_id,
+        runtime.execution_step,
         runtime.direct_output_client,
         runtime.session_id.as_deref(),
     )
@@ -2460,6 +2563,7 @@ async fn reader_task(task: PtyReaderTask) {
             job_id,
             JobStatus::Running,
             JobStatus::Killed,
+            runtime.execution_step,
             runtime.session_id.as_deref(),
         )
         .await;
@@ -2467,11 +2571,18 @@ async fn reader_task(task: PtyReaderTask) {
             &runtime.sys,
             &runtime.foreground,
             job_id,
+            runtime.execution_step,
             "killed",
             runtime.session_id.as_deref(),
         )
         .await;
-        emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+        emit_job_finished(
+            &runtime.sys,
+            job_id,
+            EXIT_CODE_UNAVAILABLE,
+            runtime.execution_step,
+        )
+        .await;
     } else {
         let exit_code = if adapter_settled {
             exit_code
@@ -2490,6 +2601,7 @@ async fn reader_task(task: PtyReaderTask) {
             job_id,
             JobStatus::Running,
             new_state,
+            runtime.execution_step,
             runtime.session_id.as_deref(),
         )
         .await;
@@ -2502,12 +2614,13 @@ async fn reader_task(task: PtyReaderTask) {
             &runtime.sys,
             &runtime.foreground,
             job_id,
+            runtime.execution_step,
             &reason,
             runtime.session_id.as_deref(),
         )
         .await;
 
-        emit_job_finished(&runtime.sys, job_id, exit_code).await;
+        emit_job_finished(&runtime.sys, job_id, exit_code, runtime.execution_step).await;
     }
 
     // Tell the main loop to remove our entry.
@@ -2568,6 +2681,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
                         emit_output(
                             &runtime.sys,
                             job_id,
+                            runtime.execution_step,
                             OutputStream::Stdout,
                             &data,
                             runtime.direct_output_client,
@@ -2581,6 +2695,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
                         emit_output(
                             &runtime.sys,
                             job_id,
+                            runtime.execution_step,
                             OutputStream::Stderr,
                             &data,
                             runtime.direct_output_client,
@@ -2624,6 +2739,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
     emit_output_eof(
         &runtime.sys,
         job_id,
+        runtime.execution_step,
         runtime.direct_output_client,
         runtime.session_id.as_deref(),
     )
@@ -2635,6 +2751,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
             job_id,
             JobStatus::Running,
             JobStatus::Killed,
+            runtime.execution_step,
             runtime.session_id.as_deref(),
         )
         .await;
@@ -2642,11 +2759,18 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
             &runtime.sys,
             &runtime.foreground,
             job_id,
+            runtime.execution_step,
             "killed",
             runtime.session_id.as_deref(),
         )
         .await;
-        emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+        emit_job_finished(
+            &runtime.sys,
+            job_id,
+            EXIT_CODE_UNAVAILABLE,
+            runtime.execution_step,
+        )
+        .await;
     } else {
         let new_state = if exit_code == 0 {
             JobStatus::Done
@@ -2658,6 +2782,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
             job_id,
             JobStatus::Running,
             new_state,
+            runtime.execution_step,
             runtime.session_id.as_deref(),
         )
         .await;
@@ -2670,11 +2795,12 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
             &runtime.sys,
             &runtime.foreground,
             job_id,
+            runtime.execution_step,
             &reason,
             runtime.session_id.as_deref(),
         )
         .await;
-        emit_job_finished(&runtime.sys, job_id, exit_code).await;
+        emit_job_finished(&runtime.sys, job_id, exit_code, runtime.execution_step).await;
     }
 
     notify_cleanup(&runtime.cleanup_tx, job_id).await;
@@ -2727,6 +2853,7 @@ async fn logical_job_task(task: LogicalJobTask) {
     emit_output_eof(
         &runtime.sys,
         job_id,
+        runtime.execution_step,
         runtime.direct_output_client,
         runtime.session_id.as_deref(),
     )
@@ -2738,6 +2865,7 @@ async fn logical_job_task(task: LogicalJobTask) {
             job_id,
             JobStatus::Running,
             JobStatus::Killed,
+            runtime.execution_step,
             runtime.session_id.as_deref(),
         )
         .await;
@@ -2745,11 +2873,18 @@ async fn logical_job_task(task: LogicalJobTask) {
             &runtime.sys,
             &runtime.foreground,
             job_id,
+            runtime.execution_step,
             "killed",
             runtime.session_id.as_deref(),
         )
         .await;
-        emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+        emit_job_finished(
+            &runtime.sys,
+            job_id,
+            EXIT_CODE_UNAVAILABLE,
+            runtime.execution_step,
+        )
+        .await;
     } else {
         let new_state = if exit_code == 0 {
             JobStatus::Done
@@ -2761,6 +2896,7 @@ async fn logical_job_task(task: LogicalJobTask) {
             job_id,
             JobStatus::Running,
             new_state,
+            runtime.execution_step,
             runtime.session_id.as_deref(),
         )
         .await;
@@ -2773,11 +2909,12 @@ async fn logical_job_task(task: LogicalJobTask) {
             &runtime.sys,
             &runtime.foreground,
             job_id,
+            runtime.execution_step,
             &reason,
             runtime.session_id.as_deref(),
         )
         .await;
-        emit_job_finished(&runtime.sys, job_id, exit_code).await;
+        emit_job_finished(&runtime.sys, job_id, exit_code, runtime.execution_step).await;
     }
 
     notify_cleanup(&runtime.cleanup_tx, job_id).await;
@@ -2894,6 +3031,7 @@ async fn run_pipeline_streaming(
                         emit_output(
                             context.sys,
                             context.job_id,
+                            None,
                             OutputStream::Stdout,
                             &data,
                             context.direct_output_client,
@@ -2907,6 +3045,7 @@ async fn run_pipeline_streaming(
                         emit_output(
                             context.sys,
                             context.job_id,
+                            None,
                             OutputStream::Stderr,
                             &data,
                             context.direct_output_client,
@@ -3437,20 +3576,40 @@ async fn settle_pipeline_results(
     settled
 }
 
-async fn fail_pending_spawn(sys: &ActorSystem, job_id: JobId, session_id: Option<&str>) {
+async fn fail_pending_spawn(
+    sys: &ActorSystem,
+    job_id: JobId,
+    session_id: Option<&str>,
+    execution_step: Option<cue_core::StepId>,
+) {
     emit_state_change(
         sys,
         job_id,
         JobStatus::Pending,
         JobStatus::Failed,
+        execution_step,
         session_id,
     )
     .await;
-    emit_job_finished(sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+    emit_job_finished(sys, job_id, EXIT_CODE_UNAVAILABLE, execution_step).await;
 }
 
-async fn emit_job_finished(sys: &ActorSystem, job_id: JobId, exit_code: i32) {
-    if sys
+async fn emit_job_finished(
+    sys: &ActorSystem,
+    job_id: JobId,
+    exit_code: i32,
+    execution_step: Option<cue_core::StepId>,
+) {
+    if let Some(step_id) = execution_step {
+        if sys
+            .execution
+            .send(super::ExecutionCoordinatorMsg::StepFinished { step_id, exit_code })
+            .await
+            .is_err()
+        {
+            warn!(%step_id, exit_code, "process_mgr: execution coordinator channel closed while reporting step completion");
+        }
+    } else if sys
         .scheduler
         .send(SchedulerMsg::JobFinished { job_id, exit_code })
         .await
@@ -3466,8 +3625,12 @@ async fn emit_state_change(
     job_id: JobId,
     old_state: JobStatus,
     new_state: JobStatus,
+    execution_step: Option<cue_core::StepId>,
     session_id: Option<&str>,
 ) {
+    if execution_step.is_some() {
+        return;
+    }
     publish_actor_session_event(
         "process_mgr",
         &sys.event_bus,
@@ -3485,23 +3648,29 @@ async fn emit_state_change(
     .await;
 }
 
+fn process_public_id(job_id: JobId, execution_step: Option<StepId>) -> String {
+    execution_step.map_or_else(|| job_id.to_string(), |step_id| step_id.to_string())
+}
+
 /// Emit an output event without losing non-UTF-8 bytes.
 async fn emit_output(
     sys: &ActorSystem,
     job_id: JobId,
+    execution_step: Option<cue_core::StepId>,
     stream: OutputStream,
     data: &[u8],
     direct_output_client: Option<u64>,
     session_id: Option<&str>,
 ) {
+    let id = process_public_id(job_id, execution_step);
     let payload = match std::str::from_utf8(data) {
         Ok(text) => EventPayload::OutputChunk {
-            id: job_id.to_string(),
+            id: id.clone(),
             stream,
             data: text.to_string(),
         },
         Err(_) => EventPayload::OutputChunkBinary {
-            id: job_id.to_string(),
+            id,
             stream,
             base64: BASE64_STANDARD.encode(data),
         },
@@ -3516,17 +3685,26 @@ async fn emit_output(
         )
         .await;
     }
-    publish_output_event(sys, job_id, payload, direct_output_client, session_id).await;
+    publish_output_event(
+        sys,
+        job_id,
+        execution_step,
+        payload,
+        direct_output_client,
+        session_id,
+    )
+    .await;
 }
 
 async fn emit_output_eof(
     sys: &ActorSystem,
     job_id: JobId,
+    execution_step: Option<cue_core::StepId>,
     direct_output_client: Option<u64>,
     session_id: Option<&str>,
 ) {
     let payload = EventPayload::OutputEof {
-        id: job_id.to_string(),
+        id: process_public_id(job_id, execution_step),
     };
     if let Some(client_id) = direct_output_client {
         send_actor_gateway_event(
@@ -3538,21 +3716,31 @@ async fn emit_output_eof(
         )
         .await;
     }
-    publish_output_event(sys, job_id, payload, direct_output_client, session_id).await;
+    publish_output_event(
+        sys,
+        job_id,
+        execution_step,
+        payload,
+        direct_output_client,
+        session_id,
+    )
+    .await;
 }
 
 async fn publish_output_event(
     sys: &ActorSystem,
     job_id: JobId,
+    execution_step: Option<cue_core::StepId>,
     payload: EventPayload,
     excluded_client_id: Option<u64>,
     session_id: Option<&str>,
 ) {
+    let channel = execution_step.map_or(EventChannel::Output(job_id), |_| EventChannel::Executions);
     if let Some(excluded_client_id) = excluded_client_id {
         publish_actor_session_event_except(
             "process_mgr",
             &sys.event_bus,
-            EventChannel::Output(job_id),
+            channel,
             payload,
             session_id.map(str::to_owned),
             excluded_client_id,
@@ -3562,7 +3750,7 @@ async fn publish_output_event(
         publish_actor_session_event(
             "process_mgr",
             &sys.event_bus,
-            EventChannel::Output(job_id),
+            channel,
             payload,
             session_id.map(str::to_owned),
         )
@@ -3574,6 +3762,7 @@ async fn emit_fg_output(
     sys: &ActorSystem,
     recipients: Vec<ForegroundRecipient>,
     job_id: JobId,
+    execution_step: Option<StepId>,
     data: &[u8],
     session_id: Option<&str>,
 ) {
@@ -3583,7 +3772,7 @@ async fn emit_fg_output(
             sys,
             recipient.client_id,
             EventPayload::FgOutput {
-                id: job_id.to_string(),
+                id: process_public_id(job_id, execution_step),
                 attachment_id: recipient.attachment_id,
                 data: data.to_vec(),
             },
@@ -3597,6 +3786,7 @@ async fn emit_fg_control_changed(
     sys: &ActorSystem,
     recipients: Vec<ForegroundRecipient>,
     job_id: JobId,
+    execution_step: Option<StepId>,
     control_available: bool,
     session_id: Option<&str>,
 ) {
@@ -3606,7 +3796,7 @@ async fn emit_fg_control_changed(
             sys,
             recipient.client_id,
             EventPayload::FgControlChanged {
-                id: job_id.to_string(),
+                id: process_public_id(job_id, execution_step),
                 attachment_id: recipient.attachment_id,
                 control_available,
             },
@@ -3620,6 +3810,7 @@ async fn emit_fg_exit(
     sys: &ActorSystem,
     foreground: &Arc<Mutex<ForegroundState>>,
     job_id: JobId,
+    execution_step: Option<StepId>,
     reason: &str,
     session_id: Option<&str>,
 ) {
@@ -3638,7 +3829,7 @@ async fn emit_fg_exit(
             sys,
             client_id,
             EventPayload::FgExited {
-                id: job_id.to_string(),
+                id: process_public_id(job_id, execution_step),
                 attachment_id,
                 reason: reason.to_string(),
             },
@@ -3736,6 +3927,7 @@ mod tests {
             direct_output_client: None,
             session_id: None,
             spawn_adapter: None,
+            execution_step: None,
         }
     }
 
@@ -3796,6 +3988,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -3867,6 +4060,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -3877,6 +4071,7 @@ mod tests {
         emit_output(
             &sys,
             JobId(7),
+            None,
             OutputStream::Stdout,
             b"\xffbin\n",
             None,
@@ -3913,6 +4108,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -3925,6 +4121,7 @@ mod tests {
             JobId(9),
             JobStatus::Pending,
             JobStatus::Running,
+            None,
             Some("SS-owner"),
         )
         .await;
@@ -3957,6 +4154,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -3967,6 +4165,7 @@ mod tests {
         emit_output(
             &sys,
             JobId(7),
+            None,
             OutputStream::Stdout,
             b"script\n",
             Some(42),
@@ -4016,6 +4215,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4023,7 +4223,7 @@ mod tests {
             resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
-        emit_output_eof(&sys, JobId(7), Some(42), Some("SS-script")).await;
+        emit_output_eof(&sys, JobId(7), None, Some(42), Some("SS-script")).await;
 
         match gateway_rx.recv().await.expect("direct eof") {
             GatewayMsg::SendEvent {
@@ -4064,6 +4264,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4079,10 +4280,10 @@ mod tests {
         let ring = Arc::new(Mutex::new(RingBuffer::default()));
 
         let recipients = record_pty_output(&ring, &foreground, b"prompt");
-        emit_fg_output(&sys, recipients, JobId(8), b"prompt", Some("SS-fg")).await;
+        emit_fg_output(&sys, recipients, JobId(8), None, b"prompt", Some("SS-fg")).await;
         let recipients = foreground.lock().unwrap().recipients();
-        emit_fg_control_changed(&sys, recipients, JobId(8), false, Some("SS-fg")).await;
-        emit_fg_exit(&sys, &foreground, JobId(8), "done", Some("SS-fg")).await;
+        emit_fg_control_changed(&sys, recipients, JobId(8), None, false, Some("SS-fg")).await;
+        emit_fg_exit(&sys, &foreground, JobId(8), None, "done", Some("SS-fg")).await;
 
         for (expected_client, expected_attachment) in [(42, 7), (43, 9)] {
             match gateway_rx.recv().await.expect("foreground output") {
@@ -4162,6 +4363,7 @@ mod tests {
         let (kill_tx, _kill_rx) = mpsc::channel(1);
         let entry = ProcessEntry {
             job_id: JobId(9),
+            execution_step: None,
             session_id: Some("SS-shared".into()),
             status: JobStatus::Running,
             reader_handle: tokio::spawn(async {}),
@@ -4383,6 +4585,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4417,7 +4620,7 @@ mod tests {
                     }],
                 }),
                 scope_hash: cue_core::ScopeHash([9; 32]),
-                options: ProcessJobOptions {
+                options: Box::new(ProcessJobOptions {
                     cwd_override: None,
                     sandbox: None,
                     wrapper_enabled: false,
@@ -4425,7 +4628,8 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
-                },
+                    execution_step: None,
+                }),
             })
             .await
             .expect("send spawn job");
@@ -4457,6 +4661,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4503,7 +4708,7 @@ mod tests {
                     }],
                 }),
                 scope_hash: cue_core::ScopeHash([8; 32]),
-                options: ProcessJobOptions {
+                options: Box::new(ProcessJobOptions {
                     cwd_override: None,
                     sandbox: None,
                     wrapper_enabled: false,
@@ -4511,7 +4716,8 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
-                },
+                    execution_step: None,
+                }),
             })
             .await
             .expect("send spawn job");
@@ -4691,6 +4897,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
             event_bus: event_tx,
@@ -4744,7 +4951,7 @@ mod tests {
                 job_id,
                 plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline { segments }),
                 scope_hash: cue_core::ScopeHash([scope_byte; 32]),
-                options: ProcessJobOptions {
+                options: Box::new(ProcessJobOptions {
                     cwd_override: None,
                     sandbox: None,
                     wrapper_enabled: false,
@@ -4752,7 +4959,8 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
-                },
+                    execution_step: None,
+                }),
             })
             .await
             .expect("send spawn job");
@@ -4920,6 +5128,7 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,

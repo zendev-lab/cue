@@ -482,9 +482,30 @@ fn validate_plan(plan: &ExecutionPlan, path: &str) -> Result<(), PlanValidationE
                 ));
             }
             for (index, branch) in branches.iter().enumerate() {
+                if contains_context_delta(branch) {
+                    return Err(PlanValidationError::new(
+                        format!("{path}.branches[{index}]"),
+                        "context deltas are not supported inside parallel composition",
+                    ));
+                }
                 validate_plan(branch, &format!("{path}.branches[{index}]"))?;
             }
             Ok(())
+        }
+    }
+}
+
+fn contains_context_delta(plan: &ExecutionPlan) -> bool {
+    match plan {
+        ExecutionPlan::ContextDelta { .. } => true,
+        ExecutionPlan::Pipeline { .. } => false,
+        ExecutionPlan::OnSuccess { left, right }
+        | ExecutionPlan::OnFailure { left, right }
+        | ExecutionPlan::Always { left, right } => {
+            contains_context_delta(left) || contains_context_delta(right)
+        }
+        ExecutionPlan::ParallelAll { branches } | ExecutionPlan::AnySuccess { branches } => {
+            branches.iter().any(contains_context_delta)
         }
     }
 }

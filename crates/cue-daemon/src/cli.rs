@@ -2412,6 +2412,7 @@ mod tests {
             &mut stream,
             1,
             cue_core::ipc::RequestPayload::Handshake {
+                protocol_version: cue_core::ipc::IPC_PROTOCOL_VERSION,
                 session_id: format!("startup-gate:{}", socket.display()),
                 cwd: cwd.to_string_lossy().into_owned(),
                 env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),

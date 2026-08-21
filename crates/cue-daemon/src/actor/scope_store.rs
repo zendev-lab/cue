@@ -301,6 +301,7 @@ mod tests {
         ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,

@@ -2266,6 +2266,18 @@ impl AppState {
             }
 
             AppMsg::ServerEvent(event) => match event {
+                EventPayload::ExecutionCreated { execution }
+                | EventPayload::ExecutionFinished { execution } => {
+                    self.main_view.update(MainViewMsg::AppendOutput {
+                        data: format!("{}: {:?}", execution.id, execution.state),
+                    });
+                }
+                EventPayload::ExecutionStateChanged { id, new_state, .. } => {
+                    self.main_view.update(MainViewMsg::AppendOutput {
+                        data: format!("{id}: {new_state:?}"),
+                    });
+                }
+                EventPayload::StepStateChanged { .. } => {}
                 EventPayload::OutputChunk { id, stream, data } => {
                     self.append_display_output(&id, stream, &data);
                 }

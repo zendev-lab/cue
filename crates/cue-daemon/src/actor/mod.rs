@@ -12,6 +12,7 @@
 
 mod cron_schedule;
 mod event_bus;
+mod execution_coordinator;
 pub(crate) mod gateway;
 mod operation_ledger;
 mod process_mgr;
@@ -35,6 +36,8 @@ pub(crate) struct SessionBinding {
     pub named_session_id: Option<String>,
     pub scope: ScopeHash,
     pub incarnation: u64,
+    pub pty_default: Option<bool>,
+    pub wrapper_default: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -121,6 +124,9 @@ pub(crate) struct ProcessJobOptions {
     pub session_id: Option<String>,
     /// Ephemeral per-execution launch interception. Never persisted.
     pub spawn_adapter: Option<ProcessSpawnAdapter>,
+    /// Unified execution step that owns this process. Legacy scheduler jobs
+    /// leave this unset during the v3 hard-cut migration.
+    pub execution_step: Option<cue_core::StepId>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +187,16 @@ pub(crate) enum SchedulerMsg {
     },
     /// Mark a transport client as disconnected and start session TTL handling.
     Disconnect { client_id: u64 },
+    CurrentBinding {
+        client_id: u64,
+        reply: tokio::sync::oneshot::Sender<Option<SessionBinding>>,
+    },
+    ApplyScopeDelta {
+        client_id: u64,
+        base: Option<ScopeHash>,
+        delta: EnvDelta,
+        reply: tokio::sync::oneshot::Sender<ResponsePayload>,
+    },
     /// Evaluate a resolved command on behalf of a client.
     Eval {
         client_id: u64,
@@ -202,6 +218,61 @@ pub(crate) enum SchedulerMsg {
     Shutdown,
 }
 
+pub(crate) enum ExecutionCoordinatorMsg {
+    Submit {
+        client_id: u64,
+        request_id: u32,
+        spec: Box<cue_core::execution::ExecutionSpec>,
+        binding: SessionBinding,
+    },
+    Get {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ExecutionId,
+        named_session_id: Option<String>,
+    },
+    List {
+        client_id: u64,
+        request_id: u32,
+        limit: Option<usize>,
+        named_session_id: Option<String>,
+    },
+    Wait {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ExecutionId,
+        named_session_id: Option<String>,
+    },
+    Cancel {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ExecutionId,
+        mode: cue_core::execution::CancelMode,
+        named_session_id: Option<String>,
+    },
+    ReadOutput {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::ExecutionId,
+        step_id: Option<cue_core::StepId>,
+        stdout_bytes: Option<usize>,
+        stderr_bytes: Option<usize>,
+        named_session_id: Option<String>,
+    },
+    AttachStep {
+        client_id: u64,
+        request_id: u32,
+        id: cue_core::StepId,
+        role: ForegroundRole,
+        named_session_id: Option<String>,
+    },
+    StepFinished {
+        step_id: cue_core::StepId,
+        exit_code: i32,
+    },
+    Shutdown,
+}
+
 /// Messages handled by the ProcessManager actor.
 pub(crate) enum ProcessMgrMsg {
     /// Spawn a child process, pipeline, or job-local expression for the given job.
@@ -211,7 +282,7 @@ pub(crate) enum ProcessMgrMsg {
         /// plans run as one JobId with stream output.
         plan: cue_core::pipeline::JobPlan,
         scope_hash: ScopeHash,
-        options: ProcessJobOptions,
+        options: Box<ProcessJobOptions>,
     },
     /// Request cancellation of a running job.
     KillJob {
@@ -243,6 +314,7 @@ pub(crate) enum ProcessMgrMsg {
         client_id: u64,
         job_id: cue_core::JobId,
         role: ForegroundRole,
+        legacy_snapshot_event: bool,
         reply: tokio::sync::oneshot::Sender<Result<ForegroundAttachmentInfo, String>>,
     },
     /// Acquire the free controller lease for the client's observed PTY job.
@@ -505,6 +577,7 @@ pub(crate) async fn send_gateway_event(
 pub(crate) struct ActorSystem {
     gateway: mpsc::Sender<GatewayMsg>,
     scheduler: mpsc::Sender<SchedulerMsg>,
+    execution: mpsc::Sender<ExecutionCoordinatorMsg>,
     process_mgr: mpsc::Sender<ProcessMgrMsg>,
     scope_store: mpsc::Sender<ScopeStoreMsg>,
     event_bus: mpsc::Sender<EventBusMsg>,
@@ -548,6 +621,12 @@ impl ActorSystem {
         .await;
         send_shutdown("gateway", &self.gateway, GatewayMsg::Shutdown).await;
         send_shutdown("scheduler", &self.scheduler, SchedulerMsg::Shutdown).await;
+        send_shutdown(
+            "execution_coordinator",
+            &self.execution,
+            ExecutionCoordinatorMsg::Shutdown,
+        )
+        .await;
         send_shutdown("process_mgr", &self.process_mgr, ProcessMgrMsg::Shutdown).await;
         send_shutdown("scope_store", &self.scope_store, ScopeStoreMsg::Shutdown).await;
         send_shutdown("event_bus", &self.event_bus, EventBusMsg::Shutdown).await;
@@ -571,6 +650,7 @@ pub(crate) async fn spawn_all(
     // Create channels.
     let (gw_tx, gw_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
     let (sched_tx, sched_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+    let (execution_tx, execution_rx) = mpsc::channel::<ExecutionCoordinatorMsg>(ACTOR_CHANNEL_CAP);
     let (pm_tx, pm_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
     let (ss_tx, ss_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
     let (eb_tx, eb_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
@@ -580,6 +660,7 @@ pub(crate) async fn spawn_all(
     let sys = ActorSystem {
         gateway: gw_tx,
         scheduler: sched_tx,
+        execution: execution_tx,
         process_mgr: pm_tx,
         scope_store: ss_tx,
         event_bus: eb_tx,
@@ -591,6 +672,7 @@ pub(crate) async fn spawn_all(
     scope_store::spawn(ss_rx, scope_db, sys.clone()).await?;
     event_bus::spawn(eb_rx);
     process_mgr::spawn(pm_rx, sys.clone());
+    execution_coordinator::spawn(execution_rx, sys.clone());
     if let Err(error) =
         scheduler::spawn(sched_rx, scheduler_db, sys.clone(), lifecycle.clone()).await
     {
@@ -628,6 +710,7 @@ mod tests {
         let sys = ActorSystem {
             gateway,
             scheduler,
+            execution: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus,
