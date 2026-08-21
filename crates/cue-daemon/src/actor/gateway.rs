@@ -253,6 +253,7 @@ pub(super) async fn spawn(
     mut rx: mpsc::Receiver<GatewayMsg>,
     socket_path: PathBuf,
     sys: ActorSystem,
+    runtime_db: crate::storage::SharedConnection,
     lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> Result<()> {
     // Startup owns stale-socket cleanup while holding the socket-specific
@@ -264,11 +265,18 @@ pub(super) async fn spawn(
 
     // Shared state: client_id → bounded outbound queues and eviction signal.
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-    // One daemon-lifetime ledger spans every transport connection.
-    let operations: SharedOperationLedger = Arc::new(Mutex::new(OperationLedger::default()));
+    // One authoritative in-memory ledger spans every transport connection and
+    // is hydrated from durable completion facts before accepting requests.
+    let facts = crate::storage::with_connection(&runtime_db, crate::storage::load_operation_facts)
+        .await
+        .context("load durable operation facts")?;
+    let operations: SharedOperationLedger = Arc::new(Mutex::new(
+        OperationLedger::restore(facts).context("restore operation ledger")?,
+    ));
 
     let clients_for_dispatch = Arc::clone(&clients);
     let operations_for_dispatch = Arc::clone(&operations);
+    let runtime_db_for_dispatch = runtime_db.clone();
 
     // Accept loop — runs in its own task.
     let sys_accept = sys.clone();
@@ -317,6 +325,15 @@ pub(super) async fn spawn(
                     let completion = operation_ledger(&operations_for_dispatch)
                         .complete(routed_request, payload.clone());
                     if let Some(completion) = completion {
+                        let fact = completion.fact;
+                        if let Err(error) =
+                            crate::storage::with_connection(&runtime_db_for_dispatch, move |conn| {
+                                crate::storage::store_operation_fact(conn, &fact)
+                            })
+                            .await
+                        {
+                            error!(%error, "gateway: failed to persist operation fact");
+                        }
                         for waiter in completion.waiters {
                             queue_response_for_client(
                                 &clients,

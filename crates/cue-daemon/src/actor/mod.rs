@@ -689,15 +689,28 @@ pub(crate) async fn spawn_all(
         lifecycle.clone(),
     )
     .await?;
-    if let Err(error) =
-        session_coordinator::spawn(session_rx, runtime_db, sys.clone(), lifecycle.clone()).await
+    if let Err(error) = session_coordinator::spawn(
+        session_rx,
+        runtime_db.clone(),
+        sys.clone(),
+        lifecycle.clone(),
+    )
+    .await
     {
         send_shutdown("scope_store", &sys.scope_store, ScopeStoreMsg::Shutdown).await;
         send_shutdown("process_mgr", &sys.process_mgr, ProcessMgrMsg::Shutdown).await;
         send_shutdown("event_bus", &sys.event_bus, EventBusMsg::Shutdown).await;
         return Err(anyhow::anyhow!("initialize session coordinator: {error}"));
     }
-    if let Err(error) = gateway::spawn(gw_rx, socket_path, sys.clone(), lifecycle).await {
+    if let Err(error) = gateway::spawn(
+        gw_rx,
+        socket_path,
+        sys.clone(),
+        runtime_db.clone(),
+        lifecycle,
+    )
+    .await
+    {
         sys.shutdown().await;
         return Err(error);
     }

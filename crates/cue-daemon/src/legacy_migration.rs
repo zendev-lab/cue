@@ -542,10 +542,10 @@ mod tests {
         let sessions: u32 = destination
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .expect("session count");
-        let crons: u32 = destination
-            .query_row("SELECT COUNT(*) FROM crons", [], |row| row.get(0))
-            .expect("cron count");
-        assert_eq!((scopes, sessions, crons), (1, 1, 0));
+        let schedules: u32 = destination
+            .query_row("SELECT COUNT(*) FROM schedules", [], |row| row.get(0))
+            .expect("schedule count");
+        assert_eq!((scopes, sessions, schedules), (1, 1, 0));
         let volatile: Option<String> = destination
             .query_row("SELECT snap_json FROM scopes", [], |row| row.get(0))
             .expect("volatile scope");

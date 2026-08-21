@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use cue_core::cron::{CronSchedule, CronStatus};
 use cue_core::execution::{ExecutionSnapshot, ExecutionSpec};
-use cue_core::ipc::ExecutionStepInfo;
+use cue_core::ipc::{ExecutionStepInfo, ResponsePayload};
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{ScheduleId, ScopeHash};
 use rusqlite::Connection;
@@ -41,7 +41,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 20;
+const SCHEMA_VERSION: u32 = 21;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -188,6 +188,17 @@ DROP TABLE IF EXISTS script_runs;
 DROP TABLE IF EXISTS jobs_history;
 DROP TABLE IF EXISTS crons;
 DROP TABLE IF EXISTS config_cache;
+";
+
+const MIGRATION_V21: &str = r"
+CREATE TABLE IF NOT EXISTS operation_facts (
+    session_namespace  BLOB NOT NULL,
+    operation_id_hash BLOB NOT NULL,
+    fingerprint       BLOB NOT NULL,
+    response_json     TEXT,
+    completed_at_ms   INTEGER NOT NULL,
+    PRIMARY KEY (session_namespace, operation_id_hash)
+);
 ";
 
 const CRON_CREATED_AT_MS_EXPR: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
@@ -384,6 +395,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(MIGRATION_V20)
             .context("failed to remove legacy job, cron, script, and config tables")?;
         set_schema_version(conn, &mut current, 20)?;
+    }
+    if current < 21 {
+        conn.execute_batch(MIGRATION_V21)
+            .context("failed to create durable idempotency facts")?;
+        set_schema_version(conn, &mut current, 21)?;
     }
     Ok(())
 }
@@ -905,6 +921,17 @@ pub struct StoredSchedule {
     pub wrapper_default: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredOperationFact {
+    pub session_namespace: [u8; 32],
+    pub operation_id_hash: [u8; 32],
+    pub fingerprint: [u8; 32],
+    /// `None` is a durable tombstone for a completed operation whose response
+    /// is no longer replayable.
+    pub response: Option<ResponsePayload>,
+    pub completed_at_ms: i64,
+}
+
 pub fn store_execution(
     conn: &Connection,
     execution: &StoredExecution,
@@ -1092,6 +1119,64 @@ pub fn remove_schedule(conn: &Connection, id: ScheduleId) -> Result<bool> {
     )? > 0)
 }
 
+pub fn store_operation_fact(conn: &Connection, fact: &StoredOperationFact) -> Result<()> {
+    let response_json = fact
+        .response
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize operation response")?;
+    conn.execute(
+        "INSERT INTO operation_facts (
+             session_namespace, operation_id_hash, fingerprint, response_json, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_namespace, operation_id_hash) DO UPDATE SET
+             fingerprint = excluded.fingerprint,
+             response_json = excluded.response_json,
+             completed_at_ms = excluded.completed_at_ms",
+        rusqlite::params![
+            fact.session_namespace.as_slice(),
+            fact.operation_id_hash.as_slice(),
+            fact.fingerprint.as_slice(),
+            response_json,
+            fact.completed_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_operation_facts(conn: &Connection) -> Result<Vec<StoredOperationFact>> {
+    let mut statement = conn.prepare(
+        "SELECT session_namespace, operation_id_hash, fingerprint, response_json, completed_at_ms
+         FROM operation_facts ORDER BY completed_at_ms, session_namespace, operation_id_hash",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut facts = Vec::new();
+    for row in rows {
+        let (session_namespace, operation_id_hash, fingerprint, response_json, completed_at_ms) =
+            row?;
+        facts.push(StoredOperationFact {
+            session_namespace: blob_to_hash(&session_namespace, "operation session namespace")?,
+            operation_id_hash: blob_to_hash(&operation_id_hash, "operation id hash")?,
+            fingerprint: blob_to_hash(&fingerprint, "operation fingerprint")?,
+            response: response_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .context("corrupt operation response")?,
+            completed_at_ms,
+        });
+    }
+    Ok(facts)
+}
+
 fn sqlite_id(value: u64, kind: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{kind} id exceeds SQLite integer range"))
 }
@@ -1229,10 +1314,12 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 }
 
 fn blob_to_scope_hash(blob: &[u8]) -> Result<ScopeHash> {
-    let arr: [u8; 32] = blob
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("scope hash blob is not 32 bytes (got {})", blob.len()))?;
-    Ok(ScopeHash(arr))
+    Ok(ScopeHash(blob_to_hash(blob, "scope hash")?))
+}
+
+fn blob_to_hash(blob: &[u8], kind: &str) -> Result<[u8; 32]> {
+    blob.try_into()
+        .map_err(|_| anyhow::anyhow!("{kind} blob is not 32 bytes (got {})", blob.len()))
 }
 
 /// Extension trait on `rusqlite::Statement` to get optional results.
@@ -1377,6 +1464,35 @@ mod tests {
         });
         let error = store_schedule(&conn, &schedule).expect_err("adapter must stay ephemeral");
         assert!(error.to_string().contains("cannot persist"));
+    }
+
+    #[test]
+    fn operation_facts_roundtrip_replay_responses_and_tombstones() {
+        let conn = in_memory_db();
+        let mut fact = StoredOperationFact {
+            session_namespace: [1; 32],
+            operation_id_hash: [2; 32],
+            fingerprint: [3; 32],
+            response: Some(ResponsePayload::ack()),
+            completed_at_ms: 42,
+        };
+
+        store_operation_fact(&conn, &fact).expect("store replayable fact");
+        let loaded = load_operation_facts(&conn).expect("load replayable fact");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].session_namespace, fact.session_namespace);
+        assert_eq!(loaded[0].operation_id_hash, fact.operation_id_hash);
+        assert_eq!(loaded[0].fingerprint, fact.fingerprint);
+        assert_eq!(loaded[0].completed_at_ms, fact.completed_at_ms);
+        assert!(matches!(loaded[0].response, Some(ResponsePayload::Ok(_))));
+
+        fact.response = None;
+        fact.completed_at_ms = 43;
+        store_operation_fact(&conn, &fact).expect("replace with tombstone");
+        let loaded = load_operation_facts(&conn).expect("load tombstone");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].completed_at_ms, fact.completed_at_ms);
+        assert!(loaded[0].response.is_none());
     }
 
     #[test]

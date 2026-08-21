@@ -3696,6 +3696,7 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.cwd = cwd.clone();
         let mut options = process_options();
+        options.execution_step = step(404);
         options.session_id = Some("SS-sandbox".into());
         options.sandbox = Some(crate::sandbox::SandboxConfig {
             mode: crate::sandbox::SandboxMode::Overlay,
