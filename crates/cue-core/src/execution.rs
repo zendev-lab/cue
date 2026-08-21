@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     id::{ExecutionId, ScopeHash, StepId},
-    job::SandboxSettings,
+    launch::SandboxSettings,
     pipeline::Pipeline,
     resource::Need,
     scope::EnvDelta,

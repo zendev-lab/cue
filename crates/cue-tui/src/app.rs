@@ -11,11 +11,11 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use cue_core::EventChannel;
 use cue_core::cron::CronStatus;
+use cue_core::execution::ExecutionState;
 use cue_core::ipc::{
-    EventPayload, ExecutionInfo, ForegroundAttachmentInfo, ForegroundRole, JobOpenHint, OkPayload,
+    EventPayload, ExecutionInfo, ForegroundAttachmentInfo, ForegroundRole, OkPayload,
     RequestPayload, ResponsePayload, ScheduleInfo,
 };
-use cue_core::job::JobStatus;
 use cue_language::{CompiledCommand, FrontendAction, Mode, compile_command, render_help};
 use ratatui::layout::Rect;
 use tui_term::vt100;
@@ -44,7 +44,7 @@ use crate::message::AppMsg;
 use crate::mouse_mode::MouseMode;
 use crate::record_format::{self, JobRecord};
 use crate::session_binding::connector_with_named_session;
-use crate::sidebar_action;
+use crate::sidebar_action::{self, ExecutionOpenHint};
 use crate::status_view;
 use crate::submission::{self, LocalCommand, PendingSubmission};
 #[cfg(test)]
@@ -60,10 +60,10 @@ use crate::target_settings::{
 struct JobRow {
     id: String,
     label: String,
-    status: JobStatus,
+    status: ExecutionState,
     start_scope: Option<String>,
     end_scope: Option<String>,
-    open_hint: JobOpenHint,
+    open_hint: ExecutionOpenHint,
     warnings: Vec<String>,
     pending_reason: Option<String>,
 }
@@ -75,26 +75,11 @@ struct CronRow {
     status: CronStatus,
 }
 
-fn execution_job_status(state: &cue_core::execution::ExecutionState) -> JobStatus {
-    match state {
-        cue_core::execution::ExecutionState::Queued => JobStatus::Pending,
-        cue_core::execution::ExecutionState::Running => JobStatus::Running,
-        cue_core::execution::ExecutionState::Succeeded => JobStatus::Done,
-        cue_core::execution::ExecutionState::Failed => JobStatus::Failed,
-        cue_core::execution::ExecutionState::Cancelled {
-            reason: cue_core::execution::ExecutionCancelReason::Forced,
-        } => JobStatus::Killed,
-        cue_core::execution::ExecutionState::Cancelled { .. } => {
-            JobStatus::Cancelled(cue_core::job::CancelReason::User)
-        }
-    }
-}
-
-fn execution_open_hint(execution: &ExecutionInfo) -> JobOpenHint {
+fn execution_open_hint(execution: &ExecutionInfo) -> ExecutionOpenHint {
     let _ = execution;
     // Foreground control is step-scoped in IPC v3; an execution-level row can
     // always open aggregate output but cannot guess which PTY step to control.
-    JobOpenHint::Stream
+    ExecutionOpenHint::Stream
 }
 
 fn execution_spec_label(spec: &cue_core::execution::ExecutionSpec) -> String {
@@ -1253,9 +1238,9 @@ impl AppState {
         &mut self,
         id: String,
         label: String,
-        status: JobStatus,
+        status: ExecutionState,
         start_scope: Option<String>,
-        open_hint: JobOpenHint,
+        open_hint: ExecutionOpenHint,
         warnings: Vec<String>,
     ) {
         if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
@@ -1270,7 +1255,7 @@ impl AppState {
             if !warnings.is_empty() {
                 job.warnings = warnings;
             }
-            if job.status != JobStatus::Pending {
+            if job.status != ExecutionState::Queued {
                 job.pending_reason = None;
             }
             return;
@@ -1292,20 +1277,20 @@ impl AppState {
         self.upsert_job(
             execution.id.to_string(),
             execution_label(execution),
-            execution_job_status(&execution.state),
+            execution.state.clone(),
             execution.spec.start_scope.map(|scope| scope.to_string()),
             execution_open_hint(execution),
             Vec::new(),
         );
     }
 
-    fn update_job_status(&mut self, id: &str, status: JobStatus, end_scope: Option<String>) {
+    fn update_job_status(&mut self, id: &str, status: ExecutionState, end_scope: Option<String>) {
         if let Some(index) = self.jobs.iter().position(|job| job.id == id) {
             self.jobs[index].status = status;
             if end_scope.is_some() {
                 self.jobs[index].end_scope = end_scope;
             }
-            if self.jobs[index].status != JobStatus::Pending {
+            if self.jobs[index].status != ExecutionState::Queued {
                 self.jobs[index].pending_reason = None;
             }
             if let Some(card_index) = self.job_cards.get(id).copied() {
@@ -1319,7 +1304,7 @@ impl AppState {
                 status,
                 start_scope: None,
                 end_scope,
-                open_hint: JobOpenHint::Stream,
+                open_hint: ExecutionOpenHint::Stream,
                 warnings: Vec::new(),
                 pending_reason: None,
             });
@@ -1755,9 +1740,7 @@ impl AppState {
                                 let card_index = self.show_submission_result(
                                     pending,
                                     body,
-                                    status_view::job_card_status(&execution_job_status(
-                                        &execution.state,
-                                    )),
+                                    status_view::job_card_status(&execution.state),
                                     Some(id.clone()),
                                 );
                                 self.job_cards.insert(id, card_index);
@@ -1818,9 +1801,7 @@ impl AppState {
                                 self.show_submission_result(
                                     pending,
                                     format_execution_info(&execution),
-                                    status_view::job_card_status(&execution_job_status(
-                                        &execution.state,
-                                    )),
+                                    status_view::job_card_status(&execution.state),
                                     Some(execution.id.to_string()),
                                 );
                             }
@@ -1973,7 +1954,7 @@ impl AppState {
                     self.sync_sidebar_items();
                 }
                 EventPayload::ExecutionStateChanged { id, new_state, .. } => {
-                    self.update_job_status(&id.to_string(), execution_job_status(&new_state), None);
+                    self.update_job_status(&id.to_string(), new_state.clone(), None);
                     self.sync_sidebar_items();
                 }
                 EventPayload::StepStateChanged { .. } => {}
@@ -1991,7 +1972,7 @@ impl AppState {
                         self.main_view.set_card_output(card_index, body);
                         self.main_view.set_card_status(
                             card_index,
-                            status_view::job_card_status(&execution_job_status(&execution.state)),
+                            status_view::job_card_status(&execution.state.clone()),
                         );
                     }
                     self.sync_sidebar_items();
@@ -2517,10 +2498,10 @@ mod tests {
         state.jobs.push(JobRow {
             id: "J1".into(),
             label: "sleep 5".into(),
-            status: JobStatus::Running,
+            status: ExecutionState::Running,
             start_scope: None,
             end_scope: None,
-            open_hint: JobOpenHint::Fg,
+            open_hint: ExecutionOpenHint::Fg,
             warnings: Vec::new(),
             pending_reason: None,
         });
@@ -2537,10 +2518,10 @@ mod tests {
         state.jobs.push(JobRow {
             id: "J1".into(),
             label: "cargo build".into(),
-            status: JobStatus::Done,
+            status: ExecutionState::Succeeded,
             start_scope: None,
             end_scope: None,
-            open_hint: JobOpenHint::Stream,
+            open_hint: ExecutionOpenHint::Stream,
             warnings: Vec::new(),
             pending_reason: None,
         });
@@ -2557,10 +2538,10 @@ mod tests {
         state.jobs.push(JobRow {
             id: "J1".into(),
             label: "vim notes.txt".into(),
-            status: JobStatus::Running,
+            status: ExecutionState::Running,
             start_scope: None,
             end_scope: None,
-            open_hint: JobOpenHint::Fg,
+            open_hint: ExecutionOpenHint::Fg,
             warnings: Vec::new(),
             pending_reason: None,
         });
@@ -2629,20 +2610,20 @@ mod tests {
             JobRow {
                 id: "J1".into(),
                 label: "sleep 1".into(),
-                status: JobStatus::Done,
+                status: ExecutionState::Succeeded,
                 start_scope: None,
                 end_scope: None,
-                open_hint: JobOpenHint::Stream,
+                open_hint: ExecutionOpenHint::Stream,
                 warnings: Vec::new(),
                 pending_reason: None,
             },
             JobRow {
                 id: "J2".into(),
                 label: "sleep 2".into(),
-                status: JobStatus::Running,
+                status: ExecutionState::Running,
                 start_scope: None,
                 end_scope: None,
-                open_hint: JobOpenHint::Stream,
+                open_hint: ExecutionOpenHint::Stream,
                 warnings: Vec::new(),
                 pending_reason: None,
             },

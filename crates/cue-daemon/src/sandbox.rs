@@ -102,31 +102,31 @@ impl Drop for SandboxCleanup {
     }
 }
 
-impl From<SandboxConfig> for cue_core::job::SandboxSettings {
+impl From<SandboxConfig> for cue_core::launch::SandboxSettings {
     fn from(value: SandboxConfig) -> Self {
         Self {
             mode: match value.mode {
-                SandboxMode::Overlay => cue_core::job::SandboxMode::Overlay,
+                SandboxMode::Overlay => cue_core::launch::SandboxMode::Overlay,
             },
             upper: value.upper.map(|upper| match upper {
-                SandboxUpper::Directory(path) => cue_core::job::SandboxUpper::Directory(path),
-                SandboxUpper::Tmpfs => cue_core::job::SandboxUpper::Tmpfs,
+                SandboxUpper::Directory(path) => cue_core::launch::SandboxUpper::Directory(path),
+                SandboxUpper::Tmpfs => cue_core::launch::SandboxUpper::Tmpfs,
             }),
         }
     }
 }
 
-impl From<&cue_core::job::SandboxSettings> for SandboxConfig {
-    fn from(value: &cue_core::job::SandboxSettings) -> Self {
+impl From<&cue_core::launch::SandboxSettings> for SandboxConfig {
+    fn from(value: &cue_core::launch::SandboxSettings) -> Self {
         Self {
             mode: match value.mode {
-                cue_core::job::SandboxMode::Overlay => SandboxMode::Overlay,
+                cue_core::launch::SandboxMode::Overlay => SandboxMode::Overlay,
             },
             upper: value.upper.as_ref().map(|upper| match upper {
-                cue_core::job::SandboxUpper::Directory(path) => {
+                cue_core::launch::SandboxUpper::Directory(path) => {
                     SandboxUpper::Directory(path.clone())
                 }
-                cue_core::job::SandboxUpper::Tmpfs => SandboxUpper::Tmpfs,
+                cue_core::launch::SandboxUpper::Tmpfs => SandboxUpper::Tmpfs,
             }),
         }
     }

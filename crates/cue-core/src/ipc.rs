@@ -404,13 +404,6 @@ pub enum Stream {
     Stderr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum JobOpenHint {
-    Stream,
-    Fg,
-}
-
 /// A client's effective role in a shared foreground attachment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

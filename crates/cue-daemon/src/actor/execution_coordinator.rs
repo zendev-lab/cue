@@ -643,7 +643,7 @@ async fn step_finished(
         let old_step_states = step_states(&record);
         let outcome = if exit_code == 0 {
             NodeOutcome::Succeeded
-        } else if exit_code == cue_core::job::EXIT_CODE_UNAVAILABLE {
+        } else if exit_code == cue_core::launch::EXIT_CODE_UNAVAILABLE {
             NodeOutcome::Failed(StepFailure::Infrastructure {
                 message: "process result unavailable".into(),
             })

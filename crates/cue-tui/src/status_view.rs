@@ -1,16 +1,15 @@
 use cue_core::cron::CronStatus;
-use cue_core::job::JobStatus;
+use cue_core::execution::{ExecutionCancelReason, ExecutionState};
 
 use crate::component::main_view::CardStatus;
 
-pub(crate) fn job_status_text(status: &JobStatus) -> String {
+pub(crate) fn job_status_text(status: &ExecutionState) -> String {
     match status {
-        JobStatus::Pending => "pending".to_string(),
-        JobStatus::Running => "running".to_string(),
-        JobStatus::Done => "done".to_string(),
-        JobStatus::Failed => "failed".to_string(),
-        JobStatus::Killed => "killed".to_string(),
-        JobStatus::Cancelled(reason) => format!("cancelled({reason:?})").to_lowercase(),
+        ExecutionState::Queued => "pending".to_string(),
+        ExecutionState::Running => "running".to_string(),
+        ExecutionState::Succeeded => "succeeded".to_string(),
+        ExecutionState::Failed => "failed".to_string(),
+        ExecutionState::Cancelled { reason } => format!("cancelled({reason:?})").to_lowercase(),
     }
 }
 
@@ -24,23 +23,25 @@ pub(crate) fn cron_status_text(status: CronStatus) -> &'static str {
     }
 }
 
-pub(crate) fn job_card_status(status: &JobStatus) -> CardStatus {
+pub(crate) fn job_card_status(status: &ExecutionState) -> CardStatus {
     match status {
-        JobStatus::Pending => CardStatus::Pending,
-        JobStatus::Running => CardStatus::Streaming,
-        JobStatus::Done => CardStatus::Success,
-        JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_) => CardStatus::Error,
+        ExecutionState::Queued => CardStatus::Pending,
+        ExecutionState::Running => CardStatus::Streaming,
+        ExecutionState::Succeeded => CardStatus::Success,
+        ExecutionState::Failed | ExecutionState::Cancelled { .. } => CardStatus::Error,
     }
 }
 
-pub(crate) fn job_status_icon(status: &JobStatus) -> &'static str {
+pub(crate) fn job_status_icon(status: &ExecutionState) -> &'static str {
     match status {
-        JobStatus::Pending => "⏳",
-        JobStatus::Running => "🔄",
-        JobStatus::Done => "✅",
-        JobStatus::Failed => "❌",
-        JobStatus::Killed => "🛑",
-        JobStatus::Cancelled(_) => "⏹",
+        ExecutionState::Queued => "⏳",
+        ExecutionState::Running => "🔄",
+        ExecutionState::Succeeded => "✅",
+        ExecutionState::Failed => "❌",
+        ExecutionState::Cancelled {
+            reason: ExecutionCancelReason::Forced,
+        } => "🛑",
+        ExecutionState::Cancelled { .. } => "⏹",
     }
 }
 
@@ -59,11 +60,21 @@ mod tests {
     use super::*;
     #[test]
     fn job_status_maps_to_text_icon_and_card_status() {
-        assert_eq!(job_status_text(&JobStatus::Running), "running");
-        assert_eq!(job_status_icon(&JobStatus::Killed), "🛑");
-        assert_eq!(job_card_status(&JobStatus::Done), CardStatus::Success);
+        assert_eq!(job_status_text(&ExecutionState::Running), "running");
         assert_eq!(
-            job_card_status(&JobStatus::Cancelled(cue_core::job::CancelReason::User)),
+            job_status_icon(&ExecutionState::Cancelled {
+                reason: ExecutionCancelReason::Forced,
+            }),
+            "🛑"
+        );
+        assert_eq!(
+            job_card_status(&ExecutionState::Succeeded),
+            CardStatus::Success
+        );
+        assert_eq!(
+            job_card_status(&ExecutionState::Cancelled {
+                reason: ExecutionCancelReason::User,
+            }),
             CardStatus::Error
         );
     }

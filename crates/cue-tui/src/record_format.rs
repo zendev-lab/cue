@@ -1,5 +1,5 @@
 use cue_core::cron::CronStatus;
-use cue_core::job::JobStatus;
+use cue_core::execution::ExecutionState;
 use cue_language::Mode;
 
 use crate::component::main_view::{Card, CardStatus};
@@ -7,7 +7,7 @@ use crate::status_view;
 
 pub(crate) struct JobRecord<'a> {
     pub(crate) id: &'a str,
-    pub(crate) status: &'a JobStatus,
+    pub(crate) status: &'a ExecutionState,
     pub(crate) start_scope: Option<&'a str>,
     pub(crate) end_scope: Option<&'a str>,
     pub(crate) warnings: &'a [String],
@@ -85,7 +85,7 @@ mod tests {
         let warnings = vec!["warning: direct shell syntax".to_string()];
         let text = format_job_record(JobRecord {
             id: "J1",
-            status: &JobStatus::Done,
+            status: &ExecutionState::Succeeded,
             start_scope: Some("S@start"),
             end_scope: Some("S@end"),
             warnings: &warnings,
@@ -102,7 +102,7 @@ mod tests {
     fn job_record_marks_same_terminal_scope_as_no_side_effect() {
         let text = format_job_record(JobRecord {
             id: "J1",
-            status: &JobStatus::Done,
+            status: &ExecutionState::Succeeded,
             start_scope: Some("S@same"),
             end_scope: Some("S@same"),
             warnings: &[],

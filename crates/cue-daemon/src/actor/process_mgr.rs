@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use cue_core::ipc::{
     EventPayload, ForegroundAttachmentInfo, ForegroundRole, Stream as OutputStream,
 };
-use cue_core::job::EXIT_CODE_UNAVAILABLE;
+use cue_core::launch::EXIT_CODE_UNAVAILABLE;
 use cue_core::pipeline::{Pipeline, command_prefers_foreground};
 use cue_core::process_status::exit_code_from_status;
 use cue_core::scope::EnvSnapshot;

@@ -11,7 +11,7 @@ use crate::Mode;
 use cue_core::command::{ModeParams, ParamValue};
 use cue_core::execution::{ExecutionPlan, ExecutionSpec, LaunchContext, SourceMetadata};
 use cue_core::ipc::RequestPayload;
-use cue_core::job::{SandboxMode, SandboxSettings, SandboxUpper};
+use cue_core::launch::{SandboxMode, SandboxSettings, SandboxUpper};
 use cue_core::pipeline::{PipeSegment as CorePipeSegment, Pipeline as CorePipeline};
 use cue_core::scope::EnvDelta;
 use cue_core::{ExecutionId, ScheduleId, StepId};

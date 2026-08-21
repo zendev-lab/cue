@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use cue_core::cron::CronStatus;
-use cue_core::job::JobStatus;
+use cue_core::execution::ExecutionState;
 use cue_language::Mode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -31,7 +31,7 @@ pub(crate) struct SidebarItem {
 pub(crate) struct JobSidebarRecord<'a> {
     pub(crate) id: &'a str,
     pub(crate) label: &'a str,
-    pub(crate) status: &'a JobStatus,
+    pub(crate) status: &'a ExecutionState,
 }
 
 pub(crate) struct CronSidebarRecord<'a> {
@@ -65,14 +65,14 @@ pub(crate) struct OverviewCounts {
 }
 
 pub(crate) fn overview_counts<'a>(
-    job_statuses: impl IntoIterator<Item = &'a JobStatus>,
+    job_statuses: impl IntoIterator<Item = &'a ExecutionState>,
     crons: usize,
 ) -> OverviewCounts {
     let mut jobs = 0usize;
     let mut jobs_running = 0usize;
     for status in job_statuses {
         jobs += 1;
-        if matches!(status, JobStatus::Running) {
+        if matches!(status, ExecutionState::Running) {
             jobs_running += 1;
         }
     }
@@ -306,7 +306,11 @@ mod tests {
     fn overview_counts_summarize_jobs_and_crons() {
         assert_eq!(
             overview_counts(
-                [&JobStatus::Running, &JobStatus::Done, &JobStatus::Running],
+                [
+                    &ExecutionState::Running,
+                    &ExecutionState::Succeeded,
+                    &ExecutionState::Running
+                ],
                 2
             ),
             OverviewCounts {
@@ -323,7 +327,7 @@ mod tests {
             job_sidebar_item(JobSidebarRecord {
                 id: "J7",
                 label: "cargo test",
-                status: &JobStatus::Running,
+                status: &ExecutionState::Running,
             })
             .status_icon,
             "🔄"

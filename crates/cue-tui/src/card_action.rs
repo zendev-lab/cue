@@ -1,14 +1,16 @@
-use cue_core::ipc::JobOpenHint;
-use cue_core::job::JobStatus;
+#[cfg(test)]
+use cue_core::execution::ExecutionCancelReason;
+use cue_core::execution::ExecutionState;
 
 use crate::component::main_view::Card;
 use crate::display::DisplayPreview;
 use crate::record_format;
+use crate::sidebar_action::ExecutionOpenHint;
 
 pub(crate) struct CardJob<'a> {
     pub(crate) id: &'a str,
-    pub(crate) status: &'a JobStatus,
-    pub(crate) open_hint: JobOpenHint,
+    pub(crate) status: &'a ExecutionState,
+    pub(crate) open_hint: ExecutionOpenHint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,13 +26,13 @@ pub(crate) fn inspect_card_action(
     job: Option<CardJob<'_>>,
 ) -> CardAction {
     if let Some(job) = job {
-        if matches!(job.status, JobStatus::Running) && job.open_hint == JobOpenHint::Fg {
+        if matches!(job.status, ExecutionState::Running) && job.open_hint == ExecutionOpenHint::Fg {
             return CardAction::Foreground {
                 job_id: job.id.to_string(),
             };
         }
 
-        if matches!(job.status, JobStatus::Running) || job.status.is_terminal() {
+        if matches!(job.status, ExecutionState::Running) || job.status.is_terminal() {
             return CardAction::Tail {
                 job_id: job.id.to_string(),
             };
@@ -50,7 +52,6 @@ pub(crate) fn inspect_card_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cue_core::job::CancelReason;
     use cue_language::Mode;
 
     use crate::component::main_view::{Card, CardStatus};
@@ -72,8 +73,8 @@ mod tests {
                 &card,
                 Some(CardJob {
                     id: "J7",
-                    status: &JobStatus::Running,
-                    open_hint: JobOpenHint::Fg,
+                    status: &ExecutionState::Running,
+                    open_hint: ExecutionOpenHint::Fg,
                 }),
             ),
             CardAction::Foreground {
@@ -86,8 +87,8 @@ mod tests {
                 &card,
                 Some(CardJob {
                     id: "J8",
-                    status: &JobStatus::Running,
-                    open_hint: JobOpenHint::Stream,
+                    status: &ExecutionState::Running,
+                    open_hint: ExecutionOpenHint::Stream,
                 }),
             ),
             CardAction::Tail {
@@ -101,10 +102,14 @@ mod tests {
         let card = card("cargo test");
 
         for status in [
-            JobStatus::Done,
-            JobStatus::Failed,
-            JobStatus::Killed,
-            JobStatus::Cancelled(CancelReason::User),
+            ExecutionState::Succeeded,
+            ExecutionState::Failed,
+            ExecutionState::Cancelled {
+                reason: ExecutionCancelReason::Forced,
+            },
+            ExecutionState::Cancelled {
+                reason: ExecutionCancelReason::User,
+            },
         ] {
             assert_eq!(
                 inspect_card_action(
@@ -113,7 +118,7 @@ mod tests {
                     Some(CardJob {
                         id: "J9",
                         status: &status,
-                        open_hint: JobOpenHint::Stream,
+                        open_hint: ExecutionOpenHint::Stream,
                     }),
                 ),
                 CardAction::Tail {
@@ -134,8 +139,8 @@ mod tests {
                 &card,
                 Some(CardJob {
                     id: "J4",
-                    status: &JobStatus::Pending,
-                    open_hint: JobOpenHint::Fg,
+                    status: &ExecutionState::Queued,
+                    open_hint: ExecutionOpenHint::Fg,
                 }),
             ),
             CardAction::Preview(DisplayPreview::new(
