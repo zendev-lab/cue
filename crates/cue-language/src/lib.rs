@@ -16,7 +16,9 @@ mod tokenizer;
 
 use cue_core::mode::Mode;
 
-pub use assistance::{complete_input, highlight_input};
+pub use assistance::{
+    CompletionItem, CompletionKind, HighlightKind, HighlightSpan, complete_input, highlight_input,
+};
 pub use compiler::{
     CompileError, CompiledCommand, FrontendAction, compile_command, compile_file, render_help,
 };

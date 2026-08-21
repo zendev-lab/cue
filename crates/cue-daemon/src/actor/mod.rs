@@ -67,7 +67,7 @@ use cue_core::ipc::{
     EventPayload, ForegroundAttachmentInfo, ForegroundRole, ResponsePayload, ScopeInfo,
 };
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
-use cue_core::{EventChannel, ScopeHash};
+use cue_core::{EventChannel, ScopeHash, StepId};
 
 use crate::resource::ProviderRegistry;
 
@@ -128,9 +128,8 @@ pub(crate) struct ProcessJobOptions {
     pub session_id: Option<String>,
     /// Ephemeral per-execution launch interception. Never persisted.
     pub spawn_adapter: Option<ProcessSpawnAdapter>,
-    /// Unified execution step that owns this process. Legacy scheduler jobs
-    /// leave this unset during the v3 hard-cut migration.
-    pub execution_step: Option<cue_core::StepId>,
+    /// Unified execution step that owns this process.
+    pub execution_step: cue_core::StepId,
 }
 
 #[derive(Clone, Debug)]
@@ -140,14 +139,8 @@ pub(crate) struct ProcessSpawnAdapter {
     pub step_id: cue_core::StepId,
 }
 
-pub(crate) fn process_output_stem(
-    job_id: cue_core::JobId,
-    step: Option<cue_core::StepId>,
-) -> String {
-    step.map_or_else(
-        || job_id.to_string(),
-        |step| format!("E{}-S{}", step.execution.0, step.index),
-    )
+pub(crate) fn process_output_stem(_job_id: cue_core::JobId, step: cue_core::StepId) -> String {
+    format!("E{}-S{}", step.execution.0, step.index)
 }
 
 // ── Per-actor message types ──
@@ -379,7 +372,7 @@ pub(crate) enum ProcessMgrMsg {
 /// Internal controller-lease transition result used to build typed IPC replies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForegroundRoleUpdate {
-    pub id: String,
+    pub id: StepId,
     pub attachment_id: u64,
     pub role: ForegroundRole,
     pub control_available: bool,

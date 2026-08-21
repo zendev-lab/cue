@@ -559,7 +559,7 @@ async fn drive_execution(
                                 step_id,
                             }
                         }),
-                        execution_step: Some(step_id),
+                        execution_step: step_id,
                     };
                     if sys
                         .process_mgr
@@ -976,7 +976,7 @@ async fn read_output(
     };
     let mut steps = Vec::with_capacity(selected.len());
     for step_id in selected {
-        let stem = super::process_output_stem(JobId(0), Some(step_id));
+        let stem = super::process_output_stem(JobId(0), step_id);
         let stdout = read_stream_tail(
             output_dir.join(format!("{stem}.log")),
             stdout_bytes.unwrap_or(DEFAULT_OUTPUT_TAIL),

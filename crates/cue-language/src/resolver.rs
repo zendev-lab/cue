@@ -10,7 +10,7 @@ use cue_core::command::{ModeParams, ParamValue};
 use cue_core::cron::{
     CronPreset, CronSchedule, CrontabSchedule, parse_day_filter, parse_time_of_day,
 };
-use cue_core::ipc::{ForegroundRole, ScriptSource};
+use cue_core::ipc::ForegroundRole;
 use cue_core::mode::Mode;
 use cue_core::pipeline::{self as core_pipeline};
 
@@ -25,7 +25,6 @@ pub enum ResolvedCommand {
     /// One script submission containing one or more top-level commands.
     Script {
         mode: Mode,
-        source: ScriptSource,
         items: Vec<ResolvedScriptItem>,
     },
     /// Run a chain of jobs.
@@ -136,7 +135,6 @@ impl Resolver {
         match ast {
             Ast::Script { items, .. } => Ok(ResolvedCommand::Script {
                 mode,
-                source: ScriptSource::Inline,
                 items: items
                     .into_iter()
                     .map(|item| Self::resolve_script_item(item, mode))

@@ -300,7 +300,7 @@ mod tests {
             slow_tx.clone(),
             slow_disconnect_tx.clone(),
         );
-        subscriptions.subscribe(1, EventChannel::Jobs, slow_tx, slow_disconnect_tx);
+        subscriptions.subscribe(1, EventChannel::Executions, slow_tx, slow_disconnect_tx);
         subscriptions.subscribe(2, EventChannel::System, healthy_tx, healthy_disconnect_tx);
 
         let first = subscriptions.publish(&EventChannel::System, &event(), None, None);
@@ -317,7 +317,7 @@ mod tests {
         assert!(slow_rx.try_recv().is_ok());
         assert!(healthy_rx.try_recv().is_ok());
         assert_eq!(subscriptions.subscriber_count(&EventChannel::System), 1);
-        assert_eq!(subscriptions.subscriber_count(&EventChannel::Jobs), 0);
+        assert_eq!(subscriptions.subscriber_count(&EventChannel::Executions), 0);
 
         // A fresh transport can subscribe normally after the evicted one closes.
         let (reconnected_tx, mut reconnected_rx) = mpsc::channel(1);
@@ -362,15 +362,20 @@ mod tests {
         let (legacy_disconnect, _) = watch::channel(false);
         let (matching_disconnect, _) = watch::channel(false);
         let (foreign_disconnect, _) = watch::channel(false);
-        subscriptions.subscribe(1, EventChannel::Jobs, legacy_tx, legacy_disconnect);
-        subscriptions.subscribe(2, EventChannel::Jobs, matching_tx, matching_disconnect);
-        subscriptions.subscribe(3, EventChannel::Jobs, foreign_tx, foreign_disconnect);
+        subscriptions.subscribe(1, EventChannel::Executions, legacy_tx, legacy_disconnect);
+        subscriptions.subscribe(
+            2,
+            EventChannel::Executions,
+            matching_tx,
+            matching_disconnect,
+        );
+        subscriptions.subscribe(3, EventChannel::Executions, foreign_tx, foreign_disconnect);
         subscriptions.set_client_session(1, None);
         subscriptions.set_client_session(2, Some("SS-owner".into()));
         subscriptions.set_client_session(3, Some("SS-foreign".into()));
 
         let owner = Some("SS-owner".to_string());
-        let stats = subscriptions.publish(&EventChannel::Jobs, &event(), None, Some(&owner));
+        let stats = subscriptions.publish(&EventChannel::Executions, &event(), None, Some(&owner));
 
         assert_eq!(stats.delivered, 2);
         assert_eq!(stats.filtered, 1);
@@ -384,10 +389,10 @@ mod tests {
         let mut subscriptions = EventSubscriptions::default();
         let (tx, mut rx) = mpsc::channel(1);
         let (disconnect, _) = watch::channel(false);
-        subscriptions.subscribe(9, EventChannel::Jobs, tx, disconnect);
+        subscriptions.subscribe(9, EventChannel::Executions, tx, disconnect);
 
         let owner = Some("SS-owner".to_string());
-        let stats = subscriptions.publish(&EventChannel::Jobs, &event(), None, Some(&owner));
+        let stats = subscriptions.publish(&EventChannel::Executions, &event(), None, Some(&owner));
 
         assert_eq!(stats.delivered, 0);
         assert_eq!(stats.filtered, 1);
@@ -399,27 +404,42 @@ mod tests {
         let mut subscriptions = EventSubscriptions::default();
         let (tx, mut rx) = mpsc::channel(2);
         let (disconnect, _) = watch::channel(false);
-        subscriptions.subscribe(7, EventChannel::Jobs, tx, disconnect);
+        subscriptions.subscribe(7, EventChannel::Executions, tx, disconnect);
         subscriptions.set_client_session(7, Some("SS-first".into()));
 
         let first_owner = Some("SS-first".to_string());
         let second_owner = Some("SS-second".to_string());
         assert_eq!(
             subscriptions
-                .publish(&EventChannel::Jobs, &event(), None, Some(&first_owner))
+                .publish(
+                    &EventChannel::Executions,
+                    &event(),
+                    None,
+                    Some(&first_owner),
+                )
                 .delivered,
             1
         );
         subscriptions.set_client_session(7, Some("SS-second".into()));
         assert_eq!(
             subscriptions
-                .publish(&EventChannel::Jobs, &event(), None, Some(&first_owner))
+                .publish(
+                    &EventChannel::Executions,
+                    &event(),
+                    None,
+                    Some(&first_owner),
+                )
                 .filtered,
             1
         );
         assert_eq!(
             subscriptions
-                .publish(&EventChannel::Jobs, &event(), None, Some(&second_owner))
+                .publish(
+                    &EventChannel::Executions,
+                    &event(),
+                    None,
+                    Some(&second_owner),
+                )
                 .delivered,
             1
         );
@@ -435,13 +455,13 @@ mod tests {
         let (named_tx, mut named_rx) = mpsc::channel(1);
         let (legacy_disconnect, _) = watch::channel(false);
         let (named_disconnect, _) = watch::channel(false);
-        subscriptions.subscribe(1, EventChannel::Crons, legacy_tx, legacy_disconnect);
-        subscriptions.subscribe(2, EventChannel::Crons, named_tx, named_disconnect);
+        subscriptions.subscribe(1, EventChannel::Scopes, legacy_tx, legacy_disconnect);
+        subscriptions.subscribe(2, EventChannel::Scopes, named_tx, named_disconnect);
         subscriptions.set_client_session(1, None);
         subscriptions.set_client_session(2, Some("SS-named".into()));
 
         let owner = None;
-        let stats = subscriptions.publish(&EventChannel::Crons, &event(), None, Some(&owner));
+        let stats = subscriptions.publish(&EventChannel::Scopes, &event(), None, Some(&owner));
 
         assert_eq!(stats.delivered, 1);
         assert_eq!(stats.filtered, 1);

@@ -1,4 +1,4 @@
-//! TUI frontend for cue-shell.
+//! TUI frontend for Cue.
 //!
 //! Architecture: TEA (The Elm Architecture) + Component hybrid.
 //! - Global app state plus message-driven update function
@@ -24,7 +24,6 @@ mod job_picker;
 mod message;
 mod mouse_mode;
 mod record_format;
-mod script_summary;
 mod session_binding;
 mod sidebar_action;
 mod status_view;

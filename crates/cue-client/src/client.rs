@@ -15,10 +15,9 @@ use tokio::task::JoinHandle;
 use cue_core::EventChannel;
 use cue_core::ipc::{
     EventPayload, ForegroundAttachmentInfo, IPC_CAPABILITY_EXECUTION_V3,
-    IPC_CAPABILITY_FOREGROUND_OBSERVERS, IPC_CAPABILITY_NAMED_SESSIONS,
-    IPC_CAPABILITY_SESSION_ARCHIVE, IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
-    IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
-    SessionInfo, SessionScopeState, encode_message,
+    IPC_CAPABILITY_NAMED_SESSIONS, IPC_CAPABILITY_SESSION_ARCHIVE,
+    IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED, IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message,
+    OkPayload, RequestPayload, ResponsePayload, SessionInfo, SessionScopeState, encode_message,
 };
 
 /// Client handle for a single connection to the cued daemon.
@@ -980,11 +979,7 @@ fn required_request_capability(payload: &RequestPayload) -> Option<&'static str>
 }
 
 fn unsupported_capability_message(capability: &'static str) -> String {
-    if capability == IPC_CAPABILITY_FOREGROUND_OBSERVERS {
-        format!(
-            "daemon does not advertise IPC capability `{capability}`; upgrade/restart cued before using :watch or shared foreground control"
-        )
-    } else if capability == IPC_CAPABILITY_NAMED_SESSIONS {
+    if capability == IPC_CAPABILITY_NAMED_SESSIONS {
         format!(
             "daemon does not advertise IPC capability `{capability}`; upgrade/restart cued before using named sessions"
         )
@@ -1175,10 +1170,10 @@ fn next_atomic_request_id(next_id: &AtomicU32) -> u32 {
 mod tests {
     use std::collections::HashSet;
 
+    use cue_core::EventChannel;
     use cue_core::ipc::{
         ForegroundAttachmentInfo, ForegroundRole, OkPayload, SessionScopeState, encode_message,
     };
-    use cue_core::{EventChannel, JobId};
     use tokio::io::duplex;
     use tokio::time::{Duration, timeout};
 
@@ -1270,7 +1265,7 @@ mod tests {
         let mut client = CuedClient::from_stream(client_stream);
 
         let request_id = client
-            .subscribe(&[EventChannel::Jobs, EventChannel::Output(JobId(7))])
+            .subscribe(&[EventChannel::Executions, EventChannel::Scopes])
             .await
             .expect("send subscribe request");
 
@@ -1282,7 +1277,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, 1);
-                assert_eq!(channels, vec!["jobs", "output:J7"]);
+                assert_eq!(channels, vec!["executions", "scopes"]);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -1397,11 +1392,11 @@ mod tests {
         let (client_stream, mut server_stream) = duplex(4096);
         let client_task = tokio::spawn(async move {
             let mut client = CuedClient::from_stream(client_stream);
-            assert!(!client.supports_capability(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
+            assert!(!client.supports_capability(IPC_CAPABILITY_EXECUTION_V3));
             assert_eq!(client.ping_for_version().await.unwrap(), "0.1.0");
-            assert!(client.supports_capability(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
+            assert!(client.supports_capability(IPC_CAPABILITY_EXECUTION_V3));
             let (_reader, writer) = client.into_reader_and_writer_handle();
-            assert!(writer.supports_capability(IPC_CAPABILITY_FOREGROUND_OBSERVERS));
+            assert!(writer.supports_capability(IPC_CAPABILITY_EXECUTION_V3));
             writer.try_send(RequestPayload::StepReleaseControl {})
         });
 
@@ -1426,7 +1421,6 @@ mod tests {
                     capabilities: vec![
                         IPC_CAPABILITY_EXECUTION_V3.into(),
                         IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED.into(),
-                        IPC_CAPABILITY_FOREGROUND_OBSERVERS.into(),
                     ],
                 }),
             },
@@ -1467,7 +1461,7 @@ mod tests {
             other => panic!("unexpected request: {other:?}"),
         };
         let attachment = ForegroundAttachmentInfo {
-            id: "E9/S1".into(),
+            id: step,
             attachment_id: 9,
             role: ForegroundRole::Observer,
             control_available: false,
@@ -2076,7 +2070,7 @@ mod tests {
                 id: request_id,
                 payload: ResponsePayload::Ok(OkPayload::FgAttached(Box::new(
                     ForegroundAttachmentInfo {
-                        id: "E12/S1".into(),
+                        id: step,
                         attachment_id: 12,
                         role: ForegroundRole::Observer,
                         control_available: false,
@@ -2090,7 +2084,7 @@ mod tests {
 
         match watching.await.unwrap().unwrap() {
             ResponsePayload::Ok(OkPayload::FgAttached(attachment)) => {
-                assert_eq!(attachment.id, "E12/S1");
+                assert_eq!(attachment.id, step);
                 assert_eq!(attachment.role, ForegroundRole::Observer);
                 assert_eq!(attachment.snapshot, b"shared output");
             }
@@ -2142,7 +2136,7 @@ mod tests {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .subscribe(&[EventChannel::Crons, EventChannel::System])
+                    .subscribe(&[EventChannel::Executions, EventChannel::System])
                     .await
             }
         });
@@ -2153,7 +2147,7 @@ mod tests {
                 payload: RequestPayload::Subscribe { channels },
                 ..
             } => {
-                assert_eq!(channels, vec!["crons", "system"]);
+                assert_eq!(channels, vec!["executions", "system"]);
                 id
             }
             other => panic!("unexpected request: {other:?}"),
@@ -2182,7 +2176,7 @@ mod tests {
 
         let response_task = tokio::spawn({
             let client = Arc::clone(&client);
-            async move { client.unsubscribe(&[EventChannel::Output(JobId(3))]).await }
+            async move { client.unsubscribe(&[EventChannel::Executions]).await }
         });
 
         let request_id = match read_message(&mut server_stream).await.unwrap() {
@@ -2191,7 +2185,7 @@ mod tests {
                 payload: RequestPayload::Unsubscribe { channels },
                 ..
             } => {
-                assert_eq!(channels, vec!["output:J3"]);
+                assert_eq!(channels, vec!["executions"]);
                 id
             }
             other => panic!("unexpected request: {other:?}"),

@@ -2084,7 +2084,10 @@ mod tests {
         begin_client_event_hold_fence(&state, 42);
         let event = ClientEvent::session(
             EventPayload::FgOutput {
-                id: "J1".into(),
+                id: cue_core::StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
                 attachment_id: 1,
                 data: b"after-cut".to_vec(),
             },

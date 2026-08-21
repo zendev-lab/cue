@@ -3,16 +3,13 @@
 //! Transport: Unix domain socket with length-prefixed JSON framing.
 //! See `docs/design/ipc-protocol.md` for the full specification.
 
-use std::collections::BTreeMap;
-use std::ops::Range;
-
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::cron::{CronSchedule, CronStatus};
 use crate::event_channel::EventChannel;
 use crate::execution::{CancelMode, ExecutionSpec, ExecutionState, StepState};
 use crate::id::{ExecutionId, ScheduleId, ScopeHash, StepId};
-use crate::job::JobStatus;
 use crate::resource::ResourceUnit;
 use crate::scope::EnvDelta;
 
@@ -20,20 +17,14 @@ use crate::scope::EnvDelta;
 pub const IPC_PROTOCOL_VERSION: u32 = 3;
 /// Capability advertised by daemons that reject session-dependent requests before `Handshake`.
 pub const IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED: &str = "session-handshake-required";
-/// Script item ownership is reported by authoritative `ScriptItemCreated` events.
-pub const IPC_CAPABILITY_SCRIPT_ITEM_CREATED: &str = "script-item-created";
-/// Typed, quiescent cancellation for jobs, chains, and script runs.
+/// Typed, quiescent cancellation for executions.
 pub const IPC_CAPABILITY_CANCEL_EXECUTION: &str = "cancel-execution";
 /// Cross-connection replay and conflict detection for side-effecting requests.
 pub const IPC_CAPABILITY_OPERATION_IDEMPOTENCY: &str = "operation-idempotency";
-/// Typed daemon-lifetime snapshots for reconnect-safe file-script recovery.
-pub const IPC_CAPABILITY_SCRIPT_INFO_RECOVERY: &str = "script-info-recovery";
 /// Drain-first daemon restart with a fenced single successor.
 pub const IPC_CAPABILITY_GRACEFUL_RESTART: &str = "graceful-restart";
 /// Durable named process sessions that multiple human and agent clients can attach to.
 pub const IPC_CAPABILITY_NAMED_SESSIONS: &str = "named-sessions";
-/// Multiple foreground observers with an explicit single-controller lease.
-pub const IPC_CAPABILITY_FOREGROUND_OBSERVERS: &str = "foreground-observers";
 /// Safe, reversible archive/restore lifecycle for durable named sessions.
 pub const IPC_CAPABILITY_SESSION_ARCHIVE: &str = "session-archive";
 /// Unified typed execution submission and observation contract.
@@ -41,13 +32,10 @@ pub const IPC_CAPABILITY_EXECUTION_V3: &str = "execution-v3";
 const IPC_CAPABILITIES: &[&str] = &[
     IPC_CAPABILITY_EXECUTION_V3,
     IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
-    IPC_CAPABILITY_SCRIPT_ITEM_CREATED,
     IPC_CAPABILITY_CANCEL_EXECUTION,
     IPC_CAPABILITY_OPERATION_IDEMPOTENCY,
-    IPC_CAPABILITY_SCRIPT_INFO_RECOVERY,
     IPC_CAPABILITY_GRACEFUL_RESTART,
     IPC_CAPABILITY_NAMED_SESSIONS,
-    IPC_CAPABILITY_FOREGROUND_OBSERVERS,
     IPC_CAPABILITY_SESSION_ARCHIVE,
 ];
 
@@ -280,48 +268,11 @@ pub enum OkPayload {
         schedule: Box<ScheduleInfo>,
     },
     ScheduleList(Vec<ScheduleInfo>),
-    ScriptCreated {
-        script_id: String,
-        source: ScriptSource,
-        items: Vec<ScriptItemInfo>,
-        submit_error: Option<ScriptSubmitError>,
-    },
-    JobCreated {
-        job_id: String,
-        start_scope: Option<String>,
-        open_hint: JobOpenHint,
-        chain_id: Option<String>,
-        chain_index: Option<usize>,
-        chain_total: Option<usize>,
-        #[serde(default)]
-        warnings: Vec<String>,
-    },
-    ChainCreated {
-        chain_id: String,
-        job_ids: Vec<String>,
-        chain: ChainInfo,
-        #[serde(default)]
-        warnings: Vec<String>,
-    },
-    CronAdded {
-        cron_id: String,
-    },
     ScopeCreated {
         hash: String,
         summary: String,
     },
 
-    JobInfo(JobInfo),
-    JobList(Vec<JobInfo>),
-    JobListPage {
-        jobs: Vec<JobInfo>,
-        page: PageInfo,
-    },
-    CronList(Vec<CronInfo>),
-    CronListPage {
-        crons: Vec<CronInfo>,
-        page: PageInfo,
-    },
     ScopeInfo(ScopeInfo),
     ScopeList(Vec<ScopeInfo>),
     ScopeListPage {
@@ -331,26 +282,6 @@ pub enum OkPayload {
     ResourceList(Vec<ResourceProviderInfo>),
     SessionInfo(Box<SessionInfo>),
     SessionList(Vec<SessionInfo>),
-    ScriptInfo(ScriptInfo),
-    Output {
-        id: String,
-        data: String,
-        truncated: bool,
-        #[serde(default)]
-        encoding: OutputEncoding,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base64: Option<String>,
-    },
-    JobOutput {
-        id: String,
-        stdout: StreamText,
-        stderr: StreamText,
-        stderr_pty_merged: bool,
-    },
-
-    EvalText {
-        text: String,
-    },
     TextOutput {
         text: String,
         truncated: bool,
@@ -360,16 +291,9 @@ pub enum OkPayload {
         base64: Option<String>,
     },
 
-    CompletionList {
-        items: Vec<CompletionItem>,
-    },
-    HighlightResult {
-        spans: Vec<HighlightSpan>,
-    },
-
     FgAttached(Box<ForegroundAttachmentInfo>),
     FgRoleChanged {
-        id: String,
+        id: StepId,
         /// Identifies the exact foreground attachment this transition belongs to.
         #[serde(default)]
         attachment_id: u64,
@@ -441,94 +365,27 @@ pub enum EventPayload {
     ExecutionFinished {
         execution: Box<ExecutionInfo>,
     },
-    // Jobs channel
-    JobStateChanged {
-        job_id: String,
-        old_state: JobStatus,
-        new_state: JobStatus,
-        end_scope: Option<String>,
-        chain_id: Option<String>,
-        chain_index: Option<usize>,
-    },
-    JobCreated {
-        job_id: String,
-        pipeline: String,
-        start_scope: Option<String>,
-        open_hint: JobOpenHint,
-        chain_id: Option<String>,
-        chain_index: Option<usize>,
-        chain_total: Option<usize>,
-    },
-    ChainProgress {
-        chain: ChainInfo,
-    },
-    /// A file-script item created after the initial `ScriptCreated` response.
-    ///
-    /// The daemon is the authority for the item-to-job/chain association.
-    /// Clients must not infer script membership from globally ordered job IDs
-    /// or unrelated `JobCreated` events.
-    ScriptItemCreated {
-        script_id: String,
-        item: ScriptItemInfo,
-    },
-    ScriptFinished {
-        script_id: String,
-        status: ScriptRunStatus,
-        /// Numeric process exit code, or `job::EXIT_CODE_UNAVAILABLE` when no
-        /// process-provided status exists.
-        exit_code: i32,
-        failed_item_index: Option<usize>,
-    },
-    JobRemoved {
-        job_id: String,
-    },
-
-    // Crons channel
-    CronTriggered {
-        cron_id: String,
-        job_id: String,
-    },
-    CronRemoved {
-        cron_id: String,
-    },
-
-    // Output channel (output:<id>)
     OutputChunk {
-        id: String,
+        id: StepId,
         stream: Stream,
-        data: String,
-    },
-    OutputChunkBinary {
-        id: String,
-        stream: Stream,
-        base64: String,
-    },
-    OutputEof {
-        id: String,
+        #[serde(with = "serde_bytes_base64")]
+        data: Vec<u8>,
     },
 
     // :fg (sent only to fg-attached client)
     FgOutput {
-        /// Empty only when decoded from daemons predating job-scoped foreground streams.
-        #[serde(default)]
-        id: String,
-        /// Zero only when decoded from daemons predating attachment epochs.
-        #[serde(default)]
+        id: StepId,
         attachment_id: u64,
         #[serde(with = "serde_bytes_base64")]
         data: Vec<u8>,
     },
     FgControlChanged {
-        id: String,
-        /// Zero only when decoded from daemons predating attachment epochs.
-        #[serde(default)]
+        id: StepId,
         attachment_id: u64,
         control_available: bool,
     },
     FgExited {
-        id: String,
-        /// Zero only when decoded from daemons predating attachment epochs.
-        #[serde(default)]
+        id: StepId,
         attachment_id: u64,
         reason: String,
     },
@@ -568,7 +425,7 @@ pub enum ForegroundRole {
 /// Atomic foreground registration result: a byte snapshot followed by live events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForegroundAttachmentInfo {
-    pub id: String,
+    pub id: StepId,
     /// Monotonic, non-zero identifier for this exact job/client attachment.
     #[serde(default)]
     pub attachment_id: u64,
@@ -656,35 +513,6 @@ pub struct ScheduleInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobInfo {
-    pub id: String,
-    /// Durable named-session owner. Legacy and anonymous-session jobs have no owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    pub status: JobStatus,
-    pub pipeline: String,
-    pub exit_code: Option<i32>,
-    pub start_scope: Option<String>,
-    pub end_scope: Option<String>,
-    pub open_hint: JobOpenHint,
-    pub chain_id: Option<String>,
-    pub chain_index: Option<usize>,
-    pub chain_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronInfo {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    pub schedule: String,
-    pub command: String,
-    pub status: CronStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeInfo {
     pub hash: String,
     pub parent: Option<String>,
@@ -721,144 +549,6 @@ pub struct SessionInfo {
     /// Present when the session is hidden from the default active-session list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainInfo {
-    pub id: String,
-    pub pipeline: String,
-    pub total_jobs: usize,
-    pub jobs: Vec<ChainJobInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainJobInfo {
-    pub index: usize,
-    pub pipeline: String,
-    pub status: JobStatus,
-    pub job_id: Option<String>,
-    pub start_scope: Option<String>,
-    pub end_scope: Option<String>,
-    pub open_hint: Option<JobOpenHint>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptItemInfo {
-    pub index: usize,
-    pub source: String,
-    pub result: ScriptItemResult,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ScriptSource {
-    #[default]
-    Inline,
-    File {
-        path: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScriptRunStatus {
-    Done,
-    Failed,
-}
-
-/// Recoverable lifecycle state for a daemon-lifetime script snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScriptInfoStatus {
-    Running,
-    Done,
-    Failed,
-}
-
-/// Authoritative snapshot used to reconcile script events missed during a
-/// transport disconnect. It is intentionally daemon-lifetime, not crash-safe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptInfo {
-    pub script_id: String,
-    pub status: ScriptInfoStatus,
-    pub items: Vec<ScriptItemInfo>,
-    pub exit_code: Option<i32>,
-    pub failed_item_index: Option<usize>,
-    pub submit_error: Option<ScriptSubmitError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ScriptItemResult {
-    Job {
-        job_id: String,
-        start_scope: Option<String>,
-        open_hint: JobOpenHint,
-    },
-    Chain {
-        chain_id: String,
-        job_ids: Vec<String>,
-        chain: ChainInfo,
-    },
-    Cron {
-        cron_id: String,
-    },
-    Message {
-        text: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptSubmitError {
-    pub index: usize,
-    pub source: String,
-    pub code: String,
-    pub message: String,
-}
-
-// ── Editor services ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionItem {
-    pub label: String,
-    pub insert_text: String,
-    pub kind: CompletionKind,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CompletionKind {
-    Command,
-    Param,
-    Id,
-    Path,
-    Operator,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HighlightSpan {
-    pub start: usize,
-    pub end: usize,
-    pub kind: HighlightKind,
-}
-
-impl HighlightSpan {
-    pub fn range(&self) -> Range<usize> {
-        self.start..self.end
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HighlightKind {
-    CommandPrefix,
-    CommandName,
-    ModeParam,
-    Operator,
-    IdRef,
-    Word,
-    String,
-    Number,
-    Error,
 }
 
 // ── Error codes ──
@@ -933,6 +623,13 @@ mod serde_bytes_base64 {
 mod tests {
     use super::*;
 
+    fn step(execution: u64) -> StepId {
+        StepId {
+            execution: ExecutionId(execution),
+            index: 1,
+        }
+    }
+
     #[test]
     fn roundtrip_typed_execution_request() {
         let msg = Message::Request {
@@ -986,13 +683,13 @@ mod tests {
     #[test]
     fn subscription_request_constructors_use_event_channel_wire_names() {
         let subscribe = RequestPayload::subscribe(&[
-            EventChannel::Jobs,
-            EventChannel::Crons,
-            EventChannel::Output(crate::JobId(7)),
+            EventChannel::Executions,
+            EventChannel::Scopes,
+            EventChannel::System,
         ]);
         match subscribe {
             RequestPayload::Subscribe { channels } => {
-                assert_eq!(channels, vec!["jobs", "crons", "output:J7"]);
+                assert_eq!(channels, vec!["executions", "scopes", "system"]);
             }
             _ => panic!("wrong variant"),
         }
@@ -1132,166 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn rich_output_payloads_roundtrip() {
-        let payload = ResponsePayload::Ok(OkPayload::JobOutput {
-            id: "J1".into(),
-            stdout: StreamText {
-                data: "out".into(),
-                truncated: false,
-                encoding: OutputEncoding::Utf8,
-                base64: None,
-            },
-            stderr: StreamText {
-                data: "err".into(),
-                truncated: true,
-                encoding: OutputEncoding::Utf8,
-                base64: None,
-            },
-            stderr_pty_merged: false,
-        });
-        let json = serde_json::to_string(&payload).unwrap();
-        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ResponsePayload::Ok(OkPayload::JobOutput { stderr, .. }) => {
-                assert_eq!(stderr.data, "err");
-                assert!(stderr.truncated);
-                assert_eq!(stderr.encoding, OutputEncoding::Utf8);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn legacy_output_without_encoding_defaults_to_utf8() {
-        let decoded: ResponsePayload = serde_json::from_str(
-            r#"{"Ok":{"JobOutput":{"id":"J1","stdout":{"data":"out","truncated":false},"stderr":{"data":"","truncated":false},"stderr_pty_merged":false}}}"#,
-        )
-        .unwrap();
-
-        match decoded {
-            ResponsePayload::Ok(OkPayload::JobOutput { stdout, stderr, .. }) => {
-                assert_eq!(stdout.encoding, OutputEncoding::Utf8);
-                assert_eq!(stderr.encoding, OutputEncoding::Utf8);
-                assert!(stdout.base64.is_none());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn binary_stream_text_roundtrips_with_authoritative_base64() {
-        let payload = ResponsePayload::Ok(OkPayload::JobOutput {
-            id: "J1".into(),
-            stdout: StreamText {
-                data: "�bin".into(),
-                truncated: false,
-                encoding: OutputEncoding::Base64,
-                base64: Some("/2Jpbg==".into()),
-            },
-            stderr: StreamText {
-                data: String::new(),
-                truncated: false,
-                encoding: OutputEncoding::Utf8,
-                base64: None,
-            },
-            stderr_pty_merged: false,
-        });
-
-        let decoded: ResponsePayload =
-            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
-        match decoded {
-            ResponsePayload::Ok(OkPayload::JobOutput { stdout, .. }) => {
-                assert_eq!(stdout.encoding, OutputEncoding::Base64);
-                assert_eq!(stdout.base64.as_deref(), Some("/2Jpbg=="));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn script_created_item_and_finished_payloads_roundtrip() {
-        let created = ResponsePayload::Ok(OkPayload::ScriptCreated {
-            script_id: "R7".into(),
-            source: ScriptSource::File {
-                path: "scripts/build.cue".into(),
-            },
-            items: vec![],
-            submit_error: None,
-        });
-        let json = serde_json::to_string(&created).unwrap();
-        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ResponsePayload::Ok(OkPayload::ScriptCreated { source, .. }) => {
-                assert_eq!(
-                    source,
-                    ScriptSource::File {
-                        path: "scripts/build.cue".into()
-                    }
-                );
-            }
-            _ => panic!("wrong variant"),
-        }
-
-        let item_created = Message::Event {
-            payload: EventPayload::ScriptItemCreated {
-                script_id: "R7".into(),
-                item: ScriptItemInfo {
-                    index: 1,
-                    source: "echo second".into(),
-                    result: ScriptItemResult::Job {
-                        job_id: "J9".into(),
-                        start_scope: Some("S@abc12345".into()),
-                        open_hint: JobOpenHint::Stream,
-                    },
-                },
-            },
-        };
-        let json = serde_json::to_string(&item_created).unwrap();
-        let decoded: Message = serde_json::from_str(&json).unwrap();
-        match decoded {
-            Message::Event {
-                payload: EventPayload::ScriptItemCreated { script_id, item },
-            } => {
-                assert_eq!(script_id, "R7");
-                assert_eq!(item.index, 1);
-                assert!(matches!(
-                    item.result,
-                    ScriptItemResult::Job { ref job_id, .. } if job_id == "J9"
-                ));
-            }
-            _ => panic!("wrong variant"),
-        }
-
-        let finished = Message::Event {
-            payload: EventPayload::ScriptFinished {
-                script_id: "R7".into(),
-                status: ScriptRunStatus::Failed,
-                exit_code: 2,
-                failed_item_index: Some(1),
-            },
-        };
-        let json = serde_json::to_string(&finished).unwrap();
-        let decoded: Message = serde_json::from_str(&json).unwrap();
-        match decoded {
-            Message::Event {
-                payload:
-                    EventPayload::ScriptFinished {
-                        script_id,
-                        status,
-                        exit_code,
-                        failed_item_index,
-                    },
-            } => {
-                assert_eq!(script_id, "R7");
-                assert_eq!(status, ScriptRunStatus::Failed);
-                assert_eq!(exit_code, 2);
-                assert_eq!(failed_item_index, Some(1));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn scope_created_payload_has_no_label_field() {
         let payload = ResponsePayload::Ok(OkPayload::ScopeCreated {
             hash: "S@abc12345".into(),
@@ -1314,7 +851,7 @@ mod tests {
     fn binary_payloads_serialize_as_base64_strings() {
         let msg = Message::Event {
             payload: EventPayload::FgOutput {
-                id: "J7".into(),
+                id: step(7),
                 attachment_id: 11,
                 data: vec![0, 1, 2, 0xfe, 0xff],
             },
@@ -1324,28 +861,10 @@ mod tests {
     }
 
     #[test]
-    fn foreground_attachment_decodes_legacy_exclusive_response() {
-        let json = r#"{"Ok":{"FgAttached":{"id":"J7"}}}"#;
-        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
-
-        match decoded {
-            ResponsePayload::Ok(OkPayload::FgAttached(info)) => {
-                assert_eq!(info.id, "J7");
-                assert_eq!(info.attachment_id, 0);
-                assert_eq!(info.role, ForegroundRole::Controller);
-                assert!(!info.control_available);
-                assert!(info.snapshot.is_empty());
-                assert!(!info.snapshot_truncated);
-            }
-            _ => panic!("wrong foreground response"),
-        }
-    }
-
-    #[test]
     fn foreground_attachment_snapshot_serializes_as_base64() {
         let payload =
             ResponsePayload::Ok(OkPayload::FgAttached(Box::new(ForegroundAttachmentInfo {
-                id: "J7".into(),
+                id: step(7),
                 attachment_id: 23,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -1368,23 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn foreground_output_decodes_legacy_event_without_job_id() {
-        let json = r#"{"type":"event","payload":{"FgOutput":{"data":"QUJD"}}}"#;
-        let decoded: Message = serde_json::from_str(json).unwrap();
-
-        assert!(matches!(
-            decoded,
-            Message::Event {
-                payload: EventPayload::FgOutput {
-                    id,
-                    attachment_id,
-                    data,
-                }
-            } if id.is_empty() && attachment_id == 0 && data == b"ABC"
-        ));
-    }
-
-    #[test]
     fn shared_foreground_requests_and_control_event_roundtrip() {
         for payload in [
             RequestPayload::StepWatch {
@@ -1402,7 +904,7 @@ mod tests {
 
         let message = Message::Event {
             payload: EventPayload::FgControlChanged {
-                id: "J7".into(),
+                id: step(7),
                 attachment_id: 29,
                 control_available: true,
             },
@@ -1416,11 +918,11 @@ mod tests {
                     attachment_id: 29,
                     control_available: true,
                 },
-            } if id == "J7"
+            } if id == step(7)
         ));
 
         let role_response = ResponsePayload::Ok(OkPayload::FgRoleChanged {
-            id: "J7".into(),
+            id: step(7),
             attachment_id: 29,
             role: ForegroundRole::Controller,
             control_available: false,
@@ -1433,53 +935,13 @@ mod tests {
                 attachment_id: 29,
                 role: ForegroundRole::Controller,
                 control_available: false,
-            }) if id == "J7"
+            }) if id == step(7)
         ));
         assert!(
             current_protocol_capabilities()
                 .iter()
-                .any(|capability| capability == IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+                .any(|capability| capability == IPC_CAPABILITY_EXECUTION_V3)
         );
-    }
-
-    #[test]
-    fn foreground_epoch_defaults_for_legacy_role_and_lifecycle_payloads() {
-        let role_json =
-            r#"{"Ok":{"FgRoleChanged":{"id":"J7","role":"observer","control_available":true}}}"#;
-        assert!(matches!(
-            serde_json::from_str::<ResponsePayload>(role_json).unwrap(),
-            ResponsePayload::Ok(OkPayload::FgRoleChanged {
-                id,
-                attachment_id: 0,
-                role: ForegroundRole::Observer,
-                control_available: true,
-            }) if id == "J7"
-        ));
-
-        let control_json = r#"{"type":"event","payload":{"FgControlChanged":{"id":"J7","control_available":true}}}"#;
-        assert!(matches!(
-            serde_json::from_str::<Message>(control_json).unwrap(),
-            Message::Event {
-                payload: EventPayload::FgControlChanged {
-                    id,
-                    attachment_id: 0,
-                    control_available: true,
-                },
-            } if id == "J7"
-        ));
-
-        let exit_json =
-            r#"{"type":"event","payload":{"FgExited":{"id":"J7","reason":"detached"}}}"#;
-        assert!(matches!(
-            serde_json::from_str::<Message>(exit_json).unwrap(),
-            Message::Event {
-                payload: EventPayload::FgExited {
-                    id,
-                    attachment_id: 0,
-                    reason,
-                },
-            } if id == "J7" && reason == "detached"
-        ));
     }
 
     #[test]
@@ -1490,18 +952,6 @@ mod tests {
 
         assert!(
             error.to_string().contains("invalid type"),
-            "wrong error: {error}"
-        );
-    }
-
-    #[test]
-    fn script_created_requires_source() {
-        let json = r#"{"Ok":{"ScriptCreated":{"script_id":"R1","items":[],"submit_error":null}}}"#;
-        let error = serde_json::from_str::<ResponsePayload>(json)
-            .expect_err("ScriptCreated must carry an explicit source");
-
-        assert!(
-            error.to_string().contains("missing field `source`"),
             "wrong error: {error}"
         );
     }
@@ -1578,7 +1028,7 @@ mod tests {
 
     #[test]
     fn pong_decodes_versioned_payload() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","protocol_version":3,"capabilities":["execution-v3","session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","protocol_version":3,"capabilities":["execution-v3","session-handshake-required","cancel-execution","operation-idempotency","graceful-restart","named-sessions","session-archive"]}}}"#;
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
             ResponsePayload::Ok(OkPayload::Pong {
@@ -1613,7 +1063,7 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert_eq!(
             json,
-            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","ready":true,"protocol_version":3,"capabilities":["execution-v3","session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#
+            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","ready":true,"protocol_version":3,"capabilities":["execution-v3","session-handshake-required","cancel-execution","operation-idempotency","graceful-restart","named-sessions","session-archive"]}}}"#
         );
     }
 
