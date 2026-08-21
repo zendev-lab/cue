@@ -9,6 +9,7 @@ pub mod command;
 pub mod command_spec;
 pub mod cron;
 pub mod event_channel;
+pub mod execution;
 pub mod id;
 pub mod ipc;
 pub mod job;
@@ -21,7 +22,7 @@ pub mod tui_debug;
 
 // Re-export commonly used types at crate root.
 pub use event_channel::EventChannel;
-pub use id::{ChainId, CronId, EntityRef, JobId, ScopeHash, ScriptId};
+pub use id::{ChainId, CronId, EntityRef, ExecutionId, JobId, ScopeHash, ScriptId, StepId};
 pub use job::{LaunchOptions, SandboxMode, SandboxSettings, SandboxUpper};
 pub use mode::Mode;
 pub use resource::{
