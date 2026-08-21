@@ -1,4 +1,4 @@
-//! Recursive descent parser: Vec<Token> → Ast.
+//! Recursive descent parser: Vec<Token> → AST.
 //!
 //! Grammar (EBNF):
 //! ```ebnf
@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use cue_core::command_spec::{
+use crate::command_spec::{
     CommandArgKind, CommandIdKind, CommandSpec, ModeParamSpec, ModeParamValueKind, command_spec,
     command_suggestions, mode_param_spec, mode_param_spec_for_command,
 };

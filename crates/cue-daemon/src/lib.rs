@@ -10,7 +10,6 @@ mod config;
 mod dirs;
 mod gateway_stdio;
 mod lifecycle;
-mod parser;
 mod pty;
 mod resource;
 mod ring_buffer;

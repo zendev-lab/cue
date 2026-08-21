@@ -1,4 +1,4 @@
-//! Tokenizer: raw input string → Vec<Spanned>.
+//! Tokenizer: raw input string → `Vec<Spanned>`.
 //!
 //! Context-sensitive `()` handling:
 //! - `(` immediately after a `Command` token → `ModeParenOpen`

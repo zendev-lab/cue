@@ -1,4 +1,4 @@
-//! Resolver: Ast → validated execution request.
+//! Resolver: AST → validated frontend intent.
 //!
 //! Responsibilities:
 //! 1. Mode injection: BareInput → wraps with default command per mode
@@ -824,7 +824,7 @@ fn mode_help_topic(mode: Mode) -> &'static str {
 mod tests {
     use std::time::Duration;
 
-    use cue_core::command_spec::{COMMAND_SPECS, CommandArgKind};
+    use crate::command_spec::{COMMAND_SPECS, CommandArgKind};
     use cue_core::cron::{DayFilter, Weekday};
     use cue_core::pipeline::JobPlan;
 

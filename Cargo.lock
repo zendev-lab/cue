@@ -387,6 +387,7 @@ dependencies = [
  "bpaf",
  "chrono",
  "cue-core",
+ "cue-language",
  "insta",
  "libc",
  "nvml-wrapper",
@@ -402,6 +403,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cue-language"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "cue-core",
+ "insta",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cue-tui"
 version = "0.1.1"
 dependencies = [
@@ -411,6 +422,7 @@ dependencies = [
  "crossterm",
  "cue-client",
  "cue-core",
+ "cue-language",
  "ratatui",
  "serde_json",
  "tokio",

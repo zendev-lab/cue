@@ -1,4 +1,4 @@
-//! AST types produced by the Parser (unresolved).
+//! AST types produced by the parser (unresolved).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
