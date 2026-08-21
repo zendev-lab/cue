@@ -20,7 +20,7 @@
 //!   internal `Mutex` so that concurrent admission attempts can't race over
 //!   the same physical unit.
 //! * `release(grant_id)` — release a previously granted reservation by id.
-//!   Best-effort: no error is propagated, since terminal job paths must
+//!   Best-effort: no error is propagated, since terminal step paths must
 //!   always succeed.
 //!
 //! All methods are synchronous. The daemon's scheduler runs admission off
@@ -31,7 +31,7 @@
 use std::fmt;
 
 use cue_core::{
-    JobId,
+    StepId,
     resource::{Grant, Need, ProviderId, Reject, ReservationId, Snapshot},
 };
 
@@ -41,13 +41,13 @@ use cue_core::{
 /// the global `Need` via `Need::select`).
 #[derive(Debug, Clone)]
 pub struct ReserveRequest {
-    pub job_id: JobId,
+    pub step_id: StepId,
     pub need: Need,
 }
 
 impl ReserveRequest {
-    pub fn new(job_id: JobId, need: Need) -> Self {
-        Self { job_id, need }
+    pub fn new(step_id: StepId, need: Need) -> Self {
+        Self { step_id, need }
     }
 }
 
@@ -99,8 +99,20 @@ mod tests {
     #[test]
     fn reserve_request_is_constructible() {
         let need = Need::from_pairs([("gpu", ResourceQuantity::Count(1))]);
-        let req = ReserveRequest::new(JobId(1), need.clone());
-        assert_eq!(req.job_id, JobId(1));
+        let req = ReserveRequest::new(
+            StepId {
+                execution: cue_core::ExecutionId(1),
+                index: 1,
+            },
+            need.clone(),
+        );
+        assert_eq!(
+            req.step_id,
+            StepId {
+                execution: cue_core::ExecutionId(1),
+                index: 1
+            }
+        );
         assert_eq!(req.need, need);
     }
 

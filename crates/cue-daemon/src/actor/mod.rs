@@ -112,7 +112,7 @@ impl ClientEvent {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProcessJobOptions {
+pub(crate) struct ProcessStepOptions {
     /// Override the scope's cwd for this specific invocation.
     pub cwd_override: Option<std::path::PathBuf>,
     /// Optional per-run filesystem sandbox configuration.
@@ -121,15 +121,13 @@ pub(crate) struct ProcessJobOptions {
     pub wrapper_enabled: bool,
     /// Whether to allocate a PTY. `false` uses pipes (stdout/stderr).
     pub pty_enabled: bool,
-    /// Client that should receive this job's output directly, independent of
+    /// Client that should receive this step's output directly, independent of
     /// output-channel subscriptions.
     pub direct_output_client: Option<u64>,
     /// Durable named-session owner for state and output event isolation.
     pub session_id: Option<String>,
     /// Ephemeral per-execution launch interception. Never persisted.
     pub spawn_adapter: Option<ProcessSpawnAdapter>,
-    /// Unified execution step that owns this process.
-    pub execution_step: cue_core::StepId,
 }
 
 #[derive(Clone, Debug)]
@@ -139,7 +137,7 @@ pub(crate) struct ProcessSpawnAdapter {
     pub step_id: cue_core::StepId,
 }
 
-pub(crate) fn process_output_stem(_job_id: cue_core::JobId, step: cue_core::StepId) -> String {
+pub(crate) fn process_output_stem(step: cue_core::StepId) -> String {
     format!("E{}-S{}", step.execution.0, step.index)
 }
 
@@ -312,24 +310,24 @@ pub(crate) enum TriggerServiceMsg {
 
 /// Messages handled by the ProcessManager actor.
 pub(crate) enum ProcessMgrMsg {
-    /// Spawn a child process, pipeline, or job-local expression for the given job.
-    SpawnJob {
-        job_id: cue_core::JobId,
-        /// Full job plan. A simple single-segment pipeline can use PTY; compound
-        /// plans run as one JobId with stream output.
-        plan: cue_core::pipeline::JobPlan,
+    /// Spawn the child processes owned by one execution step.
+    SpawnStep {
+        step_id: cue_core::StepId,
+        /// Full step plan. A simple single-segment pipeline can use PTY;
+        /// compound plans stream through the same stable StepId.
+        pipeline: cue_core::pipeline::Pipeline,
         scope_hash: ScopeHash,
-        options: Box<ProcessJobOptions>,
+        options: Box<ProcessStepOptions>,
     },
-    /// Request cancellation of a running job.
-    KillJob {
-        job_id: cue_core::JobId,
+    /// Request cancellation of a running step.
+    KillStep {
+        step_id: cue_core::StepId,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    /// Attach a client to a job's live foreground stream.
+    /// Attach a client to a step's live foreground stream.
     AttachFg {
         client_id: u64,
-        job_id: cue_core::JobId,
+        step_id: cue_core::StepId,
         role: ForegroundRole,
         legacy_snapshot_event: bool,
         reply: tokio::sync::oneshot::Sender<Result<ForegroundAttachmentInfo, String>>,

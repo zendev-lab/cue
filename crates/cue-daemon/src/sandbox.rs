@@ -35,7 +35,7 @@ pub(crate) struct SandboxConfig {
 /// Daemon-configured defaults applied when preparing an overlay sandbox.
 ///
 /// `upper_root` is the root under which each sandboxed job receives its own
-/// `<upper_root>/<job-id>/{upper,work}` pair, and `min_free_ratio` guards the
+/// `<upper_root>/<step-id>/{upper,work}` pair, and `min_free_ratio` guards the
 /// backing filesystem (typically `/dev/shm`) against being exhausted by runaway
 /// writes.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -163,19 +163,19 @@ impl SandboxConfig {
 }
 
 pub(crate) fn prepare(
-    job_id: cue_core::JobId,
+    step_id: cue_core::StepId,
     config: &SandboxConfig,
     lower_dir: &Path,
     defaults: &SandboxDefaults,
 ) -> Result<PreparedSandbox> {
     match config.mode {
-        SandboxMode::Overlay => prepare_overlay(job_id, config, lower_dir, defaults),
+        SandboxMode::Overlay => prepare_overlay(step_id, config, lower_dir, defaults),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn prepare_overlay(
-    job_id: cue_core::JobId,
+    step_id: cue_core::StepId,
     config: &SandboxConfig,
     lower_dir: &Path,
     defaults: &SandboxDefaults,
@@ -189,7 +189,7 @@ fn prepare_overlay(
         );
     }
 
-    let root_dir = sandbox_root(job_id)?;
+    let root_dir = sandbox_root(step_id)?;
     let mount_dir = root_dir.join("merged");
     let tmpfs_dir = root_dir.join("tmpfs");
     std::fs::create_dir_all(&mount_dir)
@@ -198,12 +198,12 @@ fn prepare_overlay(
     let (upper_dir, work_dir, tmpfs_upper_mount, upper_root) = match config.upper.as_ref() {
         Some(SandboxUpper::Directory(path)) => {
             ensure_upper_root_has_free_space(path, defaults.min_free_ratio)?;
-            let job_upper_root = job_upper_root(path, job_id)?;
-            let upper_dir = job_upper_root.join("upper");
-            let work_dir = job_upper_root.join("work");
+            let step_upper_root = step_upper_root(path, step_id)?;
+            let upper_dir = step_upper_root.join("upper");
+            let work_dir = step_upper_root.join("work");
             std::fs::create_dir_all(&upper_dir)
                 .with_context(|| format!("create sandbox upperdir {}", upper_dir.display()))?;
-            (upper_dir, work_dir, None, Some(job_upper_root))
+            (upper_dir, work_dir, None, Some(step_upper_root))
         }
         Some(SandboxUpper::Tmpfs) => {
             std::fs::create_dir_all(&tmpfs_dir)
@@ -221,12 +221,12 @@ fn prepare_overlay(
         }
         None => {
             ensure_upper_root_has_free_space(&defaults.upper_root, defaults.min_free_ratio)?;
-            let job_upper_root = job_upper_root(&defaults.upper_root, job_id)?;
-            let upper_dir = job_upper_root.join("upper");
-            let work_dir = job_upper_root.join("work");
+            let step_upper_root = step_upper_root(&defaults.upper_root, step_id)?;
+            let upper_dir = step_upper_root.join("upper");
+            let work_dir = step_upper_root.join("work");
             std::fs::create_dir_all(&upper_dir)
                 .with_context(|| format!("create sandbox upperdir {}", upper_dir.display()))?;
-            (upper_dir, work_dir, None, Some(job_upper_root))
+            (upper_dir, work_dir, None, Some(step_upper_root))
         }
     };
     std::fs::create_dir_all(&work_dir)
@@ -253,7 +253,7 @@ fn prepare_overlay(
     }
 
     debug!(
-        %job_id,
+        %step_id,
         lower = %lower_dir.display(),
         upper = %upper_dir.display(),
         work = %work_dir.display(),
@@ -277,7 +277,7 @@ fn prepare_overlay(
 
 #[cfg(not(target_os = "linux"))]
 fn prepare_overlay(
-    _job_id: cue_core::JobId,
+    _step_id: cue_core::StepId,
     _config: &SandboxConfig,
     _lower_dir: &Path,
     _defaults: &SandboxDefaults,
@@ -286,8 +286,8 @@ fn prepare_overlay(
 }
 
 #[cfg(target_os = "linux")]
-fn sandbox_root(job_id: cue_core::JobId) -> Result<PathBuf> {
-    let dir = dirs::runtime_sandbox_dir().join(job_id.to_string());
+fn sandbox_root(step_id: cue_core::StepId) -> Result<PathBuf> {
+    let dir = dirs::runtime_sandbox_dir().join(step_directory_name(step_id));
     cleanup_stale_sandbox_root(&dir)?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sandbox dir {}", dir.display()))?;
@@ -295,12 +295,17 @@ fn sandbox_root(job_id: cue_core::JobId) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn job_upper_root(upper_root: &Path, job_id: cue_core::JobId) -> Result<PathBuf> {
-    let dir = upper_root.join(job_id.to_string());
+fn step_upper_root(upper_root: &Path, step_id: cue_core::StepId) -> Result<PathBuf> {
+    let dir = upper_root.join(step_directory_name(step_id));
     cleanup_stale_sandbox_upper_root(&dir)?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sandbox upper root {}", dir.display()))?;
     Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn step_directory_name(step_id: cue_core::StepId) -> String {
+    format!("E{}-S{}", step_id.execution.0, step_id.index)
 }
 
 /// Refuse to prepare a sandbox when the upper-root filesystem is nearly full.
@@ -534,6 +539,13 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn step(execution: u64) -> cue_core::StepId {
+        cue_core::StepId {
+            execution: cue_core::ExecutionId(execution),
+            index: 1,
+        }
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cue-sandbox-{name}-{}-{}",
@@ -681,12 +693,7 @@ mod tests {
             upper: None,
         };
 
-        match prepare(
-            cue_core::JobId(424242),
-            &config,
-            &lower,
-            &test_defaults(&upper_root),
-        ) {
+        match prepare(step(424242), &config, &lower, &test_defaults(&upper_root)) {
             Ok(prepared) => {
                 let merged = prepared.cwd_for(&lower);
                 assert!(merged.join("kept.txt").exists());
@@ -711,16 +718,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn overlay_default_upper_root_is_namespaced_per_job() {
-        let lower = temp_path("per-job-lower");
+        let lower = temp_path("per-step-lower");
         std::fs::create_dir_all(&lower).expect("create lower");
-        let upper_root = temp_path("per-job-upper-root");
+        let upper_root = temp_path("per-step-upper-root");
         let config = SandboxConfig {
             mode: SandboxMode::Overlay,
             upper: None,
         };
 
-        let job_a = cue_core::JobId(515151);
-        let job_b = cue_core::JobId(515152);
+        let job_a = step(515151);
+        let job_b = step(515152);
         let prepared_a = match prepare(job_a, &config, &lower, &test_defaults(&upper_root)) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -737,30 +744,40 @@ mod tests {
             }
         };
 
-        // Each job derives an independent <upper_root>/<job-id>/upper directory,
-        // so a write inside job A's merged view must not be visible to job B's.
+        // Each step derives an independent <upper_root>/<step-id>/upper directory,
+        // so a write inside step A's merged view must not be visible to step B's.
         let merged_a = prepared_a.cwd_for(&lower);
-        std::fs::write(merged_a.join("only-in-a.txt"), "a").expect("write in job a sandbox");
-        assert!(upper_root.join(job_a.to_string()).join("upper").exists());
+        std::fs::write(merged_a.join("only-in-a.txt"), "a").expect("write in step a sandbox");
+        assert!(
+            upper_root
+                .join(step_directory_name(job_a))
+                .join("upper")
+                .exists()
+        );
 
         let prepared_b = prepare(job_b, &config, &lower, &test_defaults(&upper_root))
-            .expect("prepare job b sandbox");
+            .expect("prepare step b sandbox");
         let merged_b = prepared_b.cwd_for(&lower);
         assert!(
             !merged_b.join("only-in-a.txt").exists(),
-            "job B sandbox must not observe job A's overlay writes"
+            "step B sandbox must not observe step A's overlay writes"
         );
-        assert!(upper_root.join(job_b.to_string()).join("upper").exists());
+        assert!(
+            upper_root
+                .join(step_directory_name(job_b))
+                .join("upper")
+                .exists()
+        );
         assert_ne!(
-            upper_root.join(job_a.to_string()),
-            upper_root.join(job_b.to_string())
+            upper_root.join(step_directory_name(job_a)),
+            upper_root.join(step_directory_name(job_b))
         );
 
         drop(prepared_a);
         drop(prepared_b);
-        // Per-job upper roots are removed on sandbox drop.
-        assert!(!upper_root.join(job_a.to_string()).exists());
-        assert!(!upper_root.join(job_b.to_string()).exists());
+        // Per-step upper roots are removed on sandbox drop.
+        assert!(!upper_root.join(step_directory_name(job_a)).exists());
+        assert!(!upper_root.join(step_directory_name(job_b)).exists());
 
         let _ = std::fs::remove_dir_all(&lower);
         let _ = std::fs::remove_dir_all(&upper_root);
@@ -795,7 +812,7 @@ mod tests {
         };
 
         match prepare(
-            cue_core::JobId(424243),
+            step(424243),
             &config,
             &lower,
             &test_defaults(&temp_path("tmpfs-default-root")),
@@ -804,8 +821,7 @@ mod tests {
                 let merged = prepared.cwd_for(&lower);
                 std::fs::write(merged.join("tmpfs-created.txt"), "overlay")
                     .expect("write tmpfs overlay file");
-                let root_dir =
-                    dirs::runtime_sandbox_dir().join(cue_core::JobId(424243).to_string());
+                let root_dir = dirs::runtime_sandbox_dir().join(step_directory_name(step(424243)));
                 let tmpfs_dir = root_dir.join("tmpfs");
                 assert!(tmpfs_dir.exists());
                 drop(prepared);
@@ -845,7 +861,7 @@ mod tests {
             upper: None,
         };
         let error = prepare(
-            cue_core::JobId(424242),
+            step(424242),
             &config,
             Path::new("/tmp"),
             &test_defaults(Path::new("/tmp/cue-sandbox")),
@@ -862,7 +878,7 @@ mod tests {
             upper: Some(SandboxUpper::Tmpfs),
         };
         let error = prepare(
-            cue_core::JobId(424243),
+            step(424243),
             &config,
             Path::new("/tmp"),
             &test_defaults(Path::new("/tmp/cue-sandbox")),

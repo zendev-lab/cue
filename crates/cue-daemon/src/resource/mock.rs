@@ -150,7 +150,7 @@ impl Provider for MockProvider {
                     req.need.iter().map(|(k, v)| (k.to_owned(), v)).collect();
                 Ok(Reservation {
                     id: self.next_id(),
-                    job_id: req.job_id,
+                    step_id: req.step_id,
                     provider_id: self.id.clone(),
                     env,
                     info,

@@ -8,8 +8,8 @@ case "${1:-}" in
   reserve)
     input=$(cat)
     case "$input" in
-      *'"job_id":"J7"'* ) ;;
-      *) echo "missing job_id J7" >&2; exit 42 ;;
+      *'"step_id":"E7/S1"'* ) ;;
+      *) echo "missing step_id E7/S1" >&2; exit 42 ;;
     esac
     case "$input" in
       *'"license":{"kind":"count","value":1}'* ) ;;
