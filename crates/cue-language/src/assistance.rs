@@ -186,13 +186,13 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "pty"));
         assert!(!items.iter().any(|item| item.label == "retry"));
 
-        let cron_items = complete_input(":cron(p", 7);
-        assert!(!cron_items.iter().any(|item| item.label == "pty"));
+        let schedule_items = complete_input(":schedule(p", 11);
+        assert!(!schedule_items.iter().any(|item| item.label == "pty"));
     }
 
     #[test]
     fn highlight_tokenizes_command_and_operator_spans() {
-        let spans = highlight_input(":run cargo test -> :jobs");
+        let spans = highlight_input(":run cargo test -> echo E1/S1 T2");
         assert!(
             spans
                 .iter()
@@ -202,6 +202,13 @@ mod tests {
             spans
                 .iter()
                 .any(|span| span.kind == HighlightKind::Operator)
+        );
+        assert!(
+            spans
+                .iter()
+                .filter(|span| span.kind == HighlightKind::IdRef)
+                .count()
+                >= 2
         );
     }
 }

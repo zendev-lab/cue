@@ -3,8 +3,8 @@
 /// High-level command grouping used by help and documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandCategory {
-    Job,
-    Cron,
+    Execution,
+    Schedule,
     Scope,
     System,
 }
@@ -13,11 +13,9 @@ pub enum CommandCategory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandArgKind {
     Chain,
-    Cron,
+    Schedule,
     Id(CommandIdKind),
     Tail(CommandIdKind),
-    Text,
-    TargetText(CommandIdKind),
     OptionalId(CommandIdKind),
     OptionalText,
     Empty,
@@ -26,32 +24,44 @@ pub enum CommandArgKind {
 /// Entity ID shape accepted by a command argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandIdKind {
-    Job,
-    Cron,
-    JobOrCron,
+    Execution,
+    Step,
+    ExecutionOrStep,
+    Schedule,
+    ExecutionOrSchedule,
 }
 
 impl CommandIdKind {
-    pub fn accepts_job(self) -> bool {
-        matches!(self, Self::Job | Self::JobOrCron)
+    pub fn accepts_execution(self) -> bool {
+        matches!(
+            self,
+            Self::Execution | Self::ExecutionOrStep | Self::ExecutionOrSchedule
+        )
     }
 
-    pub fn accepts_cron(self) -> bool {
-        matches!(self, Self::Cron | Self::JobOrCron)
+    pub fn accepts_step(self) -> bool {
+        matches!(self, Self::Step | Self::ExecutionOrStep)
+    }
+
+    pub fn accepts_schedule(self) -> bool {
+        matches!(self, Self::Schedule | Self::ExecutionOrSchedule)
     }
 
     pub fn display(self) -> &'static str {
         match self {
-            Self::Job => "J<n>",
-            Self::Cron => "C<n>",
-            Self::JobOrCron => "J<n> or C<n>",
+            Self::Execution => "E<n>",
+            Self::Step => "E<n>/S<n>",
+            Self::ExecutionOrStep => "E<n> or E<n>/S<n>",
+            Self::Schedule => "T<n>",
+            Self::ExecutionOrSchedule => "E<n>, E<n>/S<n>, or T<n>",
         }
     }
 
     pub fn first_example(self) -> &'static str {
         match self {
-            Self::Job | Self::JobOrCron => "J1",
-            Self::Cron => "C1",
+            Self::Execution | Self::ExecutionOrStep | Self::ExecutionOrSchedule => "E1",
+            Self::Step => "E1/S1",
+            Self::Schedule => "T1",
         }
     }
 }
@@ -76,9 +86,9 @@ impl CommandSpec {
         matches!(
             (self.arg_kind, category),
             (
-                CommandArgKind::Id(CommandIdKind::JobOrCron)
-                    | CommandArgKind::OptionalId(CommandIdKind::JobOrCron),
-                CommandCategory::Job | CommandCategory::Cron
+                CommandArgKind::Id(CommandIdKind::ExecutionOrSchedule)
+                    | CommandArgKind::OptionalId(CommandIdKind::ExecutionOrSchedule),
+                CommandCategory::Execution | CommandCategory::Schedule
             )
         )
     }
@@ -107,21 +117,21 @@ pub enum ModeParamValueKind {
 const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
     ModeParamSpec {
         name: "cwd",
-        commands: &["run", "cron"],
+        commands: &["run", "schedule", "cron"],
         value_kind: ModeParamValueKind::String,
         value_hint: "/path",
         detail: "Run from this working directory without changing the session cwd",
     },
     ModeParamSpec {
         name: "wrapper",
-        commands: &["run", "cron"],
+        commands: &["run", "schedule", "cron"],
         value_kind: ModeParamValueKind::Bool,
         value_hint: "true",
         detail: "Override the runtime wrapper for this invocation",
     },
     ModeParamSpec {
         name: "scope",
-        commands: &["run", "cron"],
+        commands: &["run", "schedule", "cron"],
         value_kind: ModeParamValueKind::Bool,
         value_hint: "true",
         detail: "Allow run jobs to update the chain scope",
@@ -165,138 +175,146 @@ impl ModeParamSpec {
 pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "run",
-        category: CommandCategory::Job,
+        category: CommandCategory::Execution,
         arg_kind: CommandArgKind::Chain,
         usage: ":run <command>",
-        detail: "Run a command chain as durable job(s)",
+        detail: "Compile and submit one typed execution",
+        documented: true,
+    },
+    CommandSpec {
+        name: "schedule",
+        category: CommandCategory::Schedule,
+        arg_kind: CommandArgKind::Schedule,
+        usage: ":schedule <schedule> <command>",
+        detail: "Create a typed schedule template",
         documented: true,
     },
     CommandSpec {
         name: "cron",
-        category: CommandCategory::Cron,
-        arg_kind: CommandArgKind::Cron,
+        category: CommandCategory::Schedule,
+        arg_kind: CommandArgKind::Schedule,
         usage: ":cron <schedule> <command>",
-        detail: "Register a scheduled command chain",
-        documented: true,
+        detail: "Internal parser spelling for :schedule",
+        documented: false,
     },
     CommandSpec {
         name: "kill",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::JobOrCron),
-        usage: ":kill <id>",
-        detail: "Stop a running job or remove a cron entry",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::ExecutionOrSchedule),
+        usage: ":kill E<n> | :kill T<n>",
+        detail: "Force-cancel an execution or remove a schedule",
         documented: true,
     },
     CommandSpec {
         name: "retry",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":retry J<n>",
-        detail: "Rerun a failed job from its original start scope",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Execution),
+        usage: ":retry E<n>",
+        detail: "Submit a new execution from an existing spec",
         documented: true,
     },
     CommandSpec {
         name: "out",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":out J<n>",
-        detail: "Read a stdout snapshot",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::ExecutionOrStep),
+        usage: ":out E<n>[/S<n>]",
+        detail: "Read captured stdout for an execution or step",
         documented: true,
     },
     CommandSpec {
         name: "tail",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Tail(CommandIdKind::Job),
-        usage: ":tail J<n> [bytes]",
-        detail: "Follow live stdout, optionally capped to bytes",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Tail(CommandIdKind::ExecutionOrStep),
+        usage: ":tail E<n>[/S<n>] [bytes]",
+        detail: "Read a bounded stdout tail",
         documented: true,
     },
     CommandSpec {
         name: "err",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":err J<n>",
-        detail: "Read stderr or merged PTY output",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::ExecutionOrStep),
+        usage: ":err E<n>[/S<n>]",
+        detail: "Read captured stderr or merged PTY output",
         documented: true,
     },
     CommandSpec {
         name: "fg",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":fg J<n>",
-        detail: "Attach to a running PTY job and claim control",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Step),
+        usage: ":fg E<n>/S<n>",
+        detail: "Attach to a PTY step and claim control",
         documented: true,
     },
     CommandSpec {
         name: "watch",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":watch J<n>",
-        detail: "Observe a running PTY job without taking control",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Step),
+        usage: ":watch E<n>/S<n>",
+        detail: "Observe a PTY step without taking control",
         documented: true,
     },
     CommandSpec {
         name: "wait",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":wait J<n>",
-        detail: "Wait until a job reaches a terminal state",
-        documented: true,
-    },
-    CommandSpec {
-        name: "send",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::TargetText(CommandIdKind::Job),
-        usage: ":send J<n> <input>",
-        detail: "Write stdin to a running job",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Execution),
+        usage: ":wait E<n>",
+        detail: "Wait for an execution to reach a terminal state",
         documented: true,
     },
     CommandSpec {
         name: "cancel",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
-        usage: ":cancel J<n>",
-        detail: "Cancel a pending or running job",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Execution),
+        usage: ":cancel E<n>",
+        detail: "Gracefully cancel an execution",
         documented: true,
     },
     CommandSpec {
         name: "pause",
-        category: CommandCategory::Cron,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Cron),
-        usage: ":pause C<n>",
-        detail: "Pause a scheduled cron entry",
+        category: CommandCategory::Schedule,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Schedule),
+        usage: ":pause T<n>",
+        detail: "Pause a schedule",
         documented: true,
     },
     CommandSpec {
         name: "resume",
-        category: CommandCategory::Cron,
-        arg_kind: CommandArgKind::Id(CommandIdKind::Cron),
-        usage: ":resume C<n>",
-        detail: "Resume a paused cron entry",
+        category: CommandCategory::Schedule,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Schedule),
+        usage: ":resume T<n>",
+        detail: "Resume a schedule",
+        documented: true,
+    },
+    CommandSpec {
+        name: "remove",
+        category: CommandCategory::Schedule,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Schedule),
+        usage: ":remove T<n>",
+        detail: "Remove a schedule",
         documented: true,
     },
     CommandSpec {
         name: "log",
-        category: CommandCategory::Job,
-        arg_kind: CommandArgKind::OptionalId(CommandIdKind::JobOrCron),
-        usage: ":log [id]",
-        detail: "Show historical job and cron activity",
+        category: CommandCategory::Execution,
+        arg_kind: CommandArgKind::OptionalId(CommandIdKind::Execution),
+        usage: ":log [E<n>]",
+        detail: "List executions or inspect one execution",
         documented: true,
     },
     CommandSpec {
-        name: "jobs",
-        category: CommandCategory::Job,
+        name: "executions",
+        category: CommandCategory::Execution,
         arg_kind: CommandArgKind::Empty,
-        usage: ":jobs",
-        detail: "List known jobs",
+        usage: ":executions",
+        detail: "List typed executions",
         documented: true,
     },
     CommandSpec {
-        name: "crons",
-        category: CommandCategory::Cron,
+        name: "schedules",
+        category: CommandCategory::Schedule,
         arg_kind: CommandArgKind::Empty,
-        usage: ":crons",
-        detail: "List persisted cron entries",
+        usage: ":schedules",
+        detail: "List typed schedule templates",
         documented: true,
     },
     CommandSpec {
@@ -344,7 +362,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,
         usage: ":scope list",
-        detail: "List scope snapshots",
+        detail: "Inspect scope snapshots",
         documented: true,
     },
     CommandSpec {
@@ -364,19 +382,11 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         documented: true,
     },
     CommandSpec {
-        name: "wrap",
+        name: "restart",
         category: CommandCategory::System,
-        arg_kind: CommandArgKind::OptionalText,
-        usage: ":wrap [on|off|status]",
-        detail: "Override or inspect the runtime wrapper",
-        documented: true,
-    },
-    CommandSpec {
-        name: "pty",
-        category: CommandCategory::System,
-        arg_kind: CommandArgKind::OptionalText,
-        usage: ":pty [on|off|status]",
-        detail: "Override or inspect this session's PTY default",
+        arg_kind: CommandArgKind::Empty,
+        usage: ":restart",
+        detail: "Restart the local daemon through cue-client lifecycle",
         documented: true,
     },
     CommandSpec {
@@ -428,12 +438,16 @@ pub fn mode_param_specs_for_command(
 }
 
 pub fn command_names() -> impl Iterator<Item = &'static str> {
-    COMMAND_SPECS.iter().map(|spec| spec.name)
+    COMMAND_SPECS
+        .iter()
+        .filter(|spec| spec.documented)
+        .map(|spec| spec.name)
 }
 
 pub fn command_suggestions(name: &str) -> Vec<&'static str> {
     COMMAND_SPECS
         .iter()
+        .filter(|spec| spec.documented)
         .filter(|spec| {
             spec.name.starts_with(&name[..1.min(name.len())]) || edit_distance(name, spec.name) <= 2
         })
@@ -505,48 +519,55 @@ mod tests {
     fn id_command_boundaries_are_explicit() {
         assert_eq!(
             command_spec("fg").map(|spec| spec.arg_kind),
-            Some(CommandArgKind::Id(CommandIdKind::Job))
+            Some(CommandArgKind::Id(CommandIdKind::Step))
         );
         assert_eq!(
             command_spec("watch").map(|spec| spec.arg_kind),
-            Some(CommandArgKind::Id(CommandIdKind::Job))
+            Some(CommandArgKind::Id(CommandIdKind::Step))
         );
         assert_eq!(
             command_spec("pause").map(|spec| spec.arg_kind),
-            Some(CommandArgKind::Id(CommandIdKind::Cron))
+            Some(CommandArgKind::Id(CommandIdKind::Schedule))
         );
         assert_eq!(
             command_spec("kill").map(|spec| spec.arg_kind),
-            Some(CommandArgKind::Id(CommandIdKind::JobOrCron))
+            Some(CommandArgKind::Id(CommandIdKind::ExecutionOrSchedule))
         );
         assert_eq!(
             command_spec("log").map(|spec| spec.arg_kind),
-            Some(CommandArgKind::OptionalId(CommandIdKind::JobOrCron))
-        );
-        assert_eq!(
-            command_spec("send").map(|spec| spec.arg_kind),
-            Some(CommandArgKind::TargetText(CommandIdKind::Job))
+            Some(CommandArgKind::OptionalId(CommandIdKind::Execution))
         );
     }
 
     #[test]
     fn cross_entity_commands_are_visible_in_each_help_category() {
         let kill = command_spec("kill").expect("kill command spec");
-        assert!(kill.visible_in_category(CommandCategory::Job));
-        assert!(kill.visible_in_category(CommandCategory::Cron));
+        assert!(kill.visible_in_category(CommandCategory::Execution));
+        assert!(kill.visible_in_category(CommandCategory::Schedule));
 
         let log = command_spec("log").expect("log command spec");
-        assert!(log.visible_in_category(CommandCategory::Job));
-        assert!(log.visible_in_category(CommandCategory::Cron));
+        assert!(log.visible_in_category(CommandCategory::Execution));
+        assert!(!log.visible_in_category(CommandCategory::Schedule));
 
         let pause = command_spec("pause").expect("pause command spec");
-        assert!(!pause.visible_in_category(CommandCategory::Job));
-        assert!(pause.visible_in_category(CommandCategory::Cron));
+        assert!(!pause.visible_in_category(CommandCategory::Execution));
+        assert!(pause.visible_in_category(CommandCategory::Schedule));
     }
 
     #[test]
     fn suggestions_include_close_matches() {
         assert!(command_suggestions("rn").contains(&"run"));
-        assert!(command_suggestions("crn").contains(&"cron"));
+        assert!(command_suggestions("schedule").contains(&"schedule"));
+        assert!(!command_suggestions("crn").contains(&"cron"));
+    }
+
+    #[test]
+    fn documented_commands_exclude_legacy_spellings() {
+        let names = command_names().collect::<Vec<_>>();
+        for legacy in ["cron", "jobs", "crons", "send", "wrap", "pty"] {
+            assert!(!names.contains(&legacy), "legacy command leaked: {legacy}");
+        }
+        assert!(names.contains(&"executions"));
+        assert!(names.contains(&"schedules"));
     }
 }

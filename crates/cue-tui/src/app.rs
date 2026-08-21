@@ -1445,12 +1445,12 @@ impl AppState {
     }
 
     fn completion_candidates(&self) -> anyhow::Result<Vec<String>> {
-        let job_ids = self
+        let execution_ids = self
             .jobs
             .iter()
             .map(|job| job.id.clone())
             .collect::<Vec<_>>();
-        let cron_ids = self
+        let schedule_ids = self
             .crons
             .iter()
             .map(|cron| cron.id.clone())
@@ -1460,8 +1460,9 @@ impl AppState {
             content: &self.input.content,
             cursor: self.input.cursor,
             word_range: self.input.current_word_range(),
-            job_ids: &job_ids,
-            cron_ids: &cron_ids,
+            execution_ids: &execution_ids,
+            step_ids: &[],
+            schedule_ids: &schedule_ids,
         })
     }
 

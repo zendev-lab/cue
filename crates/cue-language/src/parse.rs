@@ -53,14 +53,12 @@ pub enum ParseErrorKind {
 }
 
 /// Recursive descent parser.
-pub(super) struct Parser<'a> {
+pub(super) struct Parser {
     tokens: Vec<Spanned>,
     /// Current position (index into tokens, skipping whitespace).
     pos: usize,
     /// Input length for EOF spans.
     input_len: usize,
-    /// Original input string for raw-text extraction.
-    input: &'a str,
 }
 
 struct ScriptChunk {
@@ -69,9 +67,9 @@ struct ScriptChunk {
     span: Span,
 }
 
-impl<'a> Parser<'a> {
+impl Parser {
     /// Parse a raw input string into an AST.
-    pub(super) fn parse(input: &'a str) -> Result<Ast, ParseError> {
+    pub(super) fn parse(input: &str) -> Result<Ast, ParseError> {
         let tokens = tokenize_for_parser(input)?;
         Self::parse_tokens(tokens, input)
     }
@@ -96,7 +94,6 @@ impl<'a> Parser<'a> {
             tokens: chunks[0].tokens.clone(),
             pos: 0,
             input_len: input.len(),
-            input,
         };
         if chunks.len() == 1 {
             return parser.parse_single_statement();
@@ -112,7 +109,6 @@ impl<'a> Parser<'a> {
                 tokens: chunk.tokens,
                 pos: 0,
                 input_len: input.len(),
-                input,
             };
             items.push(ScriptItemAst {
                 source: chunk.source,
@@ -144,7 +140,6 @@ impl<'a> Parser<'a> {
                 tokens: chunk.tokens,
                 pos: 0,
                 input_len: input.len(),
-                input,
             };
             items.push(ScriptItemAst {
                 source: chunk.source,
@@ -430,7 +425,7 @@ impl<'a> Parser<'a> {
                 Ok(Argument::Chain(self.parse_chain()?))
             }
 
-            CommandArgKind::Cron => {
+            CommandArgKind::Schedule => {
                 if self.at_end() {
                     return Err(ParseError {
                         span: self.peek_span(),
@@ -486,40 +481,6 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            CommandArgKind::Text => {
-                let text = self.consume_remaining_raw_text();
-                if text.is_empty() {
-                    return Err(ParseError {
-                        span: self.peek_span(),
-                        message: match name {
-                            "send" => "`:send` requires a target and input".into(),
-                            _ => format!(":{name} requires an argument"),
-                        },
-                        kind: ParseErrorKind::MissingArgument,
-                        suggestions: vec![],
-                    });
-                }
-                Ok(Argument::Text(text))
-            }
-
-            CommandArgKind::TargetText(allowed) => {
-                let target = self.peek().clone();
-                validate_text_target(name, allowed, &target, self.peek_span())?;
-                let text = self.consume_remaining_raw_text();
-                if text.is_empty() {
-                    return Err(ParseError {
-                        span: self.peek_span(),
-                        message: format!("`:{name}` requires a target and input"),
-                        kind: ParseErrorKind::MissingArgument,
-                        suggestions: vec![format!(
-                            ":{name} {} your input",
-                            allowed.first_example()
-                        )],
-                    });
-                }
-                Ok(Argument::Text(text))
-            }
-
             CommandArgKind::OptionalId(allowed) => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     validate_id_kind(name, allowed, kind, self.peek_span())?;
@@ -550,27 +511,6 @@ impl<'a> Parser<'a> {
             parts.push(self.advance().token.to_string());
         }
         parts.join(" ")
-    }
-
-    /// Consume remaining input as raw text (preserving original characters).
-    ///
-    /// Uses token spans to extract from the original input, so operator
-    /// characters like `->` inside raw-text arguments are preserved as-is.
-    fn consume_remaining_raw_text(&mut self) -> String {
-        if self.at_end() {
-            return String::new();
-        }
-        let start = self.tokens[self.pos].span.start;
-        // Skip all remaining tokens to advance position.
-        let end_pos = self
-            .tokens
-            .last()
-            .map(|s| s.span.end)
-            .unwrap_or(self.input_len);
-        while !self.at_end() {
-            self.advance();
-        }
-        self.input[start..end_pos].to_string()
     }
 
     // ── Chain grammar (recursive descent) ──
@@ -709,8 +649,8 @@ impl<'a> Parser<'a> {
                     self.advance();
                     words.push(w);
                 }
-                Token::IdRef(k, n) => {
-                    let s = format!("{k}{n}");
+                Token::IdRef(_, n) => {
+                    let s = n.clone();
                     self.advance();
                     words.push(s);
                 }
@@ -803,8 +743,9 @@ fn validate_id_kind(
     span: Span,
 ) -> Result<(), ParseError> {
     let accepted = match actual {
-        IdKind::Job => allowed.accepts_job(),
-        IdKind::Cron => allowed.accepts_cron(),
+        IdKind::Execution => allowed.accepts_execution(),
+        IdKind::Step => allowed.accepts_step(),
+        IdKind::Schedule => allowed.accepts_schedule(),
     };
     if accepted {
         return Ok(());
@@ -816,29 +757,6 @@ fn validate_id_kind(
         kind: ParseErrorKind::InvalidIdRef,
         suggestions: vec![format!(":{command} {}", allowed.first_example())],
     })
-}
-
-fn validate_text_target(
-    command: &str,
-    allowed: CommandIdKind,
-    target: &Token,
-    span: Span,
-) -> Result<(), ParseError> {
-    match target {
-        Token::IdRef(kind, _) => validate_id_kind(command, allowed, *kind, span),
-        Token::Eof => Err(ParseError {
-            span,
-            message: format!("`:{command}` requires a target and input"),
-            kind: ParseErrorKind::MissingArgument,
-            suggestions: vec![format!(":{command} {} your input", allowed.first_example())],
-        }),
-        _ => Err(ParseError {
-            span,
-            message: format!(":{command} requires a target ID ({})", allowed.display()),
-            kind: ParseErrorKind::InvalidIdRef,
-            suggestions: vec![format!(":{command} {} your input", allowed.first_example())],
-        }),
-    }
 }
 
 fn tokenize_for_parser(input: &str) -> Result<Vec<Spanned>, ParseError> {
@@ -1142,11 +1060,11 @@ mod tests {
 
     #[test]
     fn parse_kill_id() {
-        let ast = Parser::parse(":kill J1").unwrap();
+        let ast = Parser::parse(":kill E1").unwrap();
         match ast {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "kill");
-                assert_eq!(argument, Argument::IdRef(IdKind::Job, 1));
+                assert_eq!(argument, Argument::IdRef(IdKind::Execution, "E1".into()));
             }
             _ => panic!("expected Command"),
         }
@@ -1154,33 +1072,29 @@ mod tests {
 
     #[test]
     fn id_arguments_enforce_command_entity_kind() {
-        let kill_cron = Parser::parse(":kill C1").unwrap();
-        match kill_cron {
+        let kill_schedule = Parser::parse(":kill T1").unwrap();
+        match kill_schedule {
             Ast::Command { argument, .. } => {
-                assert_eq!(argument, Argument::IdRef(IdKind::Cron, 1));
+                assert_eq!(argument, Argument::IdRef(IdKind::Schedule, "T1".into()));
             }
             _ => panic!("expected Command"),
         }
 
-        let log_cron = Parser::parse(":log C1").unwrap();
-        match log_cron {
-            Ast::Command { argument, .. } => {
-                assert_eq!(argument, Argument::IdRef(IdKind::Cron, 1));
-            }
-            _ => panic!("expected Command"),
-        }
+        let log_schedule = Parser::parse(":log T1").expect_err("log requires execution id");
+        assert_eq!(log_schedule.kind, ParseErrorKind::InvalidIdRef);
+        assert!(log_schedule.message.contains("E<n>"));
 
-        let pause_job = Parser::parse(":pause J1").expect_err("pause requires cron id");
-        assert_eq!(pause_job.kind, ParseErrorKind::InvalidIdRef);
-        assert!(pause_job.message.contains("C<n>"));
+        let pause_execution = Parser::parse(":pause E1").expect_err("pause requires schedule id");
+        assert_eq!(pause_execution.kind, ParseErrorKind::InvalidIdRef);
+        assert!(pause_execution.message.contains("T<n>"));
 
-        let fg_cron = Parser::parse(":fg C1").expect_err("fg requires job id");
-        assert_eq!(fg_cron.kind, ParseErrorKind::InvalidIdRef);
-        assert!(fg_cron.message.contains("J<n>"));
+        let fg_execution = Parser::parse(":fg E1").expect_err("fg requires step id");
+        assert_eq!(fg_execution.kind, ParseErrorKind::InvalidIdRef);
+        assert!(fg_execution.message.contains("E<n>/S<n>"));
 
-        let tail_cron = Parser::parse(":tail C1").expect_err("tail requires job id");
-        assert_eq!(tail_cron.kind, ParseErrorKind::InvalidIdRef);
-        assert!(tail_cron.message.contains("J<n>"));
+        let tail_schedule = Parser::parse(":tail T1").expect_err("tail requires execution id");
+        assert_eq!(tail_schedule.kind, ParseErrorKind::InvalidIdRef);
+        assert!(tail_schedule.message.contains("E<n>"));
     }
 
     #[test]
@@ -1362,20 +1276,9 @@ mod tests {
     }
 
     #[test]
-    fn raw_text_builtins_still_carry_shell_metacharacters() {
-        // `:send` writes bytes to a job's stdin, where the receiving program may
-        // legitimately be a shell. Recognizing shell syntax as a token rather
-        // than a tokenizer error is what keeps this payload intact.
-        let ast = Parser::parse(":send J1 echo hi > out.txt ; echo done").unwrap();
-        match ast {
-            Ast::Command { argument, .. } => match argument {
-                Argument::Text(text) => {
-                    assert_eq!(text, "J1 echo hi > out.txt ; echo done");
-                }
-                other => panic!("expected raw text argument, got {other:?}"),
-            },
-            other => panic!("expected Command, got {other:?}"),
-        }
+    fn removed_raw_text_builtin_is_rejected() {
+        let error = Parser::parse(":send E1 echo hi").expect_err("send was removed in IPC v3");
+        assert_eq!(error.kind, ParseErrorKind::UnknownCommand);
     }
 
     #[test]
@@ -1554,62 +1457,18 @@ mod tests {
 
     #[test]
     fn oversized_id_ref_is_rejected_for_id_commands() {
-        let err = Parser::parse(":kill J4294967296").expect_err("oversized ID should fail");
+        let err =
+            Parser::parse(":kill E18446744073709551616").expect_err("oversized ID should fail");
         assert_eq!(err.kind, ParseErrorKind::InvalidIdRef);
         assert!(err.message.contains("requires an ID"));
     }
 
     #[test]
-    fn parse_send_text() {
-        let ast = Parser::parse(":send J1 continue with the fix").unwrap();
+    fn parse_schedule() {
+        let ast = Parser::parse(":schedule every 5m cargo test").unwrap();
         match ast {
             Ast::Command { name, argument, .. } => {
-                assert_eq!(name, "send");
-                assert_eq!(argument, Argument::Text("J1 continue with the fix".into()));
-            }
-            _ => panic!("expected Command"),
-        }
-    }
-
-    #[test]
-    fn parse_send_raw_preserves_quoted_operators() {
-        // Chain operators without whitespace must be quoted when passed as text.
-        let ast = Parser::parse(":send J1 replace 'a->b' with 'c->d'").unwrap();
-        match ast {
-            Ast::Command { name, argument, .. } => {
-                assert_eq!(name, "send");
-                assert_eq!(
-                    argument,
-                    Argument::Text("J1 replace 'a->b' with 'c->d'".into())
-                );
-            }
-            _ => panic!("expected Command"),
-        }
-    }
-
-    #[test]
-    fn parse_send_raw_rejects_unquoted_chain_operator_without_boundary() {
-        let err = Parser::parse(":send J1 replace a->b").unwrap_err();
-        assert!(err.message.contains("must be surrounded by whitespace"));
-    }
-
-    #[test]
-    fn parse_send_requires_job_target() {
-        let cron_target = Parser::parse(":send C1 input").expect_err("send requires job id");
-        assert_eq!(cron_target.kind, ParseErrorKind::InvalidIdRef);
-        assert!(cron_target.message.contains("J<n>"));
-
-        let text_target = Parser::parse(":send process input").expect_err("send requires id");
-        assert_eq!(text_target.kind, ParseErrorKind::InvalidIdRef);
-        assert!(text_target.message.contains("target ID"));
-    }
-
-    #[test]
-    fn parse_cron() {
-        let ast = Parser::parse(":cron every 5m cargo test").unwrap();
-        match ast {
-            Ast::Command { name, argument, .. } => {
-                assert_eq!(name, "cron");
+                assert_eq!(name, "schedule");
                 assert!(matches!(argument, Argument::Chain(ChainNode::Leaf(_))));
             }
             _ => panic!("expected Command"),
@@ -1618,10 +1477,10 @@ mod tests {
 
     #[test]
     fn parse_empty_command() {
-        let ast = Parser::parse(":jobs").unwrap();
+        let ast = Parser::parse(":executions").unwrap();
         match ast {
             Ast::Command { name, argument, .. } => {
-                assert_eq!(name, "jobs");
+                assert_eq!(name, "executions");
                 assert_eq!(argument, Argument::Empty);
             }
             _ => panic!("expected Command"),

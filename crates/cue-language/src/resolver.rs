@@ -40,10 +40,6 @@ pub enum ResolvedCommand {
     },
     /// Kill a job/session.
     Kill { id: String },
-    /// Kill a job only.
-    KillJob { id: String },
-    /// Typed IPC cancellation for jobs, chains, and file-script runs.
-    CancelExecution { id: String },
     /// Remove a cron only.
     RemoveCron { id: String },
     /// Retry a failed job.
@@ -55,18 +51,10 @@ pub enum ResolvedCommand {
     },
     /// View stderr.
     Err { id: String },
-    /// View stdout and stderr with independent limits.
-    JobOutput {
-        id: String,
-        stdout_bytes: Option<usize>,
-        stderr_bytes: Option<usize>,
-    },
     /// Attach to a PTY job as either its controller or a read-only observer.
     Fg { id: String, role: ForegroundRole },
     /// Wait for job completion.
     Wait { id: String },
-    /// Send stdin.
-    Send { id: String, data: String },
     /// Cancel a pending job.
     Cancel { id: String },
     /// Pause cron/session.
@@ -75,20 +63,10 @@ pub enum ResolvedCommand {
     Resume { id: String },
     /// View log.
     Log { id: Option<String> },
-    /// View log with pagination/tailing.
-    ShowLog {
-        id: Option<String>,
-        limit: Option<usize>,
-        tail_bytes: Option<usize>,
-    },
     /// List jobs.
     Jobs,
-    /// List jobs with pagination metadata.
-    ListJobs { limit: Option<usize> },
     /// List crons.
     Crons,
-    /// List crons with pagination metadata.
-    ListCrons { limit: Option<usize> },
     /// List scopes.
     Scopes,
     /// List resource providers and their key routes.
@@ -115,10 +93,8 @@ pub enum ResolvedCommand {
     Clear,
     /// Quit.
     Quit,
-    /// Wrapper control: on / off / status.
-    Wrap { subcommand: Option<String> },
-    /// Session PTY default control: on / off / status.
-    Pty { subcommand: Option<String> },
+    /// Restart the local daemon through the frontend lifecycle owner.
+    Restart,
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +186,7 @@ impl Resolver {
                 },
                 _ => unreachable!("parser guarantees Chain for :run"),
             },
-            "cron" => match argument {
+            "cron" | "schedule" => match argument {
                 Argument::Chain(chain) => {
                     let (schedule_ast, body) = split_bare_cron_chain(chain, span)?;
                     let schedule =
@@ -262,10 +238,6 @@ impl Resolver {
             "wait" => ResolvedCommand::Wait {
                 id: extract_id(argument, span, "wait")?,
             },
-            "send" => {
-                let (id, data) = extract_target_and_text(argument, span, "send")?;
-                ResolvedCommand::Send { id, data }
-            }
             "cancel" => ResolvedCommand::Cancel {
                 id: extract_id(argument, span, "cancel")?,
             },
@@ -275,14 +247,17 @@ impl Resolver {
             "resume" => ResolvedCommand::Resume {
                 id: extract_id(argument, span, "resume")?,
             },
+            "remove" => ResolvedCommand::RemoveCron {
+                id: extract_id(argument, span, "remove")?,
+            },
             "log" => ResolvedCommand::Log {
                 id: match argument {
-                    Argument::IdRef(k, n) => Some(format!("{k}{n}")),
+                    Argument::IdRef(_, id) => Some(id),
                     _ => None,
                 },
             },
-            "jobs" => ResolvedCommand::Jobs,
-            "crons" => ResolvedCommand::Crons,
+            "executions" => ResolvedCommand::Jobs,
+            "schedules" => ResolvedCommand::Crons,
             "scopes" => ResolvedCommand::Scopes,
             "providers" => ResolvedCommand::Providers,
             "resources" => ResolvedCommand::Resources,
@@ -303,12 +278,7 @@ impl Resolver {
             },
             "clear" => ResolvedCommand::Clear,
             "quit" | "exit" => ResolvedCommand::Quit,
-            "wrap" => ResolvedCommand::Wrap {
-                subcommand: extract_optional_text(argument),
-            },
-            "pty" => ResolvedCommand::Pty {
-                subcommand: extract_optional_text(argument),
-            },
+            "restart" => ResolvedCommand::Restart,
             _ => unreachable!("parser rejects unknown commands"),
         })
     }
@@ -374,20 +344,20 @@ fn convert_mode_params(params: Vec<(String, Value)>) -> ModeParams {
 
 fn extract_id(arg: Argument, span: Span, command: &str) -> Result<String, ParseError> {
     match arg {
-        Argument::IdRef(k, n) => Ok(format!("{k}{n}")),
+        Argument::IdRef(_, id) => Ok(id),
         _ => Err(ParseError {
             span,
-            message: format!("`:{command}` requires an ID (e.g. J1, C1)"),
+            message: format!("`:{command}` requires a typed ID"),
             kind: ParseErrorKind::InvalidIdRef,
-            suggestions: vec![format!(":{command} J1")],
+            suggestions: vec![format!(":{command} E1")],
         }),
     }
 }
 
 fn extract_tail_ref(arg: Argument) -> (String, Option<usize>) {
     match arg {
-        Argument::TailRef(k, n, bytes) => (format!("{k}{n}"), bytes),
-        Argument::IdRef(k, n) => (format!("{k}{n}"), None),
+        Argument::TailRef(_, id, bytes) => (id, bytes),
+        Argument::IdRef(_, id) => (id, None),
         _ => (String::new(), None),
     }
 }
@@ -397,47 +367,6 @@ fn extract_text(arg: Argument) -> String {
         Argument::Text(t) => t,
         Argument::Chain(chain) => chain_to_text(&chain),
         _ => String::new(),
-    }
-}
-
-fn extract_target_and_text(
-    arg: Argument,
-    span: Span,
-    command: &str,
-) -> Result<(String, String), ParseError> {
-    let text = match arg {
-        Argument::Text(text) => text,
-        _ => String::new(),
-    };
-    let trimmed = text.trim();
-    let Some((id, rest)) = split_first_word(trimmed) else {
-        return Err(ParseError {
-            span,
-            message: format!("`:{command}` requires a target and input"),
-            kind: ParseErrorKind::MissingArgument,
-            suggestions: vec![format!(":{command} J1 your input")],
-        });
-    };
-    if rest.trim().is_empty() {
-        return Err(ParseError {
-            span,
-            message: format!("`:{command}` requires input after the target"),
-            kind: ParseErrorKind::MissingArgument,
-            suggestions: vec![format!(":{command} J1 your input")],
-        });
-    }
-    Ok((id.to_string(), rest.trim().to_string()))
-}
-
-fn split_first_word(text: &str) -> Option<(&str, &str)> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(index) = trimmed.find(char::is_whitespace) {
-        Some((&trimmed[..index], &trimmed[index..]))
-    } else {
-        Some((trimmed, ""))
     }
 }
 
@@ -868,37 +797,37 @@ mod tests {
 
     #[test]
     fn resolve_output_commands() {
-        match resolve(":tail J1", Mode::Job) {
+        match resolve(":tail E1", Mode::Job) {
             ResolvedCommand::Out {
                 id,
                 tail_bytes: Some(8192),
-            } => assert_eq!(id, "J1"),
+            } => assert_eq!(id, "E1"),
             other => panic!("expected :tail default bytes, got {other:?}"),
         }
-        match resolve(":tail J2 1024", Mode::Job) {
+        match resolve(":tail E2/S1 1024", Mode::Job) {
             ResolvedCommand::Out {
                 id,
                 tail_bytes: Some(1024),
-            } => assert_eq!(id, "J2"),
+            } => assert_eq!(id, "E2/S1"),
             other => panic!("expected :tail with bytes, got {other:?}"),
         }
-        match resolve(":out J3", Mode::Job) {
+        match resolve(":out E3", Mode::Job) {
             ResolvedCommand::Out {
                 id,
                 tail_bytes: None,
-            } => assert_eq!(id, "J3"),
+            } => assert_eq!(id, "E3"),
             other => panic!("expected :out, got {other:?}"),
         }
-        match resolve(":err J4", Mode::Job) {
-            ResolvedCommand::Err { id } => assert_eq!(id, "J4"),
+        match resolve(":err E4/S2", Mode::Job) {
+            ResolvedCommand::Err { id } => assert_eq!(id, "E4/S2"),
             other => panic!("expected :err, got {other:?}"),
         }
     }
 
     #[test]
     fn resolve_log_with_and_without_id() {
-        match resolve(":log J9", Mode::Job) {
-            ResolvedCommand::Log { id: Some(id) } => assert_eq!(id, "J9"),
+        match resolve(":log E9", Mode::Job) {
+            ResolvedCommand::Log { id: Some(id) } => assert_eq!(id, "E9"),
             other => panic!("expected :log with id, got {other:?}"),
         }
         match resolve(":log", Mode::Job) {
@@ -1157,9 +1086,9 @@ mod tests {
 
     #[test]
     fn resolve_kill() {
-        let cmd = resolve(":kill J1", Mode::Job);
+        let cmd = resolve(":kill E1", Mode::Job);
         match cmd {
-            ResolvedCommand::Kill { id } => assert_eq!(id, "J1"),
+            ResolvedCommand::Kill { id } => assert_eq!(id, "E1"),
             _ => panic!("expected Kill"),
         }
     }
@@ -1167,18 +1096,18 @@ mod tests {
     #[test]
     fn resolve_foreground_role_is_explicit() {
         assert!(matches!(
-            resolve(":fg J1", Mode::Job),
+            resolve(":fg E1/S1", Mode::Job),
             ResolvedCommand::Fg {
                 id,
                 role: ForegroundRole::Controller,
-            } if id == "J1"
+            } if id == "E1/S1"
         ));
         assert!(matches!(
-            resolve(":watch J1", Mode::Job),
+            resolve(":watch E1/S1", Mode::Job),
             ResolvedCommand::Fg {
                 id,
                 role: ForegroundRole::Observer,
-            } if id == "J1"
+            } if id == "E1/S1"
         ));
     }
 
@@ -1194,8 +1123,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_jobs() {
-        let cmd = resolve(":jobs", Mode::Job);
+    fn resolve_executions() {
+        let cmd = resolve(":executions", Mode::Job);
         assert!(matches!(cmd, ResolvedCommand::Jobs));
     }
 
@@ -1215,18 +1144,6 @@ mod tests {
                 assert_eq!(subcommand.as_deref(), Some("set FOO=bar FOO=baz"));
             }
             _ => panic!("expected Env"),
-        }
-    }
-
-    #[test]
-    fn resolve_send_target_and_data() {
-        let cmd = resolve(":send J1 continue with the fix", Mode::Job);
-        match cmd {
-            ResolvedCommand::Send { id, data } => {
-                assert_eq!(id, "J1");
-                assert_eq!(data, "continue with the fix");
-            }
-            _ => panic!("expected Send"),
         }
     }
 
@@ -1276,16 +1193,12 @@ mod tests {
         for spec in COMMAND_SPECS {
             let input = match spec.arg_kind {
                 CommandArgKind::Chain => format!(":{} echo ok", spec.name),
-                CommandArgKind::Cron => format!(":{} every 5m echo ok", spec.name),
+                CommandArgKind::Schedule => format!(":{} every 5m echo ok", spec.name),
                 CommandArgKind::Id(allowed) => {
                     format!(":{} {}", spec.name, allowed.first_example())
                 }
                 CommandArgKind::Tail(allowed) => {
                     format!(":{} {} 1024", spec.name, allowed.first_example())
-                }
-                CommandArgKind::Text => format!(":{} J1 hello", spec.name),
-                CommandArgKind::TargetText(allowed) => {
-                    format!(":{} {} hello", spec.name, allowed.first_example())
                 }
                 CommandArgKind::OptionalId(allowed) => {
                     format!(":{} {}", spec.name, allowed.first_example())

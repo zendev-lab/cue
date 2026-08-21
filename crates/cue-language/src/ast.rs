@@ -39,12 +39,12 @@ pub(super) enum Argument {
     /// Chain expression (for `:run`, bare input in JOB/CRON mode).
     Chain(ChainNode),
     /// Entity ID reference (for `:kill`, `:out`, `:fg`, `:retry`).
-    IdRef(IdKind, u32),
-    /// Free-form text arguments for builtins like `:send`.
+    IdRef(IdKind, String),
+    /// Free-form text for typed scope and frontend configuration commands.
     Text(String),
-    /// Entity ID with optional byte count (for `:tail J3 1024`).
-    TailRef(IdKind, u32, Option<usize>),
-    /// No argument (`:jobs`, `:crons`, `:help`).
+    /// Entity ID with optional byte count (for `:tail E3/S1 1024`).
+    TailRef(IdKind, String, Option<usize>),
+    /// No argument (`:executions`, `:schedules`, `:help`).
     Empty,
 }
 

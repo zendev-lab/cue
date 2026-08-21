@@ -206,7 +206,6 @@ pub(crate) fn format_ack_message(input: &str) -> String {
         (":cancel", "cancel requested for"),
         (":pause", "paused"),
         (":resume", "resumed"),
-        (":send", "sent"),
     ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let rest = rest.trim();
@@ -225,7 +224,7 @@ mod tests {
     #[test]
     fn pending_submission_classifiers_expose_only_matching_intents() {
         let silent = PendingSubmission::silent_request("snapshot");
-        let user = PendingSubmission::user(None, ":jobs".into(), Mode::Job, Vec::new());
+        let user = PendingSubmission::user(None, ":executions".into(), Mode::Job, Vec::new());
 
         assert_eq!(silent.silent_description(), Some("snapshot"));
         assert!(user.is_user_visible());
@@ -260,8 +259,8 @@ mod tests {
 
     #[test]
     fn ack_messages_describe_targeted_commands() {
-        assert_eq!(format_ack_message(":kill J1"), "kill requested for J1");
-        assert_eq!(format_ack_message(":send J1 hi"), "sent J1 hi");
-        assert_eq!(format_ack_message(":jobs"), "ok");
+        assert_eq!(format_ack_message(":kill E1"), "kill requested for E1");
+        assert_eq!(format_ack_message(":pause T1"), "paused T1");
+        assert_eq!(format_ack_message(":executions"), "ok");
     }
 }

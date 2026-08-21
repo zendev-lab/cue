@@ -6,7 +6,7 @@ pub enum Token {
     // Command prefix
     /// `:` prefix for builtin commands.
     Colon,
-    /// Command name immediately after `:`, e.g. `run`, `kill`, `jobs`.
+    /// Command name immediately after `:`, e.g. `run`, `kill`, `executions`.
     Command(String),
 
     // Mode params (context-sensitive: immediately after Command)
@@ -52,13 +52,12 @@ pub enum Token {
     // Content
     /// A word (command argument, filename, flag, etc.)
     Word(String),
-    /// An entity ID reference like J1 or C3.
-    IdRef(IdKind, u32),
+    /// A typed execution, step, or schedule reference.
+    IdRef(IdKind, String),
     /// Unquoted bash syntax Cue does not interpret.
     ///
-    /// Kept as a token rather than a tokenizer error so raw-text builtins such
-    /// as `:send` can still carry these bytes as literal payload; the parser
-    /// rejects it only where a command is expected.
+    /// Kept as a token so the parser can reject it with a targeted diagnostic
+    /// where an executable command is expected.
     ShellSyntax(ShellSyntax),
 
     // Whitespace (preserved for highlighting, skipped during parsing)
@@ -72,8 +71,9 @@ pub enum Token {
 /// Entity ID prefix kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdKind {
-    Job,
-    Cron,
+    Execution,
+    Step,
+    Schedule,
 }
 
 /// An unquoted bash construct Cue recognizes only to reject.
@@ -174,8 +174,9 @@ impl Span {
 impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Job => "J",
-            Self::Cron => "C",
+            Self::Execution => "execution",
+            Self::Step => "step",
+            Self::Schedule => "schedule",
         })
     }
 }
@@ -200,7 +201,7 @@ impl fmt::Display for Token {
             Self::PipeAll => f.write_str("|&>"),
             Self::PipeStderr => f.write_str("|!>"),
             Self::Word(s) => write!(f, "{s}"),
-            Self::IdRef(k, n) => write!(f, "{k}{n}"),
+            Self::IdRef(_, id) => f.write_str(id),
             Self::ShellSyntax(s) => write!(f, "{s}"),
             Self::Whitespace(s) => write!(f, "{s}"),
             Self::Newline => f.write_str("\\n"),

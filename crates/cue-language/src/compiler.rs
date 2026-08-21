@@ -47,17 +47,7 @@ pub fn compile_command(
     mode: Mode,
     source_name: impl Into<String>,
 ) -> Result<CompiledCommand, CompileError> {
-    if let Some(compiled) = compile_v3_builtin(input)? {
-        return Ok(compiled);
-    }
-    let normalized = input
-        .trim_start()
-        .strip_prefix(":schedule ")
-        .map(|rest| format!(":cron {rest}"));
-    compile_resolved(
-        parse_command(normalized.as_deref().unwrap_or(input), mode)?,
-        source_name.into(),
-    )
+    compile_resolved(parse_command(input, mode)?, source_name.into())
 }
 
 pub fn compile_file(
@@ -154,16 +144,12 @@ fn compile_resolved(
                 tail_bytes: None,
             })),
         },
-        ResolvedCommand::Jobs | ResolvedCommand::ListJobs { .. } => {
-            Ok(CompiledCommand::Daemon(RequestPayload::ListExecutions {
-                limit: None,
-            }))
-        }
-        ResolvedCommand::Crons | ResolvedCommand::ListCrons { .. } => {
-            Ok(CompiledCommand::Daemon(RequestPayload::ListSchedules {
-                limit: None,
-            }))
-        }
+        ResolvedCommand::Jobs => Ok(CompiledCommand::Daemon(RequestPayload::ListExecutions {
+            limit: None,
+        })),
+        ResolvedCommand::Crons => Ok(CompiledCommand::Daemon(RequestPayload::ListSchedules {
+            limit: None,
+        })),
         ResolvedCommand::Scopes
         | ResolvedCommand::ListScopes { .. }
         | ResolvedCommand::Scope { subcommand: None } => {
@@ -191,11 +177,103 @@ fn compile_resolved(
                 tail_bytes,
             }))
         }
+        ResolvedCommand::Kill { id } => {
+            if let Ok(id) = id.parse::<ExecutionId>() {
+                Ok(CompiledCommand::Daemon(RequestPayload::CancelExecution {
+                    id,
+                    mode: cue_core::execution::CancelMode::Force,
+                }))
+            } else if let Ok(id) = id.parse::<ScheduleId>() {
+                Ok(CompiledCommand::Daemon(RequestPayload::RemoveSchedule {
+                    id,
+                }))
+            } else {
+                Err(CompileError::Invalid(format!(
+                    "`:kill` expects an execution or schedule ID, got `{id}`"
+                )))
+            }
+        }
+        ResolvedCommand::Retry { id } => Ok(CompiledCommand::Frontend(FrontendAction::Retry {
+            id: parse_execution_id("retry", &id)?,
+        })),
+        ResolvedCommand::Out { id, tail_bytes } => {
+            let (id, step_id) = parse_execution_output_target("out", &id)?;
+            Ok(CompiledCommand::Daemon(
+                RequestPayload::ReadExecutionOutput {
+                    id,
+                    step_id,
+                    stdout_bytes: tail_bytes,
+                    stderr_bytes: Some(0),
+                },
+            ))
+        }
+        ResolvedCommand::Err { id } => {
+            let (id, step_id) = parse_execution_output_target("err", &id)?;
+            Ok(CompiledCommand::Daemon(
+                RequestPayload::ReadExecutionOutput {
+                    id,
+                    step_id,
+                    stdout_bytes: Some(0),
+                    stderr_bytes: None,
+                },
+            ))
+        }
+        ResolvedCommand::Fg { id, role } => {
+            let id = id.parse::<StepId>().map_err(|_| {
+                CompileError::Invalid(format!(
+                    "PTY attach expects a step ID such as E1/S1, got `{id}`"
+                ))
+            })?;
+            Ok(CompiledCommand::Daemon(match role {
+                cue_core::ipc::ForegroundRole::Controller => RequestPayload::StepAttach { id },
+                cue_core::ipc::ForegroundRole::Observer => RequestPayload::StepWatch { id },
+            }))
+        }
+        ResolvedCommand::Wait { id } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::WaitExecution {
+                id: parse_execution_id("wait", &id)?,
+            }))
+        }
+        ResolvedCommand::Cancel { id } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::CancelExecution {
+                id: parse_execution_id("cancel", &id)?,
+                mode: cue_core::execution::CancelMode::Graceful,
+            }))
+        }
+        ResolvedCommand::Pause { id } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::PauseSchedule {
+                id: parse_schedule_id("pause", &id)?,
+            }))
+        }
+        ResolvedCommand::Resume { id } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ResumeSchedule {
+                id: parse_schedule_id("resume", &id)?,
+            }))
+        }
+        ResolvedCommand::RemoveCron { id } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::RemoveSchedule {
+                id: parse_schedule_id("remove", &id)?,
+            }))
+        }
+        ResolvedCommand::Log { id: None } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ListExecutions {
+                limit: None,
+            }))
+        }
+        ResolvedCommand::Log { id: Some(id) } => {
+            Ok(CompiledCommand::Daemon(RequestPayload::GetExecution {
+                id: parse_execution_id("log", &id)?,
+            }))
+        }
+        ResolvedCommand::Providers | ResolvedCommand::Resources => {
+            Ok(CompiledCommand::Daemon(RequestPayload::ListResources {}))
+        }
         ResolvedCommand::Help { topic } => {
             Ok(CompiledCommand::Frontend(FrontendAction::Help { topic }))
         }
         ResolvedCommand::Clear => Ok(CompiledCommand::Frontend(FrontendAction::Clear)),
         ResolvedCommand::Quit => Ok(CompiledCommand::Frontend(FrontendAction::Quit)),
+        ResolvedCommand::Restart => Ok(CompiledCommand::Frontend(FrontendAction::Restart)),
         command => Ok(CompiledCommand::Frontend(FrontendAction::Unsupported {
             message: format!(
                 "command {command:?} has no IPC v3 frontend mapping; use E<n>, E<n>/S<n>, or T<n> typed targets"
@@ -204,124 +282,35 @@ fn compile_resolved(
     }
 }
 
-fn compile_v3_builtin(input: &str) -> Result<Option<CompiledCommand>, CompileError> {
-    let trimmed = input.trim();
-    let Some(body) = trimmed.strip_prefix(':') else {
-        return Ok(None);
-    };
-    let mut words = body.split_whitespace();
-    let Some(command) = words.next() else {
-        return Ok(None);
-    };
-    let rest = words.collect::<Vec<_>>();
-    let daemon = |payload| Some(CompiledCommand::Daemon(payload));
-    let invalid =
-        |expected: &str| CompileError::Invalid(format!("`:{command}` expects {expected}"));
-    let compiled = match command {
-        "executions" => daemon(RequestPayload::ListExecutions { limit: None }),
-        "schedules" => daemon(RequestPayload::ListSchedules { limit: None }),
-        "wait" if rest.len() == 1 && rest[0].starts_with('E') => {
-            daemon(RequestPayload::WaitExecution {
-                id: rest[0]
-                    .parse::<ExecutionId>()
-                    .map_err(|_| invalid("an execution ID such as E1"))?,
-            })
-        }
-        "cancel" if rest.len() == 1 && rest[0].starts_with('E') => {
-            daemon(RequestPayload::CancelExecution {
-                id: rest[0]
-                    .parse::<ExecutionId>()
-                    .map_err(|_| invalid("an execution ID such as E1"))?,
-                mode: cue_core::execution::CancelMode::Graceful,
-            })
-        }
-        "kill" if rest.len() == 1 && rest[0].starts_with('E') => {
-            daemon(RequestPayload::CancelExecution {
-                id: rest[0]
-                    .parse::<ExecutionId>()
-                    .map_err(|_| invalid("an execution ID such as E1"))?,
-                mode: cue_core::execution::CancelMode::Force,
-            })
-        }
-        "kill" | "remove" if rest.len() == 1 && rest[0].starts_with('T') => {
-            daemon(RequestPayload::RemoveSchedule {
-                id: rest[0]
-                    .parse::<ScheduleId>()
-                    .map_err(|_| invalid("a schedule ID such as T1"))?,
-            })
-        }
-        "retry" if rest.len() == 1 && rest[0].starts_with('E') => {
-            Some(CompiledCommand::Frontend(FrontendAction::Retry {
-                id: rest[0]
-                    .parse::<ExecutionId>()
-                    .map_err(|_| invalid("an execution ID such as E1"))?,
-            }))
-        }
-        "fg" | "watch" if rest.len() == 1 && rest[0].starts_with('E') => {
-            let id = rest[0]
-                .parse::<StepId>()
-                .map_err(|_| invalid("a step ID such as E1/S1"))?;
-            daemon(if command == "fg" {
-                RequestPayload::StepAttach { id }
-            } else {
-                RequestPayload::StepWatch { id }
-            })
-        }
-        "out" | "err" if rest.len() == 1 && rest[0].starts_with('E') => {
-            let (id, step_id) = execution_output_target(rest[0])
-                .ok_or_else(|| invalid("an execution or step ID such as E1 or E1/S1"))?;
-            daemon(RequestPayload::ReadExecutionOutput {
-                id,
-                step_id,
-                stdout_bytes: (command == "err").then_some(0),
-                stderr_bytes: (command == "out").then_some(0),
-            })
-        }
-        "tail" if matches!(rest.len(), 1 | 2) && rest[0].starts_with('E') => {
-            let (id, step_id) = execution_output_target(rest[0])
-                .ok_or_else(|| invalid("an execution or step ID such as E1 or E1/S1"))?;
-            let bytes = rest
-                .get(1)
-                .map(|value| value.parse::<usize>())
-                .transpose()
-                .map_err(|_| invalid("an execution or step ID followed by a byte count"))?
-                .unwrap_or(8192);
-            daemon(RequestPayload::ReadExecutionOutput {
-                id,
-                step_id,
-                stdout_bytes: Some(bytes),
-                stderr_bytes: Some(0),
-            })
-        }
-        "pause" | "resume" if rest.len() == 1 && rest[0].starts_with('T') => {
-            let id = rest[0]
-                .parse::<ScheduleId>()
-                .map_err(|_| invalid("a schedule ID such as T1"))?;
-            daemon(if command == "pause" {
-                RequestPayload::PauseSchedule { id }
-            } else {
-                RequestPayload::ResumeSchedule { id }
-            })
-        }
-        "log" if rest.is_empty() => daemon(RequestPayload::ListExecutions { limit: None }),
-        "log" if rest.len() == 1 && rest[0].starts_with('E') => {
-            daemon(RequestPayload::GetExecution {
-                id: rest[0]
-                    .parse::<ExecutionId>()
-                    .map_err(|_| invalid("an execution ID such as E1"))?,
-            })
-        }
-        _ => return Ok(None),
-    };
-    Ok(compiled)
+fn parse_execution_id(command: &str, input: &str) -> Result<ExecutionId, CompileError> {
+    input.parse().map_err(|_| {
+        CompileError::Invalid(format!(
+            "`:{command}` expects an execution ID such as E1, got `{input}`"
+        ))
+    })
 }
 
-fn execution_output_target(input: &str) -> Option<(ExecutionId, Option<StepId>)> {
+fn parse_schedule_id(command: &str, input: &str) -> Result<ScheduleId, CompileError> {
+    input.parse().map_err(|_| {
+        CompileError::Invalid(format!(
+            "`:{command}` expects a schedule ID such as T1, got `{input}`"
+        ))
+    })
+}
+
+fn parse_execution_output_target(
+    command: &str,
+    input: &str,
+) -> Result<(ExecutionId, Option<StepId>), CompileError> {
     if input.contains("/S") {
-        let step = input.parse::<StepId>().ok()?;
-        Some((step.execution, Some(step)))
+        let step = input.parse::<StepId>().map_err(|_| {
+            CompileError::Invalid(format!(
+                "`:{command}` expects an execution or step ID such as E1 or E1/S1, got `{input}`"
+            ))
+        })?;
+        Ok((step.execution, Some(step)))
     } else {
-        Some((input.parse::<ExecutionId>().ok()?, None))
+        Ok((parse_execution_id(command, input)?, None))
     }
 }
 
@@ -668,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_execution_step_and_schedule_commands_bypass_legacy_ids() {
+    fn typed_commands_follow_the_shared_parser_and_compiler_path() {
         assert!(matches!(
             compile_command(":fg E7/S2", Mode::Job, "<test>").unwrap(),
             CompiledCommand::Daemon(RequestPayload::StepAttach {
