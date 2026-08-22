@@ -32,7 +32,10 @@ pub struct PtyPair {
 pub fn open_pty() -> Result<PtyPair> {
     // SAFETY: posix_openpt is a well-defined POSIX API.  We immediately wrap
     // the returned fd in OwnedFd so it will be closed on drop.
-    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    // Set close-on-exec atomically. A concurrent daemon restart forks a
+    // watchdog; inheriting either PTY end into that long-lived process would
+    // keep the job's terminal open and prevent its completion from draining.
+    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
     if master_raw < 0 {
         bail!("posix_openpt failed: {}", std::io::Error::last_os_error());
     }
@@ -69,7 +72,12 @@ pub fn open_pty() -> Result<PtyPair> {
 
     // Open the slave side.
     // SAFETY: open() with a valid NUL-terminated path.
-    let slave_raw = unsafe { libc::open(slave_cstring.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    let slave_raw = unsafe {
+        libc::open(
+            slave_cstring.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
     if slave_raw < 0 {
         bail!(
             "open slave pty {} failed: {}",
@@ -117,6 +125,22 @@ mod tests {
         assert!(pair.master.as_raw_fd() >= 0);
         assert!(pair.slave.as_raw_fd() >= 0);
         assert_ne!(pair.master.as_raw_fd(), pair.slave.as_raw_fd());
+    }
+
+    #[test]
+    fn open_pty_marks_both_ends_close_on_exec() {
+        let pair = open_pty().expect("open_pty should succeed");
+        for fd in [pair.master.as_raw_fd(), pair.slave.as_raw_fd()] {
+            // SAFETY: both descriptors are owned by `pair` for this call.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(
+                flags,
+                -1,
+                "fcntl(F_GETFD) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "fd {fd} must be close-on-exec");
+        }
     }
 
     #[test]
