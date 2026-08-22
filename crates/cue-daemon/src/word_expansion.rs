@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use cue_core::scope::EnvSnapshot;
 
 pub(crate) fn expand_command_line(
@@ -7,6 +9,16 @@ pub(crate) fn expand_command_line(
     command_line
         .iter()
         .map(|word| expand_word(word, snapshot))
+        .collect()
+}
+
+pub(crate) fn expand_environment(
+    environment: &BTreeMap<String, String>,
+    snapshot: Option<&EnvSnapshot>,
+) -> BTreeMap<String, String> {
+    environment
+        .iter()
+        .map(|(key, value)| (key.clone(), expand_word(value, snapshot)))
         .collect()
 }
 

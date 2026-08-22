@@ -35,7 +35,7 @@ use super::{
 };
 use crate::ring_buffer::RingBuffer;
 use crate::runtime_env::effective_snapshot;
-use crate::word_expansion::expand_command_line;
+use crate::word_expansion::{expand_command_line, expand_environment};
 
 // ── Per-child bookkeeping ──
 
@@ -1035,6 +1035,7 @@ async fn write_job_input(input: &JobInput, data: &[u8]) -> std::io::Result<()> {
 #[derive(Clone)]
 struct ExpandedSegment {
     command_line: Vec<String>,
+    env: BTreeMap<String, String>,
     program: String,
     args: Vec<String>,
     pipe_to_next: Option<cue_core::pipeline::PipeOp>,
@@ -1054,6 +1055,7 @@ fn expand_pipeline_segments(
     let mut expanded = Vec::with_capacity(pipeline.segments.len());
     for segment in &pipeline.segments {
         let command_line = expand_command_line(&segment.command, Some(snapshot));
+        let env = expand_environment(&segment.env, Some(snapshot));
         let Some(program) = command_line
             .first()
             .cloned()
@@ -1069,6 +1071,7 @@ fn expand_pipeline_segments(
         let args = command_line.get(1..).unwrap_or(&[]).to_vec();
         expanded.push(ExpandedSegment {
             command_line,
+            env,
             program,
             args,
             pipe_to_next: segment.pipe_to_next,
@@ -1084,12 +1087,14 @@ fn expand_pipeline_segments(
 fn configure_command(
     cmd: &mut tokio::process::Command,
     snapshot: &EnvSnapshot,
+    env: &BTreeMap<String, String>,
     cwd_override: Option<&Path>,
     sandbox: Option<&crate::sandbox::PreparedSandbox>,
 ) {
     let cwd = effective_cwd_path(snapshot, cwd_override, sandbox);
     cmd.env_clear();
     cmd.envs(snapshot.env.iter());
+    cmd.envs(env);
     cmd.env("PWD", &cwd);
     cmd.current_dir(cwd);
     cmd.kill_on_drop(true);
@@ -1126,7 +1131,13 @@ fn prepare_spawn(
 
     let mut command = tokio::process::Command::new(&program);
     command.args(&args);
-    configure_command(&mut command, snapshot, cwd_override, workspace_view);
+    configure_command(
+        &mut command,
+        snapshot,
+        &segment.env,
+        cwd_override,
+        workspace_view,
+    );
 
     PreparedSpawn {
         program,
@@ -3419,8 +3430,12 @@ mod tests {
         snapshot.env.insert("PWD".into(), "/stale".into());
         let cwd = std::env::temp_dir();
         let mut cmd = tokio::process::Command::new("pwd");
+        let env = BTreeMap::from([
+            ("PWD".into(), "/assignment-must-not-win".into()),
+            ("USER".into(), "overridden".into()),
+        ]);
 
-        configure_command(&mut cmd, &snapshot, Some(&cwd), None);
+        configure_command(&mut cmd, &snapshot, &env, Some(&cwd), None);
 
         assert_eq!(cmd.as_std().get_current_dir(), Some(cwd.as_path()));
         let pwd = cmd
@@ -3429,6 +3444,12 @@ mod tests {
             .find_map(|(key, value)| (key == "PWD").then_some(value))
             .flatten();
         assert_eq!(pwd, Some(cwd.as_os_str()));
+        let user = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "USER").then_some(value))
+            .flatten();
+        assert_eq!(user, Some(std::ffi::OsStr::new("overridden")));
     }
 
     #[tokio::test]
@@ -3463,6 +3484,7 @@ mod tests {
             JobId(404),
             &cue_core::pipeline::Pipeline {
                 segments: vec![cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["echo".into(), "unreachable".into()],
                     pipe_to_next: None,
                 }],
@@ -3966,10 +3988,12 @@ mod tests {
         let pipeline = cue_core::pipeline::Pipeline {
             segments: vec![
                 cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["printf".into(), "%s".into(), "hello world".into()],
                     pipe_to_next: Some(cue_core::pipeline::PipeOp::Stdout),
                 },
                 cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["grep".into(), "hello world".into()],
                     pipe_to_next: None,
                 },
@@ -3992,10 +4016,12 @@ mod tests {
         let pipeline = cue_core::pipeline::Pipeline {
             segments: vec![
                 cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["producer".into(), "semi;colon".into()],
                     pipe_to_next: Some(cue_core::pipeline::PipeOp::StderrOnly),
                 },
                 cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["consumer".into()],
                     pipe_to_next: None,
                 },
@@ -4051,6 +4077,7 @@ mod tests {
                 job_id,
                 plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline {
                     segments: vec![cue_core::pipeline::PipeSegment {
+                        env: BTreeMap::new(),
                         command: vec!["echo".into(), "should-not-run".into()],
                         pipe_to_next: None,
                     }],
@@ -4135,6 +4162,7 @@ mod tests {
                 job_id,
                 plan: JobPlan::Pipeline(cue_core::pipeline::Pipeline {
                     segments: vec![cue_core::pipeline::PipeSegment {
+                        env: BTreeMap::new(),
                         command: vec!["/bin/sleep".into(), "30".into()],
                         pipe_to_next: None,
                     }],
@@ -4361,11 +4389,13 @@ mod tests {
         });
 
         let mut segments = vec![cue_core::pipeline::PipeSegment {
+            env: BTreeMap::new(),
             command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
             pipe_to_next: pipeline_tail.then_some(cue_core::pipeline::PipeOp::Stdout),
         }];
         if pipeline_tail {
             segments.push(cue_core::pipeline::PipeSegment {
+                env: BTreeMap::new(),
                 command: vec![
                     "/bin/sh".into(),
                     tail_script_path.to_string_lossy().into_owned(),
@@ -4531,10 +4561,12 @@ mod tests {
         let pipeline = cue_core::pipeline::Pipeline {
             segments: vec![
                 cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["/bin/sh".into(), script_path.to_string_lossy().into_owned()],
                     pipe_to_next: Some(cue_core::pipeline::PipeOp::Stdout),
                 },
                 cue_core::pipeline::PipeSegment {
+                    env: BTreeMap::new(),
                     command: vec!["/bin/cat".into()],
                     pipe_to_next: None,
                 },

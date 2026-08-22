@@ -4623,6 +4623,92 @@ async fn test_job_command_expands_tilde_and_env_vars() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_command_prefix_environment_is_process_local() {
+    run_daemon_test(async {
+        let env = TestEnv::new("command-env");
+        let script = env.root.join("show-env.sh");
+        write_executable_script(
+            &script,
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$LOCAL_ONLY\" \"$EXPANDED\" \"$EMPTY\"\n",
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        let input = format!(
+            "LOCAL_ONLY=visible EXPANDED=$HOME EMPTY= {}",
+            script.display()
+        );
+        let job_id = job_id_from_created(
+            roundtrip(
+                &mut stream,
+                1,
+                RequestPayload::Eval {
+                    input,
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let output = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let ResponsePayload::Ok(OkPayload::Output { data, .. }) = output else {
+            panic!("expected output, got {output:?}");
+        };
+        assert!(
+            data.contains(&format!("visible|{}|", env.root.display())),
+            "prefix assignments should reach only the child: {data:?}"
+        );
+
+        let second_job = job_id_from_created(
+            roundtrip(
+                &mut stream,
+                4,
+                RequestPayload::Eval {
+                    input: script.display().to_string(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 5, &second_job).await,
+            JobStatus::Done
+        );
+        let second_output = roundtrip(
+            &mut stream,
+            6,
+            RequestPayload::Eval {
+                input: format!(":out {second_job}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let ResponsePayload::Ok(OkPayload::Output { data, .. }) = second_output else {
+            panic!("expected output, got {second_output:?}");
+        };
+        assert!(
+            data.contains("||"),
+            "prefix assignments must not mutate the session scope: {data:?}"
+        );
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_quoted_word_segments_reach_argv_as_one_argument() {
     run_daemon_test(async {
         let env = TestEnv::new("quote-join");

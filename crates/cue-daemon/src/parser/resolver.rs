@@ -354,6 +354,7 @@ fn convert_pipeline(p: Pipeline) -> core_pipeline::Pipeline {
             .segments
             .into_iter()
             .map(|s| core_pipeline::PipeSegment {
+                env: s.env,
                 command: s.command,
                 pipe_to_next: s.pipe_to_next,
             })

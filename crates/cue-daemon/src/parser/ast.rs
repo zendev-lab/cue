@@ -1,5 +1,6 @@
 //! AST types produced by the Parser (unresolved).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
@@ -87,6 +88,8 @@ pub(super) struct Pipeline {
 /// One process in a pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PipeSegment {
+    /// Environment assignments preceding this command.
+    pub(super) env: BTreeMap<String, String>,
     /// Command words, e.g. `["cargo", "test", "--release"]`.
     pub(super) command: Vec<String>,
     /// Pipe to next segment (None for last).

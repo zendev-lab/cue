@@ -7124,7 +7124,7 @@ mod tests {
     use super::*;
     use cue_core::ipc::ScriptSource;
     use cue_core::pipeline::{JobPlan, PipeSegment, Pipeline};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -7133,6 +7133,7 @@ mod tests {
     fn leaf(cmd: &str) -> ChainNode {
         ChainNode::Leaf(JobPlan::Pipeline(Pipeline {
             segments: vec![PipeSegment {
+                env: BTreeMap::new(),
                 command: cmd.split_whitespace().map(String::from).collect(),
                 pipe_to_next: None,
             }],
