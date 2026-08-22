@@ -473,10 +473,13 @@ async fn watch_foreground(
     requested_id: String,
     jsonl: bool,
 ) -> anyhow::Result<()> {
+    let step_id = requested_id
+        .parse::<cue_core::StepId>()
+        .with_context(|| format!("parse execution step ID `{requested_id}`"))?;
     let attachment = client
-        .fg_watch_roundtrip(&requested_id)
+        .step_watch_roundtrip(step_id)
         .await
-        .with_context(|| format!("watch foreground job `{requested_id}`"))?;
+        .with_context(|| format!("watch foreground step `{requested_id}`"))?;
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
     emit_foreground_snapshot(&mut stdout, &mut stderr, &attachment, jsonl)?;

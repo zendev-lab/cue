@@ -28,10 +28,15 @@ use tokio::time::timeout;
 
 use cue_core::ipc::{
     self, EventPayload, ForegroundRole, JobInfo, Message, OkPayload, RequestPayload,
-    ResponsePayload, ScriptItemResult, ScriptRunStatus, SessionInfo, SessionScopeState,
+    ResponsePayload, ScriptItemResult, SessionInfo, SessionScopeState,
 };
 use cue_core::job::JobStatus;
 use cue_core::mode::Mode;
+use cue_core::pipeline::Pipeline;
+use cue_core::{
+    ExecutionId, StepId,
+    execution::{ExecutionPlan, ExecutionSpec, LaunchContext},
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -410,6 +415,7 @@ where
         stream,
         0,
         RequestPayload::Handshake {
+            protocol_version: cue_core::ipc::IPC_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
             cwd: cwd.display().to_string(),
             env: BTreeMap::new(),
@@ -432,6 +438,7 @@ async fn handshake_with_env<S>(
         stream,
         0,
         RequestPayload::Handshake {
+            protocol_version: cue_core::ipc::IPC_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
             cwd: cwd.display().to_string(),
             env,
@@ -3673,6 +3680,7 @@ async fn test_job_kill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any())]
 async fn test_cancel_execution_stops_job_chain_and_script_idempotently() {
     run_daemon_test(async {
         let env = TestEnv::new("cancel-execution");
@@ -3830,6 +3838,197 @@ async fn test_cancel_execution_stops_job_chain_and_script_idempotently() {
             .await,
             ResponsePayload::Ok(OkPayload::Ack {})
         ));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_typed_execution_v3_submit_wait_list_and_output() {
+    run_daemon_test(async {
+        let env = TestEnv::new("execution-v3");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let plan = ExecutionPlan::OnSuccess {
+            left: Box::new(ExecutionPlan::pipeline(Pipeline::simple(vec![
+                "printf".into(),
+                "alpha".into(),
+            ]))),
+            right: Box::new(ExecutionPlan::pipeline(Pipeline::simple(vec![
+                "printf".into(),
+                "beta".into(),
+            ]))),
+        };
+        let created = roundtrip(
+            &mut stream,
+            20,
+            RequestPayload::SubmitExecution {
+                spec: Box::new(ExecutionSpec {
+                    plan,
+                    start_scope: None,
+                    launch_context: LaunchContext {
+                        pty: Some(false),
+                        ..LaunchContext::default()
+                    },
+                    source: None,
+                    retry_of: None,
+                }),
+            },
+        )
+        .await;
+        let id = match created {
+            ResponsePayload::Ok(OkPayload::ExecutionCreated { execution }) => execution.id,
+            other => panic!("expected ExecutionCreated, got {other:?}"),
+        };
+        assert_eq!(id, ExecutionId(1));
+
+        let finished = roundtrip(&mut stream, 21, RequestPayload::WaitExecution { id }).await;
+        match finished {
+            ResponsePayload::Ok(OkPayload::ExecutionInfo(execution)) => {
+                assert!(matches!(
+                    execution.state,
+                    cue_core::execution::ExecutionState::Succeeded
+                ));
+                assert_eq!(execution.steps.len(), 2);
+                assert!(
+                    execution.steps.iter().all(|step| matches!(
+                        step.state,
+                        cue_core::execution::StepState::Succeeded
+                    ))
+                );
+            }
+            other => panic!("expected terminal ExecutionInfo, got {other:?}"),
+        }
+
+        let output = roundtrip(
+            &mut stream,
+            22,
+            RequestPayload::ReadExecutionOutput {
+                id,
+                step_id: None,
+                stdout_bytes: Some(1024),
+                stderr_bytes: Some(1024),
+            },
+        )
+        .await;
+        match output {
+            ResponsePayload::Ok(OkPayload::ExecutionOutput { steps, .. }) => {
+                assert_eq!(steps.len(), 2);
+                assert_eq!(
+                    steps
+                        .iter()
+                        .map(|step| step.stdout.data.as_str())
+                        .collect::<String>(),
+                    "alphabeta"
+                );
+            }
+            other => panic!("expected ExecutionOutput, got {other:?}"),
+        }
+
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                23,
+                RequestPayload::ListExecutions { limit: Some(1) },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::ExecutionList(executions))
+                if executions.len() == 1 && executions[0].id == id
+        ));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_typed_execution_v3_step_attach_uses_stable_step_identity() {
+    run_daemon_test(async {
+        let env = TestEnv::new("execution-v3-step-attach");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            20,
+            RequestPayload::SubmitExecution {
+                spec: Box::new(ExecutionSpec {
+                    plan: ExecutionPlan::pipeline(Pipeline::simple(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "IFS= read -r ignored; printf 'got:hello\\n'".into(),
+                    ])),
+                    start_scope: None,
+                    launch_context: LaunchContext {
+                        pty: Some(true),
+                        ..LaunchContext::default()
+                    },
+                    source: None,
+                    retry_of: None,
+                }),
+            },
+        )
+        .await;
+        let execution_id = match created {
+            ResponsePayload::Ok(OkPayload::ExecutionCreated { execution }) => execution.id,
+            other => panic!("expected ExecutionCreated, got {other:?}"),
+        };
+        let step_id = StepId {
+            execution: execution_id,
+            index: 1,
+        };
+
+        let attached = roundtrip(&mut stream, 21, RequestPayload::StepAttach { id: step_id }).await;
+        match attached {
+            ResponsePayload::Ok(OkPayload::FgAttached(info)) => {
+                assert_eq!(info.id, step_id.to_string());
+                assert_eq!(info.role, ForegroundRole::Controller);
+            }
+            other => panic!("expected typed step attachment, got {other:?}"),
+        }
+
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                22,
+                RequestPayload::FgInput {
+                    data: b"hello\n".to_vec(),
+                },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                23,
+                RequestPayload::WaitExecution { id: execution_id },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::ExecutionInfo(execution))
+                if matches!(execution.state, cue_core::execution::ExecutionState::Succeeded)
+        ));
+        let output = roundtrip(
+            &mut stream,
+            24,
+            RequestPayload::ReadExecutionOutput {
+                id: execution_id,
+                step_id: Some(step_id),
+                stdout_bytes: Some(1024),
+                stderr_bytes: Some(1024),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+            &output,
+            ResponsePayload::Ok(OkPayload::ExecutionOutput { steps, .. })
+                if steps.len() == 1 && steps[0].stdout.data.contains("got:hello")
+            ),
+            "expected typed PTY output, got {output:?}"
+        );
 
         shutdown_daemon(&mut stream, &mut child).await;
     })

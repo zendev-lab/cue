@@ -193,6 +193,18 @@ pub struct Execution {
     cancelled: Option<ExecutionCancelReason>,
 }
 
+/// Durable reducer state. Transport-ephemeral launch fields must be removed by
+/// the daemon before this value is written to storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSnapshot {
+    pub id: ExecutionId,
+    pub spec: ExecutionSpec,
+    pub node_states: Vec<StepState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<ExecutionCancelReason>,
+}
+
 impl Execution {
     pub fn new(id: ExecutionId, spec: ExecutionSpec) -> Result<Self, PlanValidationError> {
         spec.plan.validate()?;
@@ -211,6 +223,65 @@ impl Execution {
 
     pub fn spec(&self) -> &ExecutionSpec {
         &self.spec
+    }
+
+    pub fn snapshot(&self) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            id: self.id,
+            spec: self.spec.clone(),
+            node_states: self.node_states.clone(),
+            cancelled: self.cancelled,
+        }
+    }
+
+    pub fn restore(snapshot: ExecutionSnapshot) -> Result<Self, PlanValidationError> {
+        snapshot.spec.plan.validate()?;
+        let expected = snapshot.spec.plan.node_count();
+        if snapshot.node_states.len() != expected {
+            return Err(PlanValidationError::new(
+                "node_states",
+                format!(
+                    "snapshot has {} node states but plan has {expected} leaves",
+                    snapshot.node_states.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            id: snapshot.id,
+            spec: snapshot.spec,
+            node_states: snapshot.node_states,
+            cancelled: snapshot.cancelled,
+        })
+    }
+
+    /// Resolve process work that was running when the daemon stopped. Queued
+    /// conditional branches remain eligible for the reducer to advance.
+    pub fn interrupt_running(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        for state in &mut self.node_states {
+            if matches!(state, StepState::Running) {
+                *state = StepState::Failed {
+                    failure: StepFailure::Infrastructure {
+                        message: message.clone(),
+                    },
+                };
+            }
+        }
+    }
+
+    /// Fail every unfinished node. Used when a required ephemeral launch lease
+    /// cannot survive process restart.
+    pub fn fail_nonterminal(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        for state in &mut self.node_states {
+            if !state.is_terminal() {
+                *state = StepState::Failed {
+                    failure: StepFailure::Infrastructure {
+                        message: message.clone(),
+                    },
+                };
+            }
+        }
     }
 
     pub fn state(&self) -> ExecutionState {
@@ -482,9 +553,30 @@ fn validate_plan(plan: &ExecutionPlan, path: &str) -> Result<(), PlanValidationE
                 ));
             }
             for (index, branch) in branches.iter().enumerate() {
+                if contains_context_delta(branch) {
+                    return Err(PlanValidationError::new(
+                        format!("{path}.branches[{index}]"),
+                        "context deltas are not supported inside parallel composition",
+                    ));
+                }
                 validate_plan(branch, &format!("{path}.branches[{index}]"))?;
             }
             Ok(())
+        }
+    }
+}
+
+fn contains_context_delta(plan: &ExecutionPlan) -> bool {
+    match plan {
+        ExecutionPlan::ContextDelta { .. } => true,
+        ExecutionPlan::Pipeline { .. } => false,
+        ExecutionPlan::OnSuccess { left, right }
+        | ExecutionPlan::OnFailure { left, right }
+        | ExecutionPlan::Always { left, right } => {
+            contains_context_delta(left) || contains_context_delta(right)
+        }
+        ExecutionPlan::ParallelAll { branches } | ExecutionPlan::AnySuccess { branches } => {
+            branches.iter().any(contains_context_delta)
         }
     }
 }
@@ -1059,6 +1151,23 @@ mod tests {
         };
         assert!(one_branch.validate().is_err());
 
+        let parallel_scope_mutation = ExecutionPlan::ParallelAll {
+            branches: vec![
+                ExecutionPlan::ContextDelta {
+                    delta: EnvDelta {
+                        set: BTreeMap::from([("FOO".into(), "bar".into())]),
+                        unset: Vec::new(),
+                        cwd: None,
+                    },
+                },
+                pipeline("b"),
+            ],
+        };
+        assert_eq!(
+            parallel_scope_mutation.validate().unwrap_err().message,
+            "context deltas are not supported inside parallel composition"
+        );
+
         let valid_pipeline = ExecutionPlan::pipeline(Pipeline {
             segments: vec![
                 PipeSegment {
@@ -1086,6 +1195,33 @@ mod tests {
         let debug = format!("{handle:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret-token"));
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_reducer_state() {
+        let mut original = execution(ExecutionPlan::OnSuccess {
+            left: Box::new(pipeline("a")),
+            right: Box::new(pipeline("b")),
+        });
+        succeed(&mut original, 1);
+
+        let mut restored = Execution::restore(original.snapshot()).expect("restore snapshot");
+
+        assert_eq!(restored, original);
+        assert_eq!(restored.advance().newly_ready, vec![PlanNodeId(2)]);
+    }
+
+    #[test]
+    fn interrupted_running_step_can_advance_failure_branch() {
+        let mut restored = execution(ExecutionPlan::OnFailure {
+            left: Box::new(pipeline("a")),
+            right: Box::new(pipeline("recover")),
+        });
+        restored.mark_running(PlanNodeId(1)).unwrap();
+
+        restored.interrupt_running("daemon restarted");
+
+        assert_eq!(restored.advance().newly_ready, vec![PlanNodeId(2)]);
     }
 
     #[test]

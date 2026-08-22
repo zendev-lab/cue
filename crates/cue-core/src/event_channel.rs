@@ -5,6 +5,7 @@ use crate::JobId;
 /// Event subscription channels exposed by the IPC protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EventChannel {
+    Executions,
     Jobs,
     Crons,
     Scopes,
@@ -13,12 +14,14 @@ pub enum EventChannel {
 }
 
 impl EventChannel {
+    pub const EXECUTIONS: &'static str = "executions";
     pub const JOBS: &'static str = "jobs";
     pub const CRONS: &'static str = "crons";
     pub const SCOPES: &'static str = "scopes";
     pub const SYSTEM: &'static str = "system";
     pub const OUTPUT_PREFIX: &'static str = "output:";
-    pub const EXPECTED: &'static str = "`jobs`, `crons`, `scopes`, `system`, or `output:<job-id>`";
+    pub const EXPECTED: &'static str =
+        "`executions`, `jobs`, `crons`, `scopes`, `system`, or `output:<job-id>`";
 
     pub fn parse_list(channels: &[String]) -> Result<Vec<Self>, ParseEventChannelError> {
         channels
@@ -48,6 +51,7 @@ impl ParseEventChannelError {
 impl fmt::Display for EventChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Executions => f.write_str(Self::EXECUTIONS),
             Self::Jobs => f.write_str(Self::JOBS),
             Self::Crons => f.write_str(Self::CRONS),
             Self::Scopes => f.write_str(Self::SCOPES),
@@ -76,6 +80,7 @@ impl FromStr for EventChannel {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         match input {
+            Self::EXECUTIONS => Ok(Self::Executions),
             Self::JOBS => Ok(Self::Jobs),
             Self::CRONS => Ok(Self::Crons),
             Self::SCOPES => Ok(Self::Scopes),

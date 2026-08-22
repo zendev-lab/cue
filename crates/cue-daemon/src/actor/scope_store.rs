@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use cue_core::ScopeHash;
-use cue_core::scope::{EnvSnapshot, Scope};
+use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 
 use super::{ScopeGcReport, ScopeStoreMsg};
 use crate::storage;
@@ -67,7 +67,11 @@ pub(super) async fn spawn(
                     let _ = reply.send(scope);
                 }
 
-                ScopeStoreMsg::Derive { base, delta, reply } => {
+                ScopeStoreMsg::Derive {
+                    base,
+                    mut delta,
+                    reply,
+                } => {
                     let parent_scope = match load_scope(&mut cache, &db, base).await {
                         Ok(scope) => scope,
                         Err(error) => {
@@ -88,6 +92,11 @@ pub(super) async fn spawn(
                         )));
                         continue;
                     };
+
+                    if let Err(error) = resolve_delta_cwd(parent_snap, &mut delta) {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
 
                     let child = Scope::fork(parent.hash, parent_snap, delta);
                     let child_hash = child.hash;
@@ -171,6 +180,24 @@ pub(super) async fn spawn(
 
         debug!("scope_store: stopped");
     });
+    Ok(())
+}
+
+fn resolve_delta_cwd(parent: &EnvSnapshot, delta: &mut EnvDelta) -> Result<()> {
+    let Some(requested) = delta.cwd.take() else {
+        return Ok(());
+    };
+    let target = if requested.is_absolute() {
+        requested
+    } else {
+        parent.cwd.join(requested)
+    };
+    let resolved = std::fs::canonicalize(&target)
+        .with_context(|| format!("cannot resolve cwd `{}`", target.display()))?;
+    if !resolved.is_dir() {
+        anyhow::bail!("cwd `{}` is not a directory", resolved.display());
+    }
+    delta.cwd = Some(resolved);
     Ok(())
 }
 
@@ -293,6 +320,28 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn relative_cwd_delta_resolves_against_parent_snapshot() {
+        let root = make_temp_dir();
+        let child = root.join("child");
+        std::fs::create_dir(&child).expect("create child cwd");
+        let canonical_child = child.canonicalize().expect("canonical child cwd");
+        let parent = EnvSnapshot {
+            env: BTreeMap::new(),
+            cwd: root.clone(),
+        };
+        let mut delta = cue_core::scope::EnvDelta {
+            set: BTreeMap::new(),
+            unset: Vec::new(),
+            cwd: Some(PathBuf::from("child")),
+        };
+
+        resolve_delta_cwd(&parent, &mut delta).expect("resolve relative cwd");
+
+        assert_eq!(delta.cwd, Some(canonical_child));
+        std::fs::remove_dir_all(root).expect("remove temp cwd");
+    }
+
     fn test_actor_system(scope_tx: mpsc::Sender<ScopeStoreMsg>) -> ActorSystem {
         let (gateway_tx, _gateway_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
@@ -301,6 +350,8 @@ mod tests {
         ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
             scope_store: scope_tx,
             event_bus: event_tx,

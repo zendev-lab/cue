@@ -15,6 +15,7 @@ pub(crate) struct PendingSubmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingSubmissionKind {
     User,
+    Retry { id: cue_core::ExecutionId },
     Silent { description: String },
     DisplaySubscribe { id: String },
     DisplayUnsubscribe { id: String },
@@ -51,6 +52,35 @@ impl PendingSubmission {
                 description: description.into(),
             },
         }
+    }
+
+    pub(crate) fn retry(
+        card_index: Option<usize>,
+        input: String,
+        mode: Mode,
+        warnings: Vec<String>,
+        id: cue_core::ExecutionId,
+    ) -> Self {
+        Self {
+            card_index,
+            input,
+            mode,
+            warnings,
+            kind: PendingSubmissionKind::Retry { id },
+        }
+    }
+
+    pub(crate) fn retry_id(&self) -> Option<cue_core::ExecutionId> {
+        match self.kind {
+            PendingSubmissionKind::Retry { id } => Some(id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_user(&self) -> Self {
+        let mut pending = self.clone();
+        pending.kind = PendingSubmissionKind::User;
+        pending
     }
 
     pub(crate) fn display_subscribe(id: String) -> Self {
@@ -102,13 +132,17 @@ impl PendingSubmission {
     }
 
     pub(crate) fn is_user_visible(&self) -> bool {
-        matches!(self.kind, PendingSubmissionKind::User)
+        matches!(
+            self.kind,
+            PendingSubmissionKind::User | PendingSubmissionKind::Retry { .. }
+        )
     }
 
     pub(crate) fn silent_description(&self) -> Option<&str> {
         match &self.kind {
             PendingSubmissionKind::Silent { description } => Some(description),
             PendingSubmissionKind::User
+            | PendingSubmissionKind::Retry { .. }
             | PendingSubmissionKind::DisplaySubscribe { .. }
             | PendingSubmissionKind::DisplayUnsubscribe { .. } => None,
         }
@@ -118,6 +152,7 @@ impl PendingSubmission {
         match &self.kind {
             PendingSubmissionKind::DisplaySubscribe { id } => Some(id),
             PendingSubmissionKind::User
+            | PendingSubmissionKind::Retry { .. }
             | PendingSubmissionKind::Silent { .. }
             | PendingSubmissionKind::DisplayUnsubscribe { .. } => None,
         }
@@ -127,6 +162,7 @@ impl PendingSubmission {
         match &self.kind {
             PendingSubmissionKind::DisplayUnsubscribe { id } => Some(id),
             PendingSubmissionKind::User
+            | PendingSubmissionKind::Retry { .. }
             | PendingSubmissionKind::Silent { .. }
             | PendingSubmissionKind::DisplaySubscribe { .. } => None,
         }
@@ -146,7 +182,9 @@ pub(crate) fn pending_display_subscription_requests<'a>(
             PendingSubmissionKind::DisplayUnsubscribe { id } => {
                 unsubscribes.insert(id.clone());
             }
-            PendingSubmissionKind::User | PendingSubmissionKind::Silent { .. } => {}
+            PendingSubmissionKind::User
+            | PendingSubmissionKind::Retry { .. }
+            | PendingSubmissionKind::Silent { .. } => {}
         }
     }
     (subscribes, unsubscribes)

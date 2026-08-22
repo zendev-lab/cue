@@ -27,7 +27,8 @@ use cue_language::{
 use super::operation_ledger::{BeginOutcome, OperationLedger, OperationWaiter};
 use super::{
     ActorSystem, CLIENT_EVENT_CAP, ClientEvent, ClientEventAudience, EventBusMsg,
-    ForegroundRoleUpdate, GatewayMsg, SchedulerMsg, SessionBinding, SessionCommand,
+    ExecutionCoordinatorMsg, ForegroundRoleUpdate, GatewayMsg, SchedulerMsg, ScopeStoreMsg,
+    SessionBinding, SessionCommand, TriggerServiceMsg,
 };
 
 /// Next client id counter (global, atomic).
@@ -657,10 +658,16 @@ fn command_contains_connection_local_foreground(command: &ResolvedCommand) -> bo
 fn is_side_effecting_request(payload: &RequestPayload) -> bool {
     matches!(
         payload,
-        RequestPayload::Eval { .. }
+        RequestPayload::SubmitExecution { .. }
+            | RequestPayload::CancelExecution { .. }
+            | RequestPayload::ApplyScopeDelta { .. }
+            | RequestPayload::CreateSchedule { .. }
+            | RequestPayload::PauseSchedule { .. }
+            | RequestPayload::ResumeSchedule { .. }
+            | RequestPayload::RemoveSchedule { .. }
+            | RequestPayload::Eval { .. }
             | RequestPayload::RunScript { .. }
             | RequestPayload::KillJob { .. }
-            | RequestPayload::CancelExecution { .. }
             | RequestPayload::RemoveCron { .. }
             | RequestPayload::ArchiveSession { .. }
             | RequestPayload::RestoreSession { .. }
@@ -718,11 +725,28 @@ async fn route_request(
 ) -> Result<Option<[u8; 32]>> {
     match payload {
         RequestPayload::Handshake {
+            protocol_version,
             session_id,
             cwd,
             env,
             refresh,
         } => {
+            if protocol_version != IPC_PROTOCOL_VERSION {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: ResponsePayload::err(
+                            error_code::PROTOCOL_UPGRADE_REQUIRED,
+                            format!(
+                                "client IPC protocol {protocol_version} is unsupported; upgrade to protocol {IPC_PROTOCOL_VERSION}"
+                            ),
+                        ),
+                    })
+                    .await
+                    .context("send protocol upgrade error")?;
+                return Ok(None);
+            }
             let snapshot = EnvSnapshot {
                 env,
                 cwd: PathBuf::from(cwd),
@@ -1073,15 +1097,315 @@ async fn route_request(
             .await?;
         }
 
-        RequestPayload::CancelExecution { id } => {
-            send_scheduler_eval(
-                sys,
-                client_id,
-                request_id,
-                ResolvedCommand::CancelExecution { id },
-                "send cancel execution to scheduler",
-            )
-            .await?;
+        RequestPayload::SubmitExecution { spec } => {
+            if lifecycle.execution_admission_closed() {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: draining_response(),
+                    })
+                    .await
+                    .context("send draining execution rejection")?;
+                return Ok(None);
+            }
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.execution
+                .send(ExecutionCoordinatorMsg::Submit {
+                    client_id,
+                    request_id,
+                    spec,
+                    binding,
+                })
+                .await
+                .context("send execution submission")?;
+        }
+        RequestPayload::GetExecution { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.execution
+                .send(ExecutionCoordinatorMsg::Get {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution query")?;
+        }
+        RequestPayload::ListExecutions { limit } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.execution
+                .send(ExecutionCoordinatorMsg::List {
+                    client_id,
+                    request_id,
+                    limit,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution list")?;
+        }
+        RequestPayload::WaitExecution { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.execution
+                .send(ExecutionCoordinatorMsg::Wait {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution wait")?;
+        }
+        RequestPayload::CancelExecution { id, mode } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.execution
+                .send(ExecutionCoordinatorMsg::Cancel {
+                    client_id,
+                    request_id,
+                    id,
+                    mode,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution cancellation")?;
+        }
+        RequestPayload::ReadExecutionOutput {
+            id,
+            step_id,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.execution
+                .send(ExecutionCoordinatorMsg::ReadOutput {
+                    client_id,
+                    request_id,
+                    id,
+                    step_id,
+                    stdout_bytes,
+                    stderr_bytes,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution output query")?;
+        }
+
+        RequestPayload::StepAttach { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            begin_client_event_hold_fence(event_state, request_id);
+            sys.execution
+                .send(ExecutionCoordinatorMsg::AttachStep {
+                    client_id,
+                    request_id,
+                    id,
+                    role: ForegroundRole::Controller,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution step attach")?;
+        }
+
+        RequestPayload::StepWatch { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            begin_client_event_hold_fence(event_state, request_id);
+            sys.execution
+                .send(ExecutionCoordinatorMsg::AttachStep {
+                    client_id,
+                    request_id,
+                    id,
+                    role: ForegroundRole::Observer,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send execution step watch")?;
+        }
+
+        RequestPayload::ApplyScopeDelta { base, delta } => {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            sys.scheduler
+                .send(SchedulerMsg::ApplyScopeDelta {
+                    client_id,
+                    base,
+                    delta,
+                    reply,
+                })
+                .await
+                .context("send typed scope delta")?;
+            let payload = response.await.context("typed scope delta reply dropped")?;
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload,
+                })
+                .await
+                .context("send typed scope delta response")?;
+        }
+
+        RequestPayload::GetScope { hash } => {
+            if current_binding(sys, client_id).await?.is_none() {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            }
+            let (reply, scope) = tokio::sync::oneshot::channel();
+            sys.scope_store
+                .send(ScopeStoreMsg::GetScope { hash, reply })
+                .await
+                .context("send typed scope query")?;
+            let payload = match scope.await.context("typed scope query reply dropped")? {
+                Ok(Some(scope)) => match scope.snapshot {
+                    Some(snapshot) => {
+                        ResponsePayload::Ok(OkPayload::ScopeInfo(cue_core::ipc::ScopeInfo {
+                            hash: scope.hash.to_string(),
+                            parent: scope.parent.map(|parent| parent.to_string()),
+                            cwd: snapshot.cwd.display().to_string(),
+                            env_count: snapshot.env.len(),
+                        }))
+                    }
+                    None => ResponsePayload::err(
+                        error_code::INVALID_STATE,
+                        format!("scope {hash} has no snapshot"),
+                    ),
+                },
+                Ok(None) => {
+                    ResponsePayload::err(error_code::NOT_FOUND, format!("scope {hash} not found"))
+                }
+                Err(error) => ResponsePayload::err(error_code::INTERNAL, error.to_string()),
+            };
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload,
+                })
+                .await
+                .context("send typed scope query response")?;
+        }
+
+        RequestPayload::CreateSchedule {
+            schedule,
+            execution,
+        } => {
+            if lifecycle.execution_admission_closed() {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: draining_response(),
+                    })
+                    .await
+                    .context("send draining schedule rejection")?;
+                return Ok(None);
+            }
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Create {
+                    client_id,
+                    request_id,
+                    schedule: Box::new(schedule),
+                    execution,
+                    binding,
+                })
+                .await
+                .context("send schedule creation")?;
+        }
+        RequestPayload::ListSchedules { limit } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::List {
+                    client_id,
+                    request_id,
+                    limit,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule list")?;
+        }
+        RequestPayload::PauseSchedule { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Pause {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule pause")?;
+        }
+        RequestPayload::ResumeSchedule { id } => {
+            if lifecycle.execution_admission_closed() {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: draining_response(),
+                    })
+                    .await
+                    .context("send draining schedule resume rejection")?;
+                return Ok(None);
+            }
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Resume {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule resume")?;
+        }
+        RequestPayload::RemoveSchedule { id } => {
+            let Some(binding) = current_binding(sys, client_id).await? else {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            };
+            sys.triggers
+                .send(TriggerServiceMsg::Remove {
+                    client_id,
+                    request_id,
+                    id,
+                    named_session_id: binding.named_session_id,
+                })
+                .await
+                .context("send schedule removal")?;
         }
 
         RequestPayload::RemoveCron { id } => {
@@ -1366,13 +1690,22 @@ async fn route_request(
             let ticket = lifecycle.request_restart(client_id, request_id)?;
             if ticket.first_request {
                 let (reply, accepted) = tokio::sync::oneshot::channel();
-                if sys
+                let scheduler_closed = sys
                     .scheduler
                     .send(SchedulerMsg::BeginDrain { reply })
                     .await
                     .is_err()
-                    || accepted.await.is_err()
-                {
+                    || accepted.await.is_err();
+                let (trigger_reply, trigger_accepted) = tokio::sync::oneshot::channel();
+                let triggers_closed = sys
+                    .triggers
+                    .send(TriggerServiceMsg::BeginDrain {
+                        reply: trigger_reply,
+                    })
+                    .await
+                    .is_err()
+                    || trigger_accepted.await.is_err();
+                if scheduler_closed || triggers_closed {
                     // The scheduler may already have closed admission before
                     // dropping its acknowledgement. Never reopen only one side
                     // of that boundary: cancel the durable successor fence and
@@ -1384,7 +1717,7 @@ async fn route_request(
                             request_id,
                             payload: ResponsePayload::err(
                                 error_code::INTERNAL,
-                                "scheduler could not begin daemon drain",
+                                "execution owners could not begin daemon drain",
                             ),
                         })
                         .await?;
@@ -1422,6 +1755,29 @@ async fn route_request(
     }
 
     Ok(None)
+}
+
+async fn current_binding(sys: &ActorSystem, client_id: u64) -> Result<Option<SessionBinding>> {
+    let (reply, binding) = tokio::sync::oneshot::channel();
+    sys.scheduler
+        .send(SchedulerMsg::CurrentBinding { client_id, reply })
+        .await
+        .context("query current session binding")?;
+    binding.await.context("session binding reply dropped")
+}
+
+async fn send_handshake_required(sys: &ActorSystem, client_id: u64, request_id: u32) -> Result<()> {
+    sys.gateway
+        .send(GatewayMsg::SendResponse {
+            client_id,
+            request_id,
+            payload: ResponsePayload::err(
+                error_code::INVALID_REQUEST,
+                "client session handshake required",
+            ),
+        })
+        .await
+        .context("send handshake-required response")
 }
 
 async fn route_session_command(
@@ -2004,6 +2360,8 @@ mod tests {
         ActorSystem {
             gateway,
             scheduler,
+            execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus,
@@ -2217,6 +2575,8 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus: event_bus_tx,
@@ -2289,6 +2649,8 @@ mod tests {
         let sys = ActorSystem {
             gateway: gateway_tx,
             scheduler: scheduler_tx,
+            execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr,
             scope_store,
             event_bus: event_bus_tx,

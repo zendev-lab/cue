@@ -8,13 +8,16 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cron::CronStatus;
+use crate::cron::{CronSchedule, CronStatus};
 use crate::event_channel::EventChannel;
+use crate::execution::{CancelMode, ExecutionSpec, ExecutionState, StepState};
+use crate::id::{ExecutionId, ScheduleId, ScopeHash, StepId};
 use crate::job::JobStatus;
 use crate::mode::Mode;
+use crate::scope::EnvDelta;
 
 /// IPC protocol version required by sessionized clients.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 /// Capability advertised by daemons that reject session-dependent requests before `Handshake`.
 pub const IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED: &str = "session-handshake-required";
 /// Script item ownership is reported by authoritative `ScriptItemCreated` events.
@@ -33,7 +36,10 @@ pub const IPC_CAPABILITY_NAMED_SESSIONS: &str = "named-sessions";
 pub const IPC_CAPABILITY_FOREGROUND_OBSERVERS: &str = "foreground-observers";
 /// Safe, reversible archive/restore lifecycle for durable named sessions.
 pub const IPC_CAPABILITY_SESSION_ARCHIVE: &str = "session-archive";
+/// Unified typed execution submission and observation contract.
+pub const IPC_CAPABILITY_EXECUTION_V3: &str = "execution-v3";
 const IPC_CAPABILITIES: &[&str] = &[
+    IPC_CAPABILITY_EXECUTION_V3,
     IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
     IPC_CAPABILITY_SCRIPT_ITEM_CREATED,
     IPC_CAPABILITY_CANCEL_EXECUTION,
@@ -99,6 +105,10 @@ pub enum RequestPayload {
 
     // Connection management
     Handshake {
+        /// Exact wire version. v3 is a hard cut; older clients receive an
+        /// explicit upgrade error before any session or execution side effect.
+        #[serde(default)]
+        protocol_version: u32,
         session_id: String,
         cwd: String,
         env: BTreeMap<String, String>,
@@ -148,6 +158,57 @@ pub enum RequestPayload {
     },
     Unsubscribe {
         channels: Vec<String>,
+    },
+
+    // Unified execution runtime.
+    SubmitExecution {
+        spec: Box<ExecutionSpec>,
+    },
+    GetExecution {
+        id: ExecutionId,
+    },
+    ListExecutions {
+        limit: Option<usize>,
+    },
+    WaitExecution {
+        id: ExecutionId,
+    },
+    ReadExecutionOutput {
+        id: ExecutionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_id: Option<StepId>,
+        stdout_bytes: Option<usize>,
+        stderr_bytes: Option<usize>,
+    },
+    ApplyScopeDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<ScopeHash>,
+        delta: EnvDelta,
+    },
+    GetScope {
+        hash: ScopeHash,
+    },
+    CreateSchedule {
+        schedule: CronSchedule,
+        execution: Box<ExecutionSpec>,
+    },
+    ListSchedules {
+        limit: Option<usize>,
+    },
+    PauseSchedule {
+        id: ScheduleId,
+    },
+    ResumeSchedule {
+        id: ScheduleId,
+    },
+    RemoveSchedule {
+        id: ScheduleId,
+    },
+    StepAttach {
+        id: StepId,
+    },
+    StepWatch {
+        id: StepId,
     },
 
     // :fg proxy
@@ -211,7 +272,8 @@ pub enum RequestPayload {
     /// (`CH<n>`), or script-run (`R<n>`) id. The acknowledgement is sent only
     /// after any currently running child processes have stopped.
     CancelExecution {
-        id: String,
+        id: ExecutionId,
+        mode: CancelMode,
     },
     RemoveCron {
         id: String,
@@ -260,6 +322,19 @@ pub enum ResponsePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OkPayload {
     Ack {},
+    ExecutionCreated {
+        execution: Box<ExecutionInfo>,
+    },
+    ExecutionInfo(Box<ExecutionInfo>),
+    ExecutionList(Vec<ExecutionInfo>),
+    ExecutionOutput {
+        id: ExecutionId,
+        steps: Vec<StepOutput>,
+    },
+    ScheduleCreated {
+        schedule: Box<ScheduleInfo>,
+    },
+    ScheduleList(Vec<ScheduleInfo>),
     ScriptCreated {
         script_id: String,
         source: ScriptSource,
@@ -394,6 +469,22 @@ fn default_pong_ready() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
+    ExecutionCreated {
+        execution: Box<ExecutionInfo>,
+    },
+    ExecutionStateChanged {
+        id: ExecutionId,
+        old_state: ExecutionState,
+        new_state: ExecutionState,
+    },
+    StepStateChanged {
+        id: StepId,
+        old_state: StepState,
+        new_state: StepState,
+    },
+    ExecutionFinished {
+        execution: Box<ExecutionInfo>,
+    },
     // Jobs channel
     JobStateChanged {
         job_id: String,
@@ -547,7 +638,7 @@ pub struct PageInfo {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamText {
     /// Backward-compatible display text. For binary output this is an explicit
     /// lossy UTF-8 view; `base64` is the authoritative byte representation.
@@ -565,6 +656,47 @@ pub enum OutputEncoding {
     #[default]
     Utf8,
     Base64,
+}
+
+/// Reconnect-safe projection of one unified execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionInfo {
+    pub id: ExecutionId,
+    pub state: ExecutionState,
+    pub steps: Vec<ExecutionStepInfo>,
+    /// Original replayable contract with ephemeral launch leases removed.
+    pub spec: ExecutionSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionStepInfo {
+    pub id: StepId,
+    pub state: StepState,
+    pub pipeline: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepOutput {
+    pub id: StepId,
+    pub stdout: StreamText,
+    pub stderr: StreamText,
+    pub stderr_pty_merged: bool,
+}
+
+/// Durable trigger template. The execution contract never contains an
+/// ephemeral spawn adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleInfo {
+    pub id: ScheduleId,
+    pub schedule: CronSchedule,
+    pub execution: ExecutionSpec,
+    pub status: CronStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_trigger_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,6 +909,7 @@ pub enum HighlightKind {
 
 /// Standard IPC error codes.
 pub mod error_code {
+    pub const PROTOCOL_UPGRADE_REQUIRED: &str = "PROTOCOL_UPGRADE_REQUIRED";
     pub const NOT_FOUND: &str = "NOT_FOUND";
     pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
     pub const INVALID_STATE: &str = "INVALID_STATE";
@@ -1507,7 +1640,7 @@ mod tests {
 
     #[test]
     fn pong_decodes_legacy_payload_without_instance_id() {
-        let json = r#"{"type":"response","id":7,"payload":{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2,"capabilities":["session-handshake-required"]}}}}"#;
+        let json = r#"{"type":"response","id":7,"payload":{"Ok":{"Pong":{"version":"0.1.0","protocol_version":3,"capabilities":["session-handshake-required"]}}}}"#;
         let decoded: Message = serde_json::from_str(json).unwrap();
 
         match decoded {
@@ -1539,7 +1672,7 @@ mod tests {
 
     #[test]
     fn pong_decodes_versioned_payload() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","protocol_version":3,"capabilities":["execution-v3","session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#;
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
             ResponsePayload::Ok(OkPayload::Pong {
@@ -1574,7 +1707,7 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert_eq!(
             json,
-            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","ready":true,"protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#
+            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","ready":true,"protocol_version":3,"capabilities":["execution-v3","session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#
         );
     }
 
@@ -1583,20 +1716,23 @@ mod tests {
         let message = Message::Request {
             id: 42,
             operation_id: None,
-            payload: RequestPayload::CancelExecution { id: "R7".into() },
+            payload: RequestPayload::CancelExecution {
+                id: ExecutionId(7),
+                mode: CancelMode::Force,
+            },
         };
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"request","id":42,"payload":{"CancelExecution":{"id":"R7"}}}"#
+            r#"{"type":"request","id":42,"payload":{"CancelExecution":{"id":7,"mode":"force"}}}"#
         );
         assert!(matches!(
             serde_json::from_str::<Message>(&json).unwrap(),
             Message::Request {
                 id: 42,
-                payload: RequestPayload::CancelExecution { id },
+                payload: RequestPayload::CancelExecution { id, mode: CancelMode::Force },
                 ..
-            } if id == "R7"
+            } if id == ExecutionId(7)
         ));
     }
 }

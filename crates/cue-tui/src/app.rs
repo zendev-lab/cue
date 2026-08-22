@@ -12,12 +12,13 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
-    CronInfo, EventPayload, ForegroundAttachmentInfo, ForegroundRole, JobInfo, JobOpenHint,
-    OkPayload, RequestPayload, ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus,
-    Stream,
+    CronInfo, EventPayload, ExecutionInfo, ForegroundAttachmentInfo, ForegroundRole, JobInfo,
+    JobOpenHint, OkPayload, RequestPayload, ResponsePayload, ScheduleInfo, ScriptItemInfo,
+    ScriptItemResult, ScriptRunStatus, Stream,
 };
 use cue_core::job::JobStatus;
 use cue_core::{EventChannel, Mode};
+use cue_language::{CompiledCommand, FrontendAction, compile_command, render_help};
 use ratatui::layout::Rect;
 use tui_term::vt100;
 
@@ -80,6 +81,92 @@ struct CronRow {
     id: String,
     label: String,
     status: CronStatus,
+}
+
+fn execution_job_status(state: &cue_core::execution::ExecutionState) -> JobStatus {
+    match state {
+        cue_core::execution::ExecutionState::Queued => JobStatus::Pending,
+        cue_core::execution::ExecutionState::Running => JobStatus::Running,
+        cue_core::execution::ExecutionState::Succeeded => JobStatus::Done,
+        cue_core::execution::ExecutionState::Failed => JobStatus::Failed,
+        cue_core::execution::ExecutionState::Cancelled {
+            reason: cue_core::execution::ExecutionCancelReason::Forced,
+        } => JobStatus::Killed,
+        cue_core::execution::ExecutionState::Cancelled { .. } => {
+            JobStatus::Cancelled(cue_core::job::CancelReason::User)
+        }
+    }
+}
+
+fn execution_open_hint(execution: &ExecutionInfo) -> JobOpenHint {
+    let _ = execution;
+    // Foreground control is step-scoped in IPC v3; an execution-level row can
+    // always open aggregate output but cannot guess which PTY step to control.
+    JobOpenHint::Stream
+}
+
+fn execution_spec_label(spec: &cue_core::execution::ExecutionSpec) -> String {
+    let mut pipelines = Vec::new();
+    collect_execution_pipelines(&spec.plan, &mut pipelines);
+    if pipelines.is_empty() {
+        "scope update".into()
+    } else {
+        pipelines.join(" → ")
+    }
+}
+
+fn execution_label(execution: &ExecutionInfo) -> String {
+    execution_spec_label(&execution.spec)
+}
+
+fn collect_execution_pipelines(
+    plan: &cue_core::execution::ExecutionPlan,
+    pipelines: &mut Vec<String>,
+) {
+    match plan {
+        cue_core::execution::ExecutionPlan::Pipeline { pipeline } => {
+            pipelines.push(pipeline.to_string());
+        }
+        cue_core::execution::ExecutionPlan::OnSuccess { left, right }
+        | cue_core::execution::ExecutionPlan::OnFailure { left, right }
+        | cue_core::execution::ExecutionPlan::Always { left, right } => {
+            collect_execution_pipelines(left, pipelines);
+            collect_execution_pipelines(right, pipelines);
+        }
+        cue_core::execution::ExecutionPlan::ParallelAll { branches }
+        | cue_core::execution::ExecutionPlan::AnySuccess { branches } => {
+            for branch in branches {
+                collect_execution_pipelines(branch, pipelines);
+            }
+        }
+        cue_core::execution::ExecutionPlan::ContextDelta { .. } => {}
+    }
+}
+
+fn format_execution_info(execution: &ExecutionInfo) -> String {
+    let mut lines = vec![
+        execution.id.to_string(),
+        format!("status: {:?}", execution.state).to_ascii_lowercase(),
+    ];
+    for step in &execution.steps {
+        lines.push(format!("{} [{:?}] {}", step.id, step.state, step.pipeline));
+    }
+    lines.join("\n")
+}
+
+fn format_execution_output(steps: &[cue_core::ipc::StepOutput]) -> String {
+    let mut sections = Vec::new();
+    for step in steps {
+        let mut lines = vec![step.id.to_string()];
+        if !step.stdout.data.is_empty() {
+            lines.push(step.stdout.data.clone());
+        }
+        if !step.stderr.data.is_empty() {
+            lines.push(format!("stderr:\n{}", step.stderr.data));
+        }
+        sections.push(lines.join("\n"));
+    }
+    sections.join("\n\n")
 }
 
 enum FgSessionKind {
@@ -1122,25 +1209,24 @@ impl AppState {
 
     fn subscribe_core_channels(&mut self) {
         let _ = self.enqueue_silent_request(
-            RequestPayload::subscribe(&[
-                EventChannel::Jobs,
-                EventChannel::Crons,
-                EventChannel::System,
-            ]),
+            RequestPayload::subscribe(&[EventChannel::Executions, EventChannel::System]),
             "core subscriptions",
             PendingSubmission::silent_request("core subscriptions"),
         );
     }
 
     fn request_sidebar_snapshots(&mut self) {
-        for (input, mode) in [(":jobs", Mode::Job), (":crons", Mode::Cron)] {
+        for (description, payload) in [
+            (
+                ":executions",
+                RequestPayload::ListExecutions { limit: None },
+            ),
+            (":schedules", RequestPayload::ListSchedules { limit: None }),
+        ] {
             if !self.enqueue_silent_request(
-                RequestPayload::Eval {
-                    input: input.to_string(),
-                    mode,
-                },
-                input,
-                PendingSubmission::silent_request(input),
+                payload,
+                description,
+                PendingSubmission::silent_request(description),
             ) {
                 break;
             }
@@ -1149,12 +1235,9 @@ impl AppState {
 
     fn request_cron_snapshot(&mut self) {
         let _ = self.enqueue_silent_request(
-            RequestPayload::Eval {
-                input: ":crons".to_string(),
-                mode: Mode::Cron,
-            },
-            ":crons",
-            PendingSubmission::silent_request(":crons"),
+            RequestPayload::ListSchedules { limit: None },
+            ":schedules",
+            PendingSubmission::silent_request(":schedules"),
         );
     }
 
@@ -1441,6 +1524,17 @@ impl AppState {
         });
     }
 
+    fn upsert_execution(&mut self, execution: &ExecutionInfo) {
+        self.upsert_job(
+            execution.id.to_string(),
+            execution_label(execution),
+            execution_job_status(&execution.state),
+            execution.spec.start_scope.map(|scope| scope.to_string()),
+            execution_open_hint(execution),
+            Vec::new(),
+        );
+    }
+
     fn update_job_status(&mut self, id: &str, status: JobStatus, end_scope: Option<String>) {
         if let Some(index) = self.jobs.iter().position(|job| job.id == id) {
             self.jobs[index].status = status;
@@ -1530,6 +1624,13 @@ impl AppState {
             .collect();
     }
 
+    fn replace_executions(&mut self, executions: Vec<ExecutionInfo>) {
+        self.jobs.clear();
+        for execution in &executions {
+            self.upsert_execution(execution);
+        }
+    }
+
     fn replace_crons(&mut self, list: Vec<CronInfo>) {
         self.crons = list
             .into_iter()
@@ -1537,6 +1638,22 @@ impl AppState {
                 id: cron.id,
                 label: format!("{} {}", cron.schedule, cron.command),
                 status: cron.status,
+            })
+            .collect();
+        self.refresh_all_cron_trigger_cards();
+    }
+
+    fn replace_schedules(&mut self, schedules: Vec<ScheduleInfo>) {
+        self.crons = schedules
+            .into_iter()
+            .map(|schedule| CronRow {
+                id: schedule.id.to_string(),
+                label: format!(
+                    "{} {}",
+                    schedule.schedule.display(),
+                    execution_spec_label(&schedule.execution)
+                ),
+                status: schedule.status,
             })
             .collect();
         self.refresh_all_cron_trigger_cards();
@@ -1813,15 +1930,69 @@ impl AppState {
                 let warnings = submission::operator_spacing_warnings(&text);
                 let card_index = submission::precreates_card(&text, self.mode, &warnings)
                     .then(|| self.main_view.push_card(text.clone(), self.mode));
-                let pending =
-                    PendingSubmission::user(card_index, text.clone(), self.mode, warnings);
                 self.input.update(InputMsg::Clear);
 
+                let compiled = match compile_command(&text, self.mode, "<tui>") {
+                    Ok(compiled) => compiled,
+                    Err(error) => {
+                        let pending =
+                            PendingSubmission::user(card_index, text, self.mode, warnings);
+                        self.show_submission_result(
+                            &pending,
+                            format!("Error [syntax]: {error}"),
+                            CardStatus::Error,
+                            None,
+                        );
+                        return;
+                    }
+                };
+
+                let (payload, pending) = match compiled {
+                    CompiledCommand::Daemon(payload) => (
+                        payload,
+                        PendingSubmission::user(card_index, text, self.mode, warnings),
+                    ),
+                    CompiledCommand::Frontend(FrontendAction::Help { topic }) => {
+                        let pending =
+                            PendingSubmission::user(card_index, text, self.mode, warnings);
+                        self.show_submission_result(
+                            &pending,
+                            render_help(topic.as_deref()),
+                            CardStatus::Success,
+                            None,
+                        );
+                        return;
+                    }
+                    CompiledCommand::Frontend(FrontendAction::Clear) => {
+                        self.update(AppMsg::ClearDisplay);
+                        return;
+                    }
+                    CompiledCommand::Frontend(FrontendAction::Quit) => {
+                        self.update(AppMsg::Quit);
+                        return;
+                    }
+                    CompiledCommand::Frontend(FrontendAction::Restart) => {
+                        self.restart_daemon();
+                        return;
+                    }
+                    CompiledCommand::Frontend(FrontendAction::Retry { id }) => (
+                        RequestPayload::GetExecution { id },
+                        PendingSubmission::retry(card_index, text, self.mode, warnings, id),
+                    ),
+                    CompiledCommand::Frontend(FrontendAction::Unsupported { message }) => {
+                        let pending =
+                            PendingSubmission::user(card_index, text, self.mode, warnings);
+                        self.show_submission_result(
+                            &pending,
+                            format!("Error [unsupported]: {message}"),
+                            CardStatus::Error,
+                            None,
+                        );
+                        return;
+                    }
+                };
+
                 if let Some(ref writer) = self.writer {
-                    let payload = RequestPayload::Eval {
-                        input: text.clone(),
-                        mode: self.mode,
-                    };
                     match writer.try_send(payload) {
                         Ok(request_id) => {
                             self.track_pending_submission(request_id, pending);
@@ -1940,6 +2111,150 @@ impl AppState {
                                         None,
                                     );
                                 }
+                            }
+                        }
+                        OkPayload::ExecutionCreated { execution } => {
+                            self.upsert_execution(&execution);
+                            self.sync_sidebar_items();
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                let id = execution.id.to_string();
+                                let card_index = self.show_submission_result(
+                                    pending,
+                                    format_execution_info(&execution),
+                                    status_view::job_card_status(&execution_job_status(
+                                        &execution.state,
+                                    )),
+                                    Some(id.clone()),
+                                );
+                                self.job_cards.insert(id, card_index);
+                            }
+                        }
+                        OkPayload::ExecutionInfo(execution) => {
+                            if let Some(pending) = pending.as_ref()
+                                && let Some(retry_id) = pending.retry_id()
+                            {
+                                if execution.id != retry_id {
+                                    self.show_submission_result(
+                                        pending,
+                                        "Error [protocol]: retry lookup returned another execution"
+                                            .into(),
+                                        CardStatus::Error,
+                                        None,
+                                    );
+                                    return;
+                                }
+                                let mut spec = execution.spec.clone();
+                                spec.retry_of = Some(retry_id);
+                                spec.launch_context.spawn_adapter = None;
+                                let retry_pending = pending.as_user();
+                                let Some(writer) = self.writer.as_ref() else {
+                                    self.show_submission_result(
+                                        &retry_pending,
+                                        "Error [offline]: cued is not connected".into(),
+                                        CardStatus::Error,
+                                        None,
+                                    );
+                                    return;
+                                };
+                                match writer.try_send(RequestPayload::SubmitExecution {
+                                    spec: Box::new(spec),
+                                }) {
+                                    Ok(request_id) => {
+                                        self.track_pending_submission(request_id, retry_pending);
+                                        self.refresh_clear_action();
+                                    }
+                                    Err(error) => {
+                                        self.show_submission_result(
+                                            &retry_pending,
+                                            format!(
+                                                "Error [transport]: failed to submit retry: {error}"
+                                            ),
+                                            CardStatus::Error,
+                                            None,
+                                        );
+                                    }
+                                }
+                                return;
+                            }
+                            self.upsert_execution(&execution);
+                            self.sync_sidebar_items();
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    format_execution_info(&execution),
+                                    status_view::job_card_status(&execution_job_status(
+                                        &execution.state,
+                                    )),
+                                    Some(execution.id.to_string()),
+                                );
+                            }
+                        }
+                        OkPayload::ExecutionList(executions) => {
+                            let count = executions.len();
+                            self.replace_executions(executions);
+                            self.sync_sidebar_items();
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    format!("loaded {count} execution(s) into sidebar"),
+                                    CardStatus::Success,
+                                    None,
+                                );
+                            }
+                        }
+                        OkPayload::ExecutionOutput { id, steps } => {
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    format_execution_output(&steps),
+                                    CardStatus::Success,
+                                    Some(id.to_string()),
+                                );
+                            }
+                        }
+                        OkPayload::ScheduleCreated { schedule } => {
+                            self.upsert_cron(
+                                schedule.id.to_string(),
+                                format!(
+                                    "{} {}",
+                                    schedule.schedule.display(),
+                                    execution_spec_label(&schedule.execution)
+                                ),
+                                schedule.status,
+                            );
+                            self.sync_sidebar_items();
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    schedule.id.to_string(),
+                                    CardStatus::Success,
+                                    Some(schedule.id.to_string()),
+                                );
+                            }
+                        }
+                        OkPayload::ScheduleList(schedules) => {
+                            let count = schedules.len();
+                            self.replace_schedules(schedules);
+                            self.sync_sidebar_items();
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    format!("loaded {count} schedule(s) into sidebar"),
+                                    CardStatus::Success,
+                                    None,
+                                );
                             }
                         }
                         OkPayload::ScriptCreated {
@@ -2266,6 +2581,28 @@ impl AppState {
             }
 
             AppMsg::ServerEvent(event) => match event {
+                EventPayload::ExecutionCreated { execution } => {
+                    self.upsert_execution(&execution);
+                    self.sync_sidebar_items();
+                }
+                EventPayload::ExecutionStateChanged { id, new_state, .. } => {
+                    self.update_job_status(&id.to_string(), execution_job_status(&new_state), None);
+                    self.sync_sidebar_items();
+                }
+                EventPayload::StepStateChanged { .. } => {}
+                EventPayload::ExecutionFinished { execution } => {
+                    self.upsert_execution(&execution);
+                    if let Some(card_index) = self.job_cards.get(&execution.id.to_string()).copied()
+                    {
+                        self.main_view
+                            .set_card_output(card_index, format_execution_info(&execution));
+                        self.main_view.set_card_status(
+                            card_index,
+                            status_view::job_card_status(&execution_job_status(&execution.state)),
+                        );
+                    }
+                    self.sync_sidebar_items();
+                }
                 EventPayload::OutputChunk { id, stream, data } => {
                     self.append_display_output(&id, stream, &data);
                 }
@@ -4615,12 +4952,12 @@ destination = "devbox"
         let mut state = AppState::new();
         let mut server_stream = attach_test_writer(&mut state);
 
-        state.update(AppMsg::Submit(":watch J1".into()));
+        state.update(AppMsg::Submit(":watch E1/S1".into()));
 
         let card = state.main_view.cards.last().expect("visible watch failure");
         assert!(
             card.output
-                .contains(cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+                .contains(cue_core::ipc::IPC_CAPABILITY_EXECUTION_V3)
         );
         assert!(card.output.contains("upgrade/restart cued"));
         assert!(
@@ -4630,7 +4967,7 @@ destination = "devbox"
             )
             .await
             .is_err(),
-            "unsupported :watch must not reach an old daemon"
+            "unsupported typed :watch must not reach an old daemon"
         );
     }
 

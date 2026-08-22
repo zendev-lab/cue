@@ -22,6 +22,10 @@ pub struct ScriptId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ExecutionId(pub u64);
 
+/// Durable trigger sequence number, displayed as T1, T2, ...
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ScheduleId(pub u64);
+
 /// Stable process-step identity within one execution, displayed as E1/S1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StepId {
@@ -85,6 +89,12 @@ impl fmt::Display for ScriptId {
 impl fmt::Display for ExecutionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "E{}", self.0)
+    }
+}
+
+impl fmt::Display for ScheduleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "T{}", self.0)
     }
 }
 
@@ -166,6 +176,14 @@ impl FromStr for ExecutionId {
     }
 }
 
+impl FromStr for ScheduleId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_u64(input, "T", "schedule").map(Self)
+    }
+}
+
 impl FromStr for StepId {
     type Err = ParseIdError;
 
@@ -216,6 +234,7 @@ mod tests {
         assert_eq!(ChainId(7).to_string(), "CH7");
         assert_eq!(ScriptId(9).to_string(), "R9");
         assert_eq!(ExecutionId(11).to_string(), "E11");
+        assert_eq!(ScheduleId(5).to_string(), "T5");
         assert_eq!(
             StepId {
                 execution: ExecutionId(11),
@@ -233,6 +252,7 @@ mod tests {
         assert_eq!("CH7".parse::<ChainId>(), Ok(ChainId(7)));
         assert_eq!("R9".parse::<ScriptId>(), Ok(ScriptId(9)));
         assert_eq!("E11".parse::<ExecutionId>(), Ok(ExecutionId(11)));
+        assert_eq!("T5".parse::<ScheduleId>(), Ok(ScheduleId(5)));
         assert_eq!(
             "E11/S3".parse::<StepId>(),
             Ok(StepId {

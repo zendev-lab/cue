@@ -346,6 +346,23 @@ impl SchedulerState {
             .map(|session| session.scope)
     }
 
+    fn client_binding(&self, client_id: u64) -> Option<SessionBinding> {
+        let key = self.client_sessions.get(&client_id)?;
+        let session = self.sessions.get(key)?;
+        let named_session_id = session.named.as_ref().map(|named| named.id.clone());
+        let session_id = named_session_id
+            .clone()
+            .unwrap_or_else(|| key.strip_prefix("ephemeral:").unwrap_or(key).to_string());
+        Some(SessionBinding {
+            session_id,
+            named_session_id,
+            scope: session.scope,
+            incarnation: session.incarnation,
+            pty_default: session.defaults.pty,
+            wrapper_default: session.defaults.wrapper_enabled,
+        })
+    }
+
     fn named_session_id_for_client(&self, client_id: u64) -> Option<&str> {
         self.session_for_client(client_id)
             .and_then(|session| session.named.as_ref())
@@ -559,11 +576,10 @@ fn scheduler_is_idle_for_restart(state: &SchedulerState) -> bool {
 /// Restore durable Scheduler state and spawn the actor task.
 pub(super) async fn spawn(
     mut rx: mpsc::Receiver<SchedulerMsg>,
-    conn: Connection,
+    db: storage::SharedConnection,
     sys: ActorSystem,
     lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> anyhow::Result<()> {
-    let db = storage::shared_connection(conn);
     let config = sys.config.clone();
     let mut state = SchedulerState::new();
     restore_named_sessions(&db, &mut state).await?;
@@ -679,6 +695,23 @@ pub(super) async fn spawn(
 
                         SchedulerMsg::Disconnect { client_id } => {
                             disconnect_session(client_id, &mut state);
+                        }
+
+                        SchedulerMsg::CurrentBinding { client_id, reply } => {
+                            let _ = reply.send(state.client_binding(client_id));
+                        }
+
+                        SchedulerMsg::ApplyScopeDelta { client_id, base, delta, reply } => {
+                            let response = apply_typed_scope_delta(
+                                client_id,
+                                base,
+                                delta,
+                                &mut state,
+                                &db,
+                                &sys,
+                            )
+                            .await;
+                            let _ = reply.send(response);
                         }
 
                         SchedulerMsg::ScriptInfo { client_id, request_id, id } => {
@@ -1484,6 +1517,8 @@ async fn connect_session(
         }
         let scope = session.scope;
         let incarnation = session.incarnation;
+        let pty_default = session.defaults.pty;
+        let wrapper_default = session.defaults.wrapper_enabled;
         state.client_sessions.insert(client_id, session_id.clone());
         mark_replaced_session_disconnected(state, old_session_id, &session_id);
         return Ok(SessionBinding {
@@ -1491,6 +1526,8 @@ async fn connect_session(
             named_session_id: None,
             scope,
             incarnation,
+            pty_default,
+            wrapper_default,
         });
     }
 
@@ -1515,6 +1552,8 @@ async fn connect_session(
         named_session_id: None,
         scope: hash,
         incarnation,
+        pty_default: None,
+        wrapper_default: None,
     })
 }
 
@@ -2045,6 +2084,8 @@ fn bind_client_to_ready_session(
     let named_id = target.named.as_ref()?.id.clone();
     let scope = target.scope;
     let incarnation = target.incarnation;
+    let pty_default = target.defaults.pty;
+    let wrapper_default = target.defaults.wrapper_enabled;
     state.client_sessions.insert(client_id, key.to_string());
     mark_replaced_session_disconnected(state, old_session_id, key);
     Some(SessionBinding {
@@ -2052,6 +2093,8 @@ fn bind_client_to_ready_session(
         named_session_id: Some(named_id),
         scope,
         incarnation,
+        pty_default,
+        wrapper_default,
     })
 }
 
@@ -2110,6 +2153,43 @@ async fn update_client_session_scope(
     session.scope = scope;
     session.named = Some(meta);
     Ok(())
+}
+
+async fn apply_typed_scope_delta(
+    client_id: u64,
+    requested_base: Option<ScopeHash>,
+    delta: cue_core::scope::EnvDelta,
+    state: &mut SchedulerState,
+    db: &storage::SharedConnection,
+    sys: &ActorSystem,
+) -> ResponsePayload {
+    let Some(current_scope) = state.client_scope(client_id) else {
+        return ResponsePayload::err(
+            error_code::INVALID_REQUEST,
+            "client session handshake required",
+        );
+    };
+    let base = requested_base.unwrap_or(current_scope);
+    let before = match get_scope_snapshot_by_hash(sys, base).await {
+        Ok(snapshot) => snapshot,
+        Err(message) => return ResponsePayload::err(error_code::NOT_FOUND, message),
+    };
+    let hash = match derive_scope(sys, base, delta).await {
+        Ok(hash) => hash,
+        Err(message) => return ResponsePayload::err(error_code::INTERNAL, message),
+    };
+    if requested_base.is_none()
+        && let Err(error) = update_client_session_scope(state, client_id, hash, db).await
+    {
+        return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+    }
+    match get_scope_snapshot_by_hash(sys, hash).await {
+        Ok(after) => ResponsePayload::Ok(OkPayload::ScopeCreated {
+            hash: hash.to_string(),
+            summary: format_scope_change_summary(hash, &before, &after),
+        }),
+        Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
+    }
 }
 
 fn named_session_list(
@@ -2726,7 +2806,7 @@ async fn spawn_process_job(
             job_id,
             plan,
             scope_hash,
-            options,
+            options: Box::new(options),
         })
         .await
         .map_err(|_| "process_mgr unreachable".to_string())
@@ -2969,6 +3049,7 @@ impl ProcessJobContext {
             direct_output_client: self.direct_output_client,
             session_id,
             spawn_adapter: None,
+            execution_step: None,
         }
     }
 
@@ -5341,6 +5422,7 @@ async fn handle_command_with_scope(
                         client_id,
                         job_id,
                         role,
+                        legacy_snapshot_event: true,
                         reply: tx,
                     })
                     .await
@@ -7168,6 +7250,8 @@ mod tests {
         let sys = ActorSystem {
             gateway: gw_tx,
             scheduler: sched_tx,
+            execution: mpsc::channel(1).0,
+            triggers: mpsc::channel(1).0,
             process_mgr: pm_tx,
             scope_store: ss_tx,
             event_bus: eb_tx,
@@ -7606,6 +7690,7 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
+                    execution_step: None,
                 },
                 needs: Need::new(),
             },

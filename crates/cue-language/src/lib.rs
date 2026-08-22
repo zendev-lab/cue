@@ -6,6 +6,7 @@
 mod assistance;
 mod ast;
 pub mod command_spec;
+mod compiler;
 mod completion;
 mod duration;
 mod parse;
@@ -16,6 +17,9 @@ mod tokenizer;
 use cue_core::mode::Mode;
 
 pub use assistance::{complete_input, highlight_input};
+pub use compiler::{
+    CompileError, CompiledCommand, FrontendAction, compile_command, compile_file, render_help,
+};
 pub use completion::{CompletionScope, completion_candidates, completion_replacement};
 pub use parse::ParseError;
 pub use parse::ParseErrorKind;

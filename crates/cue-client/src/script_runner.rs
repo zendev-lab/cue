@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use crate::{CuedClient, ResolvedTransport, connect_ssh_transport, load_transport_config};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use cue_core::ipc::{EventPayload, Message, OkPayload, ResponsePayload, Stream};
+use cue_core::execution::{ExecutionState, StepFailure, StepState};
+use cue_core::ipc::{EventPayload, ExecutionInfo, Message, OkPayload, ResponsePayload, Stream};
 
 use crate::daemon_lifecycle::{
     check_local_daemon_version, ensure_daemon_running, version_from_ping,
@@ -123,39 +124,30 @@ async fn connect_for_script() -> Result<CuedClient> {
 }
 
 async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Result<i32> {
-    let request_id = client.run_script(path, input).await?;
-    let mut script_id: Option<String> = None;
-    let mut pending_finished: Vec<(String, i32)> = Vec::new();
+    let spec = cue_language::compile_file(input, path)
+        .with_context(|| format!("compile .cue script `{path}`"))?;
+    let submit_id = client.submit_execution(spec).await?;
+    let mut wait_id = None;
 
     loop {
         match client.recv().await? {
-            Message::Response { id, payload } if id == request_id => match payload {
-                ResponsePayload::Ok(OkPayload::ScriptCreated {
-                    script_id: created,
-                    items: _,
-                    submit_error,
-                    ..
-                }) => {
-                    script_id = Some(created.clone());
-                    if let Some((_, exit_code)) = pending_finished
-                        .iter()
-                        .find(|(finished, _)| finished == &created)
-                    {
-                        return Ok(*exit_code);
-                    }
-                    if let Some(error) = submit_error {
-                        bail!(
-                            "script {created} submission failed at item {} [{}]: {}",
-                            error.index,
-                            error.code,
-                            error.message
-                        );
-                    }
+            Message::Response { id, payload } if id == submit_id => match payload {
+                ResponsePayload::Ok(OkPayload::ExecutionCreated { execution }) => {
+                    wait_id = Some(client.wait_execution(execution.id).await?);
                 }
                 ResponsePayload::Err { code, message } => {
                     bail!("cue run failed [{code}]: {message}");
                 }
                 other => bail!("unexpected cue run response: {other:?}"),
+            },
+            Message::Response { id, payload } if wait_id == Some(id) => match payload {
+                ResponsePayload::Ok(OkPayload::ExecutionInfo(execution)) => {
+                    return Ok(execution_exit_code(&execution));
+                }
+                ResponsePayload::Err { code, message } => {
+                    bail!("cue run wait failed [{code}]: {message}");
+                }
+                other => bail!("unexpected cue run wait response: {other:?}"),
             },
             Message::Response { .. } => {}
             Message::Request { .. } => {
@@ -169,19 +161,28 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                     let bytes = decode_binary_output_chunk(&base64)?;
                     write_stream(stream, &bytes)?;
                 }
-                EventPayload::ScriptFinished {
-                    script_id: finished,
-                    exit_code,
-                    ..
-                } => {
-                    if script_id.as_deref() == Some(finished.as_str()) {
-                        return Ok(exit_code);
-                    }
-                    pending_finished.push((finished, exit_code));
-                }
                 _ => {}
             },
         }
+    }
+}
+
+fn execution_exit_code(execution: &ExecutionInfo) -> i32 {
+    match execution.state {
+        ExecutionState::Succeeded => 0,
+        ExecutionState::Failed => execution
+            .steps
+            .iter()
+            .find_map(|step| match &step.state {
+                StepState::Failed {
+                    failure: StepFailure::Exit { code },
+                } => Some(*code),
+                StepState::Failed { .. } => Some(1),
+                _ => None,
+            })
+            .unwrap_or(1),
+        ExecutionState::Cancelled { .. } => 130,
+        ExecutionState::Queued | ExecutionState::Running => 1,
     }
 }
 
@@ -202,9 +203,10 @@ fn decode_binary_output_chunk(base64: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cue_core::ExecutionId;
+    use cue_core::execution::{ExecutionPlan, ExecutionSpec, LaunchContext};
     use cue_core::ipc::{
-        MAX_MESSAGE_SIZE, RequestPayload, ScriptRunStatus, ScriptSource, SessionInfo,
-        SessionScopeState, encode_message,
+        MAX_MESSAGE_SIZE, RequestPayload, SessionInfo, SessionScopeState, encode_message,
     };
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -236,6 +238,23 @@ mod tests {
             .write_all(&encoded)
             .await
             .expect("write test message");
+    }
+
+    fn execution_info(id: ExecutionId, state: ExecutionState) -> ExecutionInfo {
+        ExecutionInfo {
+            id,
+            state,
+            steps: Vec::new(),
+            spec: ExecutionSpec {
+                plan: ExecutionPlan::pipeline(cue_core::pipeline::Pipeline::simple(vec![
+                    "true".into(),
+                ])),
+                start_scope: None,
+                launch_context: LaunchContext::default(),
+                source: None,
+                retry_of: None,
+            },
+        }
     }
 
     #[test]
@@ -289,7 +308,7 @@ mod tests {
             run_in_session_with_client(
                 &mut client,
                 "shared.cue",
-                ":help\n",
+                "echo shared\n",
                 Some("shared-bench".into()),
                 false,
             )
@@ -306,7 +325,7 @@ mod tests {
                 assert!(!refresh);
                 id
             }
-            other => panic!("expected AttachSession before RunScript, got {other:?}"),
+            other => panic!("expected AttachSession before SubmitExecution, got {other:?}"),
         };
         write_test_message(
             &mut server_stream,
@@ -328,42 +347,47 @@ mod tests {
         )
         .await;
 
-        let run_id = match read_test_message(&mut server_stream).await {
+        let submit_id = match read_test_message(&mut server_stream).await {
             Message::Request {
                 id,
-                payload: RequestPayload::RunScript { path, input },
+                payload: RequestPayload::SubmitExecution { spec },
                 ..
             } => {
-                assert_eq!(path, "shared.cue");
-                assert_eq!(input, ":help\n");
+                assert_eq!(spec.source.as_ref().unwrap().name, "shared.cue");
                 id
             }
-            other => panic!("expected RunScript after attach confirmation, got {other:?}"),
+            other => panic!("expected SubmitExecution after attach confirmation, got {other:?}"),
         };
+        let execution_id = ExecutionId(1);
         write_test_message(
             &mut server_stream,
             Message::Response {
-                id: run_id,
-                payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
-                    script_id: "R1".into(),
-                    source: ScriptSource::File {
-                        path: "shared.cue".into(),
-                    },
-                    items: vec![],
-                    submit_error: None,
+                id: submit_id,
+                payload: ResponsePayload::Ok(OkPayload::ExecutionCreated {
+                    execution: Box::new(execution_info(execution_id, ExecutionState::Running)),
                 }),
             },
         )
         .await;
+        let wait_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::WaitExecution { id: requested },
+                ..
+            } => {
+                assert_eq!(requested, execution_id);
+                id
+            }
+            other => panic!("expected WaitExecution, got {other:?}"),
+        };
         write_test_message(
             &mut server_stream,
-            Message::Event {
-                payload: EventPayload::ScriptFinished {
-                    script_id: "R1".into(),
-                    status: ScriptRunStatus::Done,
-                    exit_code: 0,
-                    failed_item_index: None,
-                },
+            Message::Response {
+                id: wait_id,
+                payload: ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(execution_info(
+                    execution_id,
+                    ExecutionState::Succeeded,
+                )))),
             },
         )
         .await;
@@ -421,33 +445,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_with_client_uses_direct_script_finished_without_jobs_subscription() {
+    async fn run_with_client_uses_typed_wait_without_event_subscription() {
         let (client_stream, mut server_stream) = tokio::io::duplex(4096);
         let mut client = CuedClient::from_stream(client_stream);
         let runner =
-            tokio::spawn(async move { run_with_client(&mut client, "fast.cue", ":help\n").await });
+            tokio::spawn(
+                async move { run_with_client(&mut client, "fast.cue", "echo fast\n").await },
+            );
 
         match read_test_message(&mut server_stream).await {
             Message::Request {
                 id,
-                payload: RequestPayload::RunScript { path, input },
+                payload: RequestPayload::SubmitExecution { spec },
                 ..
             } => {
                 assert_eq!(id, 1);
-                assert_eq!(path, "fast.cue");
-                assert_eq!(input, ":help\n");
+                assert_eq!(spec.source.as_ref().unwrap().name, "fast.cue");
             }
-            other => panic!("expected first request to be RunScript, got {other:?}"),
+            other => panic!("expected first request to be SubmitExecution, got {other:?}"),
         }
 
+        let execution_id = ExecutionId(7);
         write_test_message(
             &mut server_stream,
             Message::Event {
-                payload: EventPayload::ScriptFinished {
-                    script_id: "R1".into(),
-                    status: ScriptRunStatus::Done,
-                    exit_code: 0,
-                    failed_item_index: None,
+                payload: EventPayload::OutputChunk {
+                    id: "E7/S1".into(),
+                    stream: Stream::Stdout,
+                    data: "fast\n".into(),
                 },
             },
         )
@@ -456,14 +481,31 @@ mod tests {
             &mut server_stream,
             Message::Response {
                 id: 1,
-                payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
-                    script_id: "R1".into(),
-                    source: ScriptSource::File {
-                        path: "fast.cue".into(),
-                    },
-                    items: vec![],
-                    submit_error: None,
+                payload: ResponsePayload::Ok(OkPayload::ExecutionCreated {
+                    execution: Box::new(execution_info(execution_id, ExecutionState::Succeeded)),
                 }),
+            },
+        )
+        .await;
+        let wait_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::WaitExecution { id: requested },
+                ..
+            } => {
+                assert_eq!(requested, execution_id);
+                id
+            }
+            other => panic!("expected WaitExecution, got {other:?}"),
+        };
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: wait_id,
+                payload: ResponsePayload::Ok(OkPayload::ExecutionInfo(Box::new(execution_info(
+                    execution_id,
+                    ExecutionState::Succeeded,
+                )))),
             },
         )
         .await;

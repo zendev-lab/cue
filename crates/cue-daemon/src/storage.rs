@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use cue_core::cron::CronStatus;
+use cue_core::cron::{CronSchedule, CronStatus};
+use cue_core::execution::{ExecutionSnapshot, ExecutionSpec};
+use cue_core::ipc::ExecutionStepInfo;
 use cue_core::job::JobStatus;
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
-use cue_core::{CronId, JobId, ScopeHash, ScriptId};
+use cue_core::{CronId, JobId, ScheduleId, ScopeHash, ScriptId};
 use rusqlite::Connection;
 
 pub type SharedConnection = Arc<Mutex<Connection>>;
@@ -39,7 +41,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -139,6 +141,42 @@ CREATE TABLE IF NOT EXISTS sessions (
     scope_hash          BLOB REFERENCES scopes(hash),
     pty_default         INTEGER,
     wrapper_enabled     INTEGER,
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
+";
+
+const MIGRATION_V19: &str = r"
+CREATE TABLE IF NOT EXISTS executions (
+    id                INTEGER PRIMARY KEY,
+    snapshot_json     TEXT NOT NULL,
+    current_scope     BLOB NOT NULL,
+    session_id        TEXT,
+    pty_default       INTEGER NOT NULL,
+    wrapper_default   INTEGER NOT NULL,
+    adapter_required  INTEGER NOT NULL DEFAULT 0,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_steps (
+    execution_id  INTEGER NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+    step_index    INTEGER NOT NULL,
+    state_json    TEXT NOT NULL,
+    pipeline      TEXT NOT NULL,
+    PRIMARY KEY (execution_id, step_index)
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id                  INTEGER PRIMARY KEY,
+    schedule_json       TEXT NOT NULL,
+    execution_json      TEXT NOT NULL,
+    status_json         TEXT NOT NULL,
+    next_trigger_at_ms  INTEGER,
+    scope_hash          BLOB NOT NULL,
+    session_id          TEXT,
+    pty_default         INTEGER NOT NULL,
+    wrapper_default     INTEGER NOT NULL,
     created_at_ms       INTEGER NOT NULL,
     updated_at_ms       INTEGER NOT NULL
 );
@@ -328,6 +366,11 @@ fn migrate(conn: &Connection) -> Result<()> {
                 .context("failed to add sessions.archived_at_ms")?;
         }
         set_schema_version(conn, &mut current, 18)?;
+    }
+    if current < 19 {
+        conn.execute_batch(MIGRATION_V19)
+            .context("failed to run schema migration v19")?;
+        set_schema_version(conn, &mut current, 19)?;
     }
     Ok(())
 }
@@ -829,6 +872,228 @@ pub struct StoredSession {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub archived_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredExecution {
+    pub snapshot: ExecutionSnapshot,
+    pub current_scope: ScopeHash,
+    pub session_id: Option<String>,
+    pub pty_default: bool,
+    pub wrapper_default: bool,
+    pub adapter_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSchedule {
+    pub id: ScheduleId,
+    pub schedule: CronSchedule,
+    pub execution: ExecutionSpec,
+    pub status: CronStatus,
+    pub next_trigger_at_ms: Option<i64>,
+    pub scope_hash: ScopeHash,
+    pub session_id: Option<String>,
+    pub pty_default: bool,
+    pub wrapper_default: bool,
+}
+
+pub fn store_execution(
+    conn: &Connection,
+    execution: &StoredExecution,
+    steps: &[ExecutionStepInfo],
+) -> Result<()> {
+    let id = sqlite_id(execution.snapshot.id.0, "execution")?;
+    let mut durable_snapshot = execution.snapshot.clone();
+    durable_snapshot.spec.launch_context.spawn_adapter = None;
+    let snapshot_json = serde_json::to_string(&durable_snapshot)?;
+    let now = unix_time_ms()?;
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin execution projection transaction")?;
+    tx.execute(
+        "INSERT INTO executions (
+             id, snapshot_json, current_scope, session_id, pty_default,
+             wrapper_default, adapter_required, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+             snapshot_json = excluded.snapshot_json,
+             current_scope = excluded.current_scope,
+             session_id = excluded.session_id,
+             pty_default = excluded.pty_default,
+             wrapper_default = excluded.wrapper_default,
+             adapter_required = excluded.adapter_required,
+             updated_at_ms = excluded.updated_at_ms",
+        rusqlite::params![
+            id,
+            snapshot_json,
+            execution.current_scope.0.as_slice(),
+            execution.session_id,
+            execution.pty_default,
+            execution.wrapper_default,
+            execution.adapter_required,
+            now,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM execution_steps WHERE execution_id = ?1",
+        rusqlite::params![id],
+    )?;
+    for step in steps {
+        let index = i64::from(step.id.index);
+        tx.execute(
+            "INSERT INTO execution_steps (
+                 execution_id, step_index, state_json, pipeline
+             ) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                id,
+                index,
+                serde_json::to_string(&step.state)?,
+                step.pipeline,
+            ],
+        )?;
+    }
+    tx.commit().context("commit execution projection")?;
+    Ok(())
+}
+
+pub fn load_executions(conn: &Connection) -> Result<Vec<StoredExecution>> {
+    let mut statement = conn.prepare(
+        "SELECT snapshot_json, current_scope, session_id, pty_default,
+                wrapper_default, adapter_required
+         FROM executions ORDER BY id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, bool>(4)?,
+            row.get::<_, bool>(5)?,
+        ))
+    })?;
+    let mut executions = Vec::new();
+    for row in rows {
+        let (snapshot_json, scope, session_id, pty_default, wrapper_default, adapter_required) =
+            row?;
+        executions.push(StoredExecution {
+            snapshot: serde_json::from_str(&snapshot_json).context("corrupt execution snapshot")?,
+            current_scope: blob_to_scope_hash(&scope)?,
+            session_id,
+            pty_default,
+            wrapper_default,
+            adapter_required,
+        });
+    }
+    Ok(executions)
+}
+
+pub fn store_schedule(conn: &Connection, schedule: &StoredSchedule) -> Result<()> {
+    if schedule.execution.launch_context.spawn_adapter.is_some() {
+        return Err(anyhow!(
+            "scheduled executions cannot persist an ephemeral spawn adapter"
+        ));
+    }
+    let id = sqlite_id(schedule.id.0, "schedule")?;
+    let now = unix_time_ms()?;
+    conn.execute(
+        "INSERT INTO schedules (
+             id, schedule_json, execution_json, status_json,
+             next_trigger_at_ms, scope_hash, session_id, pty_default,
+             wrapper_default, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             schedule_json = excluded.schedule_json,
+             execution_json = excluded.execution_json,
+             status_json = excluded.status_json,
+             next_trigger_at_ms = excluded.next_trigger_at_ms,
+             scope_hash = excluded.scope_hash,
+             session_id = excluded.session_id,
+             pty_default = excluded.pty_default,
+             wrapper_default = excluded.wrapper_default,
+             updated_at_ms = excluded.updated_at_ms",
+        rusqlite::params![
+            id,
+            serde_json::to_string(&schedule.schedule)?,
+            serde_json::to_string(&schedule.execution)?,
+            serde_json::to_string(&schedule.status)?,
+            schedule.next_trigger_at_ms,
+            schedule.scope_hash.0.as_slice(),
+            schedule.session_id,
+            schedule.pty_default,
+            schedule.wrapper_default,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_schedules(conn: &Connection) -> Result<Vec<StoredSchedule>> {
+    let mut statement = conn.prepare(
+        "SELECT id, schedule_json, execution_json, status_json,
+                next_trigger_at_ms, scope_hash, session_id, pty_default,
+                wrapper_default
+         FROM schedules ORDER BY id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, bool>(7)?,
+            row.get::<_, bool>(8)?,
+        ))
+    })?;
+    let mut schedules = Vec::new();
+    for row in rows {
+        let (
+            id,
+            schedule_json,
+            execution_json,
+            status_json,
+            next_trigger_at_ms,
+            scope_hash,
+            session_id,
+            pty_default,
+            wrapper_default,
+        ) = row?;
+        schedules.push(StoredSchedule {
+            id: ScheduleId(u64::try_from(id).context("negative schedule id")?),
+            schedule: serde_json::from_str(&schedule_json).context("corrupt schedule")?,
+            execution: serde_json::from_str(&execution_json)
+                .context("corrupt scheduled execution")?,
+            status: serde_json::from_str(&status_json).context("corrupt schedule status")?,
+            next_trigger_at_ms,
+            scope_hash: blob_to_scope_hash(&scope_hash)?,
+            session_id,
+            pty_default,
+            wrapper_default,
+        });
+    }
+    Ok(schedules)
+}
+
+pub fn remove_schedule(conn: &Connection, id: ScheduleId) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM schedules WHERE id = ?1",
+        rusqlite::params![sqlite_id(id.0, "schedule")?],
+    )? > 0)
+}
+
+fn sqlite_id(value: u64, kind: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{kind} id exceeds SQLite integer range"))
+}
+
+fn unix_time_ms() -> Result<i64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates Unix epoch")?
+        .as_millis();
+    i64::try_from(millis).context("system clock exceeds SQLite integer range")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1499,8 +1764,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
+    use cue_core::execution::{Execution, ExecutionPlan, ExecutionSpec, StepState};
+    use cue_core::ipc::ExecutionStepInfo;
     use cue_core::job::CancelReason;
+    use cue_core::pipeline::Pipeline;
     use cue_core::scope::{EnvDelta, EnvSnapshot};
+    use cue_core::spawn_adapter::{SecretToken, SpawnAdapterHandle};
+    use cue_core::{ExecutionId, StepId};
 
     use super::*;
 
@@ -1544,6 +1814,104 @@ mod tests {
             ScopePersistence::Persisted
         );
         scope.hash
+    }
+
+    fn typed_execution_spec(command: &str) -> ExecutionSpec {
+        ExecutionSpec {
+            plan: ExecutionPlan::pipeline(Pipeline::simple(vec![command.into()])),
+            start_scope: None,
+            launch_context: Default::default(),
+            source: None,
+            retry_of: None,
+        }
+    }
+
+    #[test]
+    fn execution_projection_roundtrips_without_ephemeral_adapter() {
+        let conn = in_memory_db();
+        let id = ExecutionId(7);
+        let mut spec = typed_execution_spec("true");
+        spec.launch_context.spawn_adapter = Some(SpawnAdapterHandle {
+            endpoint: PathBuf::from("/tmp/cue/adapters/test.sock"),
+            token: SecretToken::new("never-persist-this-token"),
+        });
+        let execution = Execution::new(id, spec).expect("valid execution");
+        let stored = StoredExecution {
+            snapshot: execution.snapshot(),
+            current_scope: ScopeHash([9; 32]),
+            session_id: Some("SS-test".into()),
+            pty_default: false,
+            wrapper_default: true,
+            adapter_required: true,
+        };
+        let steps = vec![ExecutionStepInfo {
+            id: StepId {
+                execution: id,
+                index: 1,
+            },
+            state: StepState::Queued,
+            pipeline: "true".into(),
+        }];
+
+        store_execution(&conn, &stored, &steps).expect("store execution");
+        let loaded = load_executions(&conn).expect("load executions");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].snapshot.id, id);
+        assert!(
+            loaded[0]
+                .snapshot
+                .spec
+                .launch_context
+                .spawn_adapter
+                .is_none()
+        );
+        assert!(loaded[0].adapter_required);
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM execution_steps WHERE execution_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count step projections");
+        assert_eq!(step_count, 1);
+        let persisted: String = conn
+            .query_row(
+                "SELECT snapshot_json FROM executions WHERE id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read persisted snapshot");
+        assert!(!persisted.contains("never-persist-this-token"));
+    }
+
+    #[test]
+    fn schedule_projection_roundtrips_and_rejects_ephemeral_adapter() {
+        let conn = in_memory_db();
+        let mut schedule = StoredSchedule {
+            id: ScheduleId(4),
+            schedule: CronSchedule::Delay(Duration::from_secs(5)),
+            execution: typed_execution_spec("echo"),
+            status: CronStatus::Scheduled,
+            next_trigger_at_ms: Some(1234),
+            scope_hash: ScopeHash([4; 32]),
+            session_id: Some("SS-scheduled".into()),
+            pty_default: true,
+            wrapper_default: false,
+        };
+
+        store_schedule(&conn, &schedule).expect("store schedule");
+        assert_eq!(
+            load_schedules(&conn).expect("load schedules"),
+            vec![schedule.clone()]
+        );
+
+        schedule.execution.launch_context.spawn_adapter = Some(SpawnAdapterHandle {
+            endpoint: PathBuf::from("/tmp/cue/adapters/test.sock"),
+            token: SecretToken::new("token"),
+        });
+        let error = store_schedule(&conn, &schedule).expect_err("adapter must stay ephemeral");
+        assert!(error.to_string().contains("cannot persist"));
     }
 
     #[test]
