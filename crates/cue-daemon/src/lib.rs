@@ -16,6 +16,7 @@ mod ring_buffer;
 mod runtime_env;
 mod sandbox;
 mod service;
+mod spawn_adapter;
 mod storage;
 mod upgrade;
 mod word_expansion;

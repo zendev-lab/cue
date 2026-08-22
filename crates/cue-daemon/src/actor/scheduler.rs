@@ -2968,6 +2968,7 @@ impl ProcessJobContext {
             pty_enabled: self.launch.pty.unwrap_or(self.pty_default),
             direct_output_client: self.direct_output_client,
             session_id,
+            spawn_adapter: None,
         }
     }
 
@@ -7604,6 +7605,7 @@ mod tests {
                     pty_enabled: false,
                     direct_output_client: None,
                     session_id: None,
+                    spawn_adapter: None,
                 },
                 needs: Need::new(),
             },

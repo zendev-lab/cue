@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -24,11 +25,12 @@ use cue_core::job::{EXIT_CODE_UNAVAILABLE, JobStatus};
 use cue_core::pipeline::{JobPlan, command_prefers_foreground};
 use cue_core::process_status::exit_code_from_status;
 use cue_core::scope::EnvSnapshot;
+use cue_core::spawn_adapter::{SpawnAdapterRequest, SpawnResult};
 use cue_core::{EventChannel, JobId};
 
 use super::{
     ActorSystem, ForegroundRoleUpdate, OutputSnapshot, ProcessJobOptions, ProcessMgrMsg,
-    SchedulerMsg, ScopeStoreMsg, StderrSnapshot,
+    ProcessSpawnAdapter, SchedulerMsg, ScopeStoreMsg, StderrSnapshot,
     publish_session_event as publish_actor_session_event,
     publish_session_event_except as publish_actor_session_event_except,
     send_gateway_event as send_actor_gateway_event,
@@ -211,6 +213,7 @@ const PIPELINE_CHUNK_CAP: usize = 64;
 
 struct NativePipelineSpawn {
     children: Vec<tokio::process::Child>,
+    settlements: Vec<Option<PreparedAdapterSettlement>>,
     input: Option<JobInput>,
     stdout_sources: Vec<tokio::process::ChildStdout>,
     stderr_sources: Vec<tokio::process::ChildStderr>,
@@ -220,7 +223,17 @@ struct NativePipelineOptions<'a> {
     cwd_override: Option<&'a Path>,
     sandbox: Option<&'a crate::sandbox::PreparedSandbox>,
     wrapper_enabled: bool,
+    spawn_adapter: Option<&'a ProcessSpawnAdapter>,
     capture_stdin: bool,
+    sys: &'a ActorSystem,
+}
+
+struct PrepareSpawnOptions<'a> {
+    snapshot: &'a EnvSnapshot,
+    cwd_override: Option<&'a Path>,
+    workspace_view: Option<&'a crate::sandbox::PreparedSandbox>,
+    wrapper_enabled: bool,
+    spawn_adapter: Option<&'a ProcessSpawnAdapter>,
     sys: &'a ActorSystem,
 }
 
@@ -275,12 +288,14 @@ struct PtyReaderTask {
     log_file: Option<std::fs::File>,
     kill_rx: mpsc::Receiver<()>,
     ring: Arc<Mutex<RingBuffer>>,
+    settlement: Option<PreparedAdapterSettlement>,
     runtime: ProcessTaskRuntime,
 }
 
 struct PipelineReaderTask {
     job_id: JobId,
     children: Vec<tokio::process::Child>,
+    settlements: Vec<Option<PreparedAdapterSettlement>>,
     sandbox: Option<crate::sandbox::PreparedSandbox>,
     stdout_sources: Vec<tokio::process::ChildStdout>,
     stderr_sources: Vec<tokio::process::ChildStderr>,
@@ -612,6 +627,19 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
 
                     clear_job_logs(job_id).await;
+
+                    if effective_options.spawn_adapter.is_some()
+                        && !matches!(plan, JobPlan::Pipeline(_))
+                    {
+                        error!(%job_id, "process_mgr: spawn adapters require one pipeline step");
+                        fail_pending_spawn(
+                            &sys,
+                            job_id,
+                            effective_options.session_id.as_deref(),
+                        )
+                        .await;
+                        continue;
+                    }
 
                     let entry = spawn_job_plan(
                         job_id,
@@ -1045,6 +1073,36 @@ struct PreparedSpawn {
     program: String,
     args: Vec<String>,
     command: tokio::process::Command,
+    settlement: Option<PreparedAdapterSettlement>,
+}
+
+struct PreparedAdapterSettlement {
+    client: crate::spawn_adapter::SpawnAdapterClient,
+    token: cue_core::SecretToken,
+    execution_id: cue_core::ExecutionId,
+    step_id: cue_core::StepId,
+    segment_index: u32,
+}
+
+impl PreparedAdapterSettlement {
+    async fn settle(
+        &self,
+        result: SpawnResult,
+        diagnostic_tail: String,
+        diagnostic_truncated: bool,
+    ) -> Result<(), crate::spawn_adapter::SpawnAdapterError> {
+        self.client
+            .settle(SpawnAdapterRequest::Settle {
+                token: self.token.clone(),
+                execution_id: self.execution_id,
+                step_id: self.step_id,
+                segment_index: self.segment_index,
+                result,
+                diagnostic_tail,
+                diagnostic_truncated,
+            })
+            .await
+    }
 }
 
 fn expand_pipeline_segments(
@@ -1106,19 +1164,16 @@ fn configure_command(
 /// children require different file descriptors, but argv, workspace view,
 /// wrapper application, environment, cwd, and kill-on-drop semantics must all
 /// pass through this function before `spawn`.
-fn prepare_spawn(
+async fn prepare_spawn(
     segment: &ExpandedSegment,
-    snapshot: &EnvSnapshot,
-    cwd_override: Option<&Path>,
-    workspace_view: Option<&crate::sandbox::PreparedSandbox>,
-    wrapper_enabled: bool,
-    sys: &ActorSystem,
-) -> PreparedSpawn {
+    segment_index: usize,
+    options: PrepareSpawnOptions<'_>,
+) -> Result<PreparedSpawn, crate::spawn_adapter::SpawnAdapterError> {
     let mut program = segment.program.clone();
     let mut args = segment.args.clone();
 
-    if wrapper_enabled {
-        let wrapper = &sys.config.wrapper;
+    if options.wrapper_enabled {
+        let wrapper = &options.sys.config.wrapper;
         let is_foreground = command_prefers_foreground(&segment.command_line);
         if wrapper.should_wrap(&program, is_foreground, Some(true)) {
             let mut wrapped_args = Vec::with_capacity(1 + args.len());
@@ -1129,21 +1184,54 @@ fn prepare_spawn(
         }
     }
 
+    let settlement = if let Some(adapter) = options.spawn_adapter {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(program);
+        argv.extend(args);
+        let client = crate::spawn_adapter::SpawnAdapterClient::new(adapter.handle.clone());
+        let prepared = client
+            .prepare(SpawnAdapterRequest::Prepare {
+                token: adapter.handle.token.clone(),
+                execution_id: adapter.execution_id,
+                step_id: adapter.step_id,
+                segment_index: segment_index as u32,
+                argv,
+                cwd: effective_cwd_path(
+                    options.snapshot,
+                    options.cwd_override,
+                    options.workspace_view,
+                ),
+            })
+            .await?;
+        program = prepared[0].clone();
+        args = prepared[1..].to_vec();
+        Some(PreparedAdapterSettlement {
+            client,
+            token: adapter.handle.token.clone(),
+            execution_id: adapter.execution_id,
+            step_id: adapter.step_id,
+            segment_index: segment_index as u32,
+        })
+    } else {
+        None
+    };
+
     let mut command = tokio::process::Command::new(&program);
     command.args(&args);
     configure_command(
         &mut command,
-        snapshot,
+        options.snapshot,
         &segment.env,
-        cwd_override,
-        workspace_view,
+        options.cwd_override,
+        options.workspace_view,
     );
 
-    PreparedSpawn {
+    Ok(PreparedSpawn {
         program,
         args,
         command,
-    }
+        settlement,
+    })
 }
 
 #[cfg(unix)]
@@ -1354,41 +1442,59 @@ async fn spawn_single_pipe_job(
         program,
         args,
         command: mut cmd,
+        settlement,
     } = prepare_spawn(
         &segments[0],
-        snapshot,
-        options.cwd_override.as_deref(),
-        sandbox.as_ref(),
-        options.wrapper_enabled,
-        &sys,
-    );
+        0,
+        PrepareSpawnOptions {
+            snapshot,
+            cwd_override: options.cwd_override.as_deref(),
+            workspace_view: sandbox.as_ref(),
+            wrapper_enabled: options.wrapper_enabled,
+            spawn_adapter: options.spawn_adapter.as_ref(),
+            sys: &sys,
+        },
+    )
+    .await
+    .map_err(|error| error!(%job_id, %error, "process_mgr: prepare spawn failed"))?;
     configure_process_group(&mut cmd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|error| {
-        log_spawn_failure(
-            job_id,
-            &program,
-            &args,
-            snapshot,
-            options.cwd_override.as_deref(),
-            &error,
-        );
-    })?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            log_spawn_failure(
+                job_id,
+                &program,
+                &args,
+                snapshot,
+                options.cwd_override.as_deref(),
+                &error,
+            );
+            settle_spawn_error(job_id, settlement.as_ref(), &error).await;
+            return Err(());
+        }
+    };
     info!(%job_id, pid = ?child.id(), "process_mgr: pipe child spawned");
 
     let Some(mut stdout) = child.stdout.take() else {
         error!(%job_id, "process_mgr: spawned pipe child without stdout pipe");
         request_child_kill(job_id, &mut child, "missing stdout pipe");
-        wait_for_child(job_id, &mut child, "after missing stdout pipe").await;
+        let (_, result) =
+            wait_for_child_result(job_id, &mut child, "after missing stdout pipe").await;
+        let empty_diagnostic = Arc::new(Mutex::new(RingBuffer::default()));
+        settle_spawn_result(job_id, settlement.as_ref(), result, &empty_diagnostic).await;
         return Err(());
     };
     let Some(mut stderr) = child.stderr.take() else {
         error!(%job_id, "process_mgr: spawned pipe child without stderr pipe");
         request_child_kill(job_id, &mut child, "missing stderr pipe");
-        wait_for_child(job_id, &mut child, "after missing stderr pipe").await;
+        let (_, result) =
+            wait_for_child_result(job_id, &mut child, "after missing stderr pipe").await;
+        let empty_diagnostic = Arc::new(Mutex::new(RingBuffer::default()));
+        settle_spawn_result(job_id, settlement.as_ref(), result, &empty_diagnostic).await;
         return Err(());
     };
 
@@ -1398,6 +1504,7 @@ async fn spawn_single_pipe_job(
     let sys_clone = sys.clone();
     let ring_clone = ring_buffer.clone();
     let stderr_clone = stderr_ring.clone();
+    let stderr_settlement = stderr_ring.clone();
     let foreground_clone = foreground.clone();
     let cleanup_tx_clone = cleanup_tx.clone();
     let direct_output_client = options.direct_output_client;
@@ -1472,7 +1579,7 @@ async fn spawn_single_pipe_job(
             }
         });
 
-        let (exit_code, was_killed) = tokio::select! {
+        let (exit_code, spawn_result, was_killed) = tokio::select! {
             exit = wait_for_child_exit_unreaped(&mut child) => {
                 match exit {
                     Ok(()) => {
@@ -1485,13 +1592,13 @@ async fn spawn_single_pipe_job(
                         }
                     }
                 }
-                let code = wait_for_child(job_id, &mut child, "after pipe child exit").await;
-                (code, false)
+                let (code, result) = wait_for_child_result(job_id, &mut child, "after pipe child exit").await;
+                (code, result, false)
             }
             _ = kill_rx.recv() => {
                 request_child_kill(job_id, &mut child, "pipe kill requested");
-                let code = wait_for_child(job_id, &mut child, "after pipe kill").await;
-                (code, true)
+                let (code, result) = wait_for_child_result(job_id, &mut child, "after pipe kill").await;
+                (code, result, true)
             }
         };
 
@@ -1502,6 +1609,14 @@ async fn spawn_single_pipe_job(
             error!(%job_id, err = %error, stream = "stderr", "process_mgr: pipe reader task failed");
         }
         info!(%job_id, exit_code, "process_mgr: pipe child exited");
+
+        let adapter_settled = settle_spawn_result(
+            job_id,
+            settlement.as_ref(),
+            spawn_result,
+            &stderr_settlement,
+        )
+        .await;
 
         emit_output_eof(
             &sys_clone,
@@ -1516,6 +1631,12 @@ async fn spawn_single_pipe_job(
                 JobStatus::Killed,
                 EXIT_CODE_UNAVAILABLE,
                 "killed".to_string(),
+            )
+        } else if !adapter_settled {
+            (
+                JobStatus::Failed,
+                EXIT_CODE_UNAVAILABLE,
+                "spawn adapter infrastructure failure".to_string(),
             )
         } else if exit_code == 0 {
             (JobStatus::Done, exit_code, format!("exit {exit_code}"))
@@ -1570,14 +1691,21 @@ async fn spawn_single_pty_job(
         program,
         args,
         command: mut cmd,
+        settlement,
     } = prepare_spawn(
         &segments[0],
-        snapshot,
-        options.cwd_override.as_deref(),
-        sandbox.as_ref(),
-        options.wrapper_enabled,
-        &sys,
-    );
+        0,
+        PrepareSpawnOptions {
+            snapshot,
+            cwd_override: options.cwd_override.as_deref(),
+            workspace_view: sandbox.as_ref(),
+            wrapper_enabled: options.wrapper_enabled,
+            spawn_adapter: options.spawn_adapter.as_ref(),
+            sys: &sys,
+        },
+    )
+    .await
+    .map_err(|error| error!(%job_id, %error, "process_mgr: prepare spawn failed"))?;
 
     let pty_pair = crate::pty::open_pty().map_err(|error| {
         error!(%job_id, err = %error, "process_mgr: open pty failed");
@@ -1635,16 +1763,21 @@ async fn spawn_single_pty_job(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let mut child = cmd.spawn().map_err(|error| {
-        log_spawn_failure(
-            job_id,
-            &program,
-            &args,
-            snapshot,
-            options.cwd_override.as_deref(),
-            &error,
-        )
-    })?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            log_spawn_failure(
+                job_id,
+                &program,
+                &args,
+                snapshot,
+                options.cwd_override.as_deref(),
+                &error,
+            );
+            settle_spawn_error(job_id, settlement.as_ref(), &error).await;
+            return Err(());
+        }
+    };
     drop(slave);
     drop(master_file);
 
@@ -1656,7 +1789,11 @@ async fn spawn_single_pty_job(
         Err(error) => {
             error!(%job_id, err = %error, "process_mgr: async pty input failed");
             request_child_kill(job_id, &mut child, "async pty input setup failed");
-            wait_for_child(job_id, &mut child, "after async pty input setup failure").await;
+            let (_, result) =
+                wait_for_child_result(job_id, &mut child, "after async pty input setup failure")
+                    .await;
+            let empty_diagnostic = Arc::new(Mutex::new(RingBuffer::default()));
+            settle_spawn_result(job_id, settlement.as_ref(), result, &empty_diagnostic).await;
             return Err(());
         }
     };
@@ -1665,7 +1802,11 @@ async fn spawn_single_pty_job(
         Err(error) => {
             error!(%job_id, err = %error, "process_mgr: async pty reader failed");
             request_child_kill(job_id, &mut child, "async pty reader setup failed");
-            wait_for_child(job_id, &mut child, "after async pty reader setup failure").await;
+            let (_, result) =
+                wait_for_child_result(job_id, &mut child, "after async pty reader setup failure")
+                    .await;
+            let empty_diagnostic = Arc::new(Mutex::new(RingBuffer::default()));
+            settle_spawn_result(job_id, settlement.as_ref(), result, &empty_diagnostic).await;
             return Err(());
         }
     };
@@ -1682,6 +1823,7 @@ async fn spawn_single_pty_job(
         log_file,
         kill_rx,
         ring: ring_buffer.clone(),
+        settlement,
         runtime: ProcessTaskRuntime {
             sys: sys.clone(),
             foreground: foreground.clone(),
@@ -1717,6 +1859,7 @@ async fn spawn_native_pipeline_job(
     let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
     let NativePipelineSpawn {
         children,
+        settlements,
         input,
         stdout_sources,
         stderr_sources,
@@ -1728,6 +1871,7 @@ async fn spawn_native_pipeline_job(
             cwd_override: options.cwd_override.as_deref(),
             sandbox: sandbox.as_ref(),
             wrapper_enabled: options.wrapper_enabled,
+            spawn_adapter: options.spawn_adapter.as_ref(),
             capture_stdin: options.pty_enabled,
             sys: &sys,
         },
@@ -1750,6 +1894,7 @@ async fn spawn_native_pipeline_job(
     let reader_handle = tokio::spawn(pipeline_reader_task(PipelineReaderTask {
         job_id,
         children,
+        settlements,
         sandbox,
         stdout_sources,
         stderr_sources,
@@ -1850,6 +1995,7 @@ async fn spawn_native_pipeline_with_hook(
     mut before_segment: impl FnMut(usize) -> Result<(), ()>,
 ) -> Result<NativePipelineSpawn, ()> {
     let mut children = Vec::with_capacity(segments.len());
+    let mut settlements = Vec::with_capacity(segments.len());
     let mut stdout_sources = Vec::new();
     let mut stderr_sources = Vec::new();
     let mut input = None;
@@ -1857,21 +2003,36 @@ async fn spawn_native_pipeline_with_hook(
 
     for (idx, segment) in segments.iter().enumerate() {
         if before_segment(idx).is_err() {
-            cleanup_partial_pipeline_spawn(job_id, children).await;
+            cleanup_partial_pipeline_spawn(job_id, children, settlements).await;
             return Err(());
         }
+        let prepared = match prepare_spawn(
+            segment,
+            idx,
+            PrepareSpawnOptions {
+                snapshot,
+                cwd_override: options.cwd_override,
+                workspace_view: options.sandbox,
+                wrapper_enabled: options.wrapper_enabled,
+                spawn_adapter: options.spawn_adapter,
+                sys: options.sys,
+            },
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                error!(%job_id, segment = idx, %error, "process_mgr: prepare spawn failed");
+                cleanup_partial_pipeline_spawn(job_id, children, settlements).await;
+                return Err(());
+            }
+        };
         let PreparedSpawn {
             program,
             args,
             command: mut cmd,
-        } = prepare_spawn(
-            segment,
-            snapshot,
-            options.cwd_override,
-            options.sandbox,
-            options.wrapper_enabled,
-            options.sys,
-        );
+            settlement,
+        } = prepared;
         configure_process_group(&mut cmd);
 
         let spawn_result = (|| -> Result<tokio::process::Child, ()> {
@@ -1936,7 +2097,20 @@ async fn spawn_native_pipeline_with_hook(
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(()) => {
-                cleanup_partial_pipeline_spawn(job_id, children).await;
+                if let Some(settlement) = settlement.as_ref()
+                    && let Err(error) = settlement
+                        .settle(
+                            SpawnResult::SpawnError {
+                                message: "failed to spawn prepared command".into(),
+                            },
+                            String::new(),
+                            false,
+                        )
+                        .await
+                {
+                    error!(%job_id, segment = idx, %error, "process_mgr: settle spawn error failed");
+                }
+                cleanup_partial_pipeline_spawn(job_id, children, settlements).await;
                 return Err(());
             }
         };
@@ -1953,19 +2127,26 @@ async fn spawn_native_pipeline_with_hook(
             stderr_sources.push(stderr);
         }
         children.push(child);
+        settlements.push(settlement);
     }
 
     Ok(NativePipelineSpawn {
         children,
+        settlements,
         input,
         stdout_sources,
         stderr_sources,
     })
 }
 
-async fn cleanup_partial_pipeline_spawn(job_id: JobId, mut children: Vec<tokio::process::Child>) {
+async fn cleanup_partial_pipeline_spawn(
+    job_id: JobId,
+    mut children: Vec<tokio::process::Child>,
+    settlements: Vec<Option<PreparedAdapterSettlement>>,
+) {
     terminate_children(job_id, &mut children).await;
-    wait_for_children(job_id, &mut children).await;
+    let (_, results) = wait_for_children_results(job_id, &mut children).await;
+    settle_pipeline_results(job_id, &settlements, results, None).await;
 }
 
 fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
@@ -2092,6 +2273,7 @@ async fn reader_task(task: PtyReaderTask) {
         log_file,
         mut kill_rx,
         ring,
+        settlement,
         runtime,
     } = task;
 
@@ -2131,22 +2313,24 @@ async fn reader_task(task: PtyReaderTask) {
                 // The group has already received SIGKILL. Keep a bounded wait
                 // only for reaping the direct child and releasing its handle.
                 let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
-                tokio::select! {
+                let spawn_result = tokio::select! {
                     status = child.wait() => {
-                        let code = match status {
-                            Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
+                        let result = match status {
+                            Ok(status) => spawn_result_from_status(status),
                             Err(error) => {
                                 error!(%job_id, err = %error, "process_mgr: wait after kill failed");
-                                EXIT_CODE_UNAVAILABLE
+                                SpawnResult::SpawnError { message: error.to_string() }
                             }
                         };
-                        debug!(%job_id, code, "process_mgr: child reaped after SIGKILL");
+                        debug!(%job_id, result = ?result, "process_mgr: child reaped after SIGKILL");
+                        result
                     }
                     () = timeout => {
                         warn!(%job_id, "process_mgr: child was not reaped within 10 s of SIGKILL; dropping handle");
                         drop(child);
+                        SpawnResult::SpawnError { message: "timed out reaping killed process".into() }
                     }
-                }
+                };
 
                 emit_state_change(
                     &runtime.sys,
@@ -2165,6 +2349,13 @@ async fn reader_task(task: PtyReaderTask) {
                 )
                 .await;
                 emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+                let _ = settle_spawn_result(
+                    job_id,
+                    settlement.as_ref(),
+                    spawn_result,
+                    &ring,
+                )
+                .await;
                 // Tell the main loop to remove our entry.
                 notify_cleanup(&runtime.cleanup_tx, job_id).await;
                 return;
@@ -2216,11 +2407,10 @@ async fn reader_task(task: PtyReaderTask) {
     // Wait for exit status while still honoring late kill requests. Observe
     // natural exit without reaping first so the owned session/process-group id
     // cannot be reused before descendant cleanup.
-    let (exit_code, was_killed) = if child_exit_observed {
-        (
-            wait_for_child(job_id, &mut child, "after observed PTY child exit").await,
-            false,
-        )
+    let (exit_code, spawn_result, was_killed) = if child_exit_observed {
+        let (code, result) =
+            wait_for_child_result(job_id, &mut child, "after observed PTY child exit").await;
+        (code, result, false)
     } else {
         tokio::select! {
             exit = wait_for_child_exit_unreaped(&mut child) => {
@@ -2240,19 +2430,21 @@ async fn reader_task(task: PtyReaderTask) {
                         }
                     }
                 }
-                let code = wait_for_child(job_id, &mut child, "after PTY child exit").await;
-                (code, false)
+                let (code, result) = wait_for_child_result(job_id, &mut child, "after PTY child exit").await;
+                (code, result, false)
             }
             _ = kill_rx.recv() => {
                 request_child_kill(job_id, &mut child, "late kill requested");
-                let code = wait_for_child(job_id, &mut child, "after late kill").await;
-                (code, true)
+                let (code, result) = wait_for_child_result(job_id, &mut child, "after late kill").await;
+                (code, result, true)
             }
         }
     };
 
     let ring_len = ring.lock().unwrap().len();
     info!(%job_id, exit_code, bytes = ring_len, "process_mgr: child exited");
+    let adapter_settled =
+        settle_spawn_result(job_id, settlement.as_ref(), spawn_result, &ring).await;
 
     emit_output_eof(
         &runtime.sys,
@@ -2281,6 +2473,11 @@ async fn reader_task(task: PtyReaderTask) {
         .await;
         emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
+        let exit_code = if adapter_settled {
+            exit_code
+        } else {
+            EXIT_CODE_UNAVAILABLE
+        };
         // Determine final state.
         let new_state = if exit_code == 0 {
             JobStatus::Done
@@ -2321,6 +2518,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
     let PipelineReaderTask {
         job_id,
         mut children,
+        settlements,
         sandbox,
         stdout_sources,
         stderr_sources,
@@ -2399,17 +2597,24 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
         }
     }
 
-    let exit_code = if was_killed {
-        wait_for_children(job_id, &mut children).await
+    let (exit_code, results) = if was_killed {
+        wait_for_children_results(job_id, &mut children).await
     } else {
         tokio::select! {
             _ = kill_rx.recv() => {
                 was_killed = true;
                 terminate_children(job_id, &mut children).await;
-                wait_for_children(job_id, &mut children).await
+                wait_for_children_results(job_id, &mut children).await
             }
-            code = wait_for_children(job_id, &mut children) => code,
+            result = wait_for_children_results(job_id, &mut children) => result,
         }
+    };
+    let adapter_settled =
+        settle_pipeline_results(job_id, &settlements, results, Some(&stderr_ring)).await;
+    let exit_code = if adapter_settled {
+        exit_code
+    } else {
+        EXIT_CODE_UNAVAILABLE
     };
 
     let stdout_len = ring.lock().unwrap().len();
@@ -2631,6 +2836,7 @@ async fn run_pipeline_streaming(
             cwd_override: None,
             sandbox: context.sandbox,
             wrapper_enabled: context.options.wrapper_enabled,
+            spawn_adapter: None,
             capture_stdin: context.options.capture_stdin,
             sys: context.sys,
         },
@@ -2717,19 +2923,29 @@ async fn run_pipeline_streaming(
         }
     }
 
-    if *context.was_killed {
-        wait_for_children(context.job_id, &mut spawn.children).await;
-        EXIT_CODE_UNAVAILABLE
+    let (exit_code, results) = if *context.was_killed {
+        wait_for_children_results(context.job_id, &mut spawn.children).await
     } else {
         tokio::select! {
             _ = context.kill_rx.recv() => {
                 *context.was_killed = true;
                 terminate_children(context.job_id, &mut spawn.children).await;
-                wait_for_children(context.job_id, &mut spawn.children).await;
-                EXIT_CODE_UNAVAILABLE
+                wait_for_children_results(context.job_id, &mut spawn.children).await
             }
-            code = wait_for_children(context.job_id, &mut spawn.children) => code,
+            result = wait_for_children_results(context.job_id, &mut spawn.children) => result,
         }
+    };
+    let adapter_settled = settle_pipeline_results(
+        context.job_id,
+        &spawn.settlements,
+        results,
+        Some(context.stderr_ring),
+    )
+    .await;
+    if *context.was_killed || !adapter_settled {
+        EXIT_CODE_UNAVAILABLE
+    } else {
+        exit_code
     }
 }
 
@@ -3041,9 +3257,16 @@ fn request_child_kill(job_id: JobId, child: &mut tokio::process::Child, reason: 
     }
 }
 
-async fn wait_for_child(job_id: JobId, child: &mut tokio::process::Child, reason: &str) -> i32 {
+async fn wait_for_child_result(
+    job_id: JobId,
+    child: &mut tokio::process::Child,
+    reason: &str,
+) -> (i32, SpawnResult) {
     match child.wait().await {
-        Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
+        Ok(status) => {
+            let code = exit_code_from_status(status, EXIT_CODE_UNAVAILABLE);
+            (code, spawn_result_from_status(status))
+        }
         Err(error) => {
             error!(
                 %job_id,
@@ -3051,7 +3274,66 @@ async fn wait_for_child(job_id: JobId, child: &mut tokio::process::Child, reason
                 err = %error,
                 "process_mgr: child wait failed"
             );
-            EXIT_CODE_UNAVAILABLE
+            (
+                EXIT_CODE_UNAVAILABLE,
+                SpawnResult::SpawnError {
+                    message: error.to_string(),
+                },
+            )
+        }
+    }
+}
+
+fn spawn_result_from_status(status: std::process::ExitStatus) -> SpawnResult {
+    match status.signal() {
+        Some(signal) => SpawnResult::Signaled { signal },
+        None => SpawnResult::Exited {
+            code: exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
+        },
+    }
+}
+
+async fn settle_spawn_error(
+    job_id: JobId,
+    settlement: Option<&PreparedAdapterSettlement>,
+    error: &std::io::Error,
+) {
+    let Some(settlement) = settlement else {
+        return;
+    };
+    if let Err(settle_error) = settlement
+        .settle(
+            SpawnResult::SpawnError {
+                message: error.to_string(),
+            },
+            String::new(),
+            false,
+        )
+        .await
+    {
+        error!(%job_id, error = %settle_error, "process_mgr: settle spawn error failed");
+    }
+}
+
+async fn settle_spawn_result(
+    job_id: JobId,
+    settlement: Option<&PreparedAdapterSettlement>,
+    result: SpawnResult,
+    diagnostic: &Arc<Mutex<RingBuffer>>,
+) -> bool {
+    let Some(settlement) = settlement else {
+        return true;
+    };
+    let (tail, truncated) = diagnostic
+        .lock()
+        .unwrap()
+        .tail_with_truncation(cue_core::spawn_adapter::MAX_SPAWN_DIAGNOSTIC_BYTES);
+    let diagnostic_tail = String::from_utf8_lossy(&tail).into_owned();
+    match settlement.settle(result, diagnostic_tail, truncated).await {
+        Ok(()) => true,
+        Err(error) => {
+            error!(%job_id, %error, "process_mgr: settle spawn failed");
+            false
         }
     }
 }
@@ -3062,8 +3344,12 @@ async fn terminate_children(job_id: JobId, children: &mut [tokio::process::Child
     }
 }
 
-async fn wait_for_children(job_id: JobId, children: &mut [tokio::process::Child]) -> i32 {
+async fn wait_for_children_results(
+    job_id: JobId,
+    children: &mut [tokio::process::Child],
+) -> (i32, Vec<SpawnResult>) {
     let mut exit_code = EXIT_CODE_UNAVAILABLE;
+    let mut results = Vec::with_capacity(children.len());
     let last_idx = children.len().saturating_sub(1);
     for (idx, child) in children.iter_mut().enumerate() {
         match wait_for_child_exit_unreaped(child).await {
@@ -3089,19 +3375,66 @@ async fn wait_for_children(job_id: JobId, children: &mut [tokio::process::Child]
         }
         match child.wait().await {
             Ok(status) => {
+                let code = exit_code_from_status(status, EXIT_CODE_UNAVAILABLE);
                 if idx == last_idx {
-                    exit_code = exit_code_from_status(status, EXIT_CODE_UNAVAILABLE);
+                    exit_code = code;
                 }
+                results.push(spawn_result_from_status(status));
             }
             Err(error) => {
                 error!(err = %error, "process_mgr: child wait failed");
                 if idx == last_idx {
                     exit_code = EXIT_CODE_UNAVAILABLE;
                 }
+                results.push(SpawnResult::SpawnError {
+                    message: error.to_string(),
+                });
             }
         }
     }
-    exit_code
+    (exit_code, results)
+}
+
+async fn settle_pipeline_results(
+    job_id: JobId,
+    settlements: &[Option<PreparedAdapterSettlement>],
+    results: Vec<SpawnResult>,
+    diagnostic: Option<&Arc<Mutex<RingBuffer>>>,
+) -> bool {
+    if settlements.len() != results.len() {
+        error!(
+            %job_id,
+            settlements = settlements.len(),
+            results = results.len(),
+            "process_mgr: spawn adapter settlement count mismatch"
+        );
+        return false;
+    }
+
+    let (diagnostic_tail, diagnostic_truncated) = diagnostic.map_or_else(
+        || (String::new(), false),
+        |ring| {
+            let (tail, truncated) = ring
+                .lock()
+                .unwrap()
+                .tail_with_truncation(cue_core::spawn_adapter::MAX_SPAWN_DIAGNOSTIC_BYTES);
+            (String::from_utf8_lossy(&tail).into_owned(), truncated)
+        },
+    );
+    let mut settled = true;
+    for (segment_index, (settlement, result)) in settlements.iter().zip(results).enumerate() {
+        let Some(settlement) = settlement else {
+            continue;
+        };
+        if let Err(error) = settlement
+            .settle(result, diagnostic_tail.clone(), diagnostic_truncated)
+            .await
+        {
+            settled = false;
+            error!(%job_id, segment = segment_index, %error, "process_mgr: settle pipeline segment failed");
+        }
+    }
+    settled
 }
 
 async fn fail_pending_spawn(sys: &ActorSystem, job_id: JobId, session_id: Option<&str>) {
@@ -3402,6 +3735,7 @@ mod tests {
             pty_enabled: true,
             direct_output_client: None,
             session_id: None,
+            spawn_adapter: None,
         }
     }
 
@@ -4090,6 +4424,7 @@ mod tests {
                     pty_enabled: false,
                     direct_output_client: None,
                     session_id: None,
+                    spawn_adapter: None,
                 },
             })
             .await
@@ -4175,6 +4510,7 @@ mod tests {
                     pty_enabled: false,
                     direct_output_client: None,
                     session_id: None,
+                    spawn_adapter: None,
                 },
             })
             .await
@@ -4415,6 +4751,7 @@ mod tests {
                     pty_enabled,
                     direct_output_client: None,
                     session_id: None,
+                    spawn_adapter: None,
                 },
             })
             .await
@@ -4598,6 +4935,7 @@ mod tests {
                 cwd_override: Some(&cwd),
                 sandbox: None,
                 wrapper_enabled: false,
+                spawn_adapter: None,
                 capture_stdin: false,
                 sys: &sys,
             },

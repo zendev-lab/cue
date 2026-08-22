@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod process_status;
 pub mod resource;
 pub mod scope;
+pub mod spawn_adapter;
 pub mod tui_debug;
 
 // Re-export commonly used types at crate root.
@@ -28,3 +29,4 @@ pub use resource::{
     Grant, Need, ParseQuantityError, ParseQuantityReason, ProviderId, Reject, Reservation,
     ReservationId, ResourceQuantity, ResourceUnit, Snapshot,
 };
+pub use spawn_adapter::{SecretToken, SpawnAdapterHandle};
