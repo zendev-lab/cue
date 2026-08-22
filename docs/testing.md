@@ -10,6 +10,7 @@ is checked by dedicated static tools, not by tests that mirror the current sourc
 | Crate unit and contract | `crates/*/src/**/*.rs` | Pure behavior, parsing, schemas, state transitions, and adapter contracts |
 | Crate integration and process | `crates/*/tests/**/*.rs` | IPC, persistence, process lifecycle, PTY, and daemon/client composition |
 | Package smoke | `scripts/smoke_package.sh` | Commands installed from the built wheel or source distribution |
+| npm Skill package | `scripts/smoke_npm_package.mjs` | Packed file allowlist, version alignment, exported root, and canonical Skill bytes |
 | Repository policy | `just pre-commit` | Formatting, lint, workflow syntax and security, links, spelling, and commit messages |
 
 Keep Linux-only process behavior in the integration lane instead of replacing it with a mock that
@@ -38,6 +39,7 @@ important modules while implying that mutation testing is an active gate.
 - `just test` runs the workspace behavior suite.
 - `just msrv` compiles all targets with Rust 1.95 through rustup.
 - `just package-smoke` builds wheel and source distributions and exercises every installed command.
+- `just npm-package-smoke` packs and installs `@zendev-lab/cue`, then verifies the canonical Skill.
 - `just ci` is the serial local aggregate of those gates; hosted CI keeps independent lanes parallel.
 
 The primary toolchain is pinned in `rust-toolchain.toml` and advances through a dedicated Renovate

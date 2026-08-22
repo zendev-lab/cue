@@ -1,0 +1,36 @@
+{
+  "name": "@zendev-lab/cue",
+  "version": "0.1.2",
+  "description": "Canonical agent guidance for the Cue execution runtime.",
+  "license": "MIT",
+  "author": "zrr1999",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zendev-lab/cue.git"
+  },
+  "homepage": "https://github.com/zendev-lab/cue#readme",
+  "bugs": {
+    "url": "https://github.com/zendev-lab/cue/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "skills/cue/SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "node scripts/smoke_npm_package.mjs"
+  }
+}
