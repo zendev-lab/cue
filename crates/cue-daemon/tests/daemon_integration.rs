@@ -4096,10 +4096,17 @@ async fn test_fg_attach_input_and_detach() {
             before_reattach.iter().all(|message| !matches!(
                 message,
                 Message::Event {
-                    payload: EventPayload::FgOutput { id, .. },
+                    payload: EventPayload::FgOutput {
+                        id,
+                        attachment_id,
+                        ..
+                    },
                 } if id == &job_id
+                    && (*attachment_id == 0
+                        || *attachment_id == reattached.attachment_id)
             )),
-            "legacy snapshot event crossed the attach response fence: {before_reattach:?}"
+            "epoch-0 or new-attachment output crossed the attach response fence: \
+             {before_reattach:?}"
         );
         let legacy_snapshot = collect_until(&mut stream, Duration::from_secs(5), |message| {
             matches!(
