@@ -12,6 +12,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const expectedFiles = [
   "package/LICENSE",
   "package/README.md",
+  "package/index.d.ts",
   "package/index.js",
   "package/package.json",
   "package/skills/cue/SKILL.md",

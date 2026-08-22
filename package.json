@@ -13,11 +13,17 @@
     "url": "https://github.com/zendev-lab/cue/issues"
   },
   "type": "module",
+  "types": "./index.d.ts",
   "exports": {
-    ".": "./index.js",
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
+    "index.d.ts",
     "index.js",
     "skills/cue/SKILL.md",
     "README.md",
