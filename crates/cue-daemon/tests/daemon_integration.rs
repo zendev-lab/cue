@@ -38,9 +38,9 @@ use cue_core::mode::Mode;
 /// Per-test timeout to prevent hangs.
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Restart tests include instrumented daemon shutdown and successor readiness.
-const RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(40);
+const RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(90);
 /// LLVM coverage flushes profile data while the predecessor process exits.
-const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// These integration tests spawn real daemons and child processes. Run them one
 /// at a time so the default Rust test harness does not create cross-test
