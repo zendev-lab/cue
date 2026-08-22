@@ -16,7 +16,6 @@ use cue_core::chain::{
     is_chain_terminal,
 };
 use cue_core::command::ModeParams;
-use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{CronSchedule, CronStatus, parse_schedule_text};
 #[cfg(test)]
 use cue_core::ipc::ForegroundRole;
@@ -36,10 +35,11 @@ use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{ChainId, CronId, EventChannel, JobId, ScopeHash, ScriptId};
 
 use crate::config::{BlockDecision, Config};
-use crate::parser::{ResolvedCommand, ResolvedScriptItem, Token, Tokenizer, parse_command};
 use crate::resource::RejectGroup;
 use crate::storage;
 use crate::word_expansion::expand_command_line;
+use cue_language::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
+use cue_language::{ResolvedCommand, ResolvedScriptItem, Token, Tokenizer, parse_command};
 
 use super::cron_schedule::next_trigger_instant;
 use super::script_record::{

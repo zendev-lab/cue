@@ -2,7 +2,7 @@
 
 ## 1. Architecture
 
-**Three-layer pipeline**, all running inside cued:
+**Three-layer pipeline**, owned by the I/O-free `cue-language` crate:
 
 ```
 Raw input (String)
@@ -11,9 +11,10 @@ Raw input (String)
   → Resolver   → ResolvedCommand (validated, ready for execution)
 ```
 
-Interactive clients send `Eval { input }` over IPC; cued runs the full pipeline.
-File scripts are loaded through `cue run <file.cue>` and use the same parser with
-a file-script source mode.
+Frontends use this pipeline before submitting typed execution contracts. During
+the internal IPC v2-to-v3 stack migration, cued temporarily calls the same
+library for legacy `Eval`; this bridge is removed with the v3 cut. File scripts
+loaded through `cue run <file.cue>` use the same compiler with source metadata.
 
 File-script bodies are parsed as a **top-level script**: newline separates items
 only at top level, and only when the current chain is already syntactically
@@ -233,7 +234,7 @@ Notes:
 
 ## 6. Resolver
 
-The Resolver transforms `Ast` → `RequestPayload`:
+The Resolver transforms `Ast` into a validated frontend intent:
 
 1. **Mode injection**: `BareInput` → wraps with default command per current mode
    - JOB ⚡ → `:run`
@@ -244,10 +245,11 @@ The Resolver transforms `Ast` → `RequestPayload`:
 2. **Argument type validation**: ensures command gets correct argument type
     - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
 
-3. **ID resolution**: validates J1/C3 references exist (queries cued state)
+3. **ID syntax**: classifies typed references; live existence is checked by the
+   daemon operation that owns the referenced entity
 
 4. **Mode params parse/validate**: per-invocation params are validated against
-   `cue-core::command_spec`; dynamic namespaces such as `need.<resource>` are
+   `cue-language::command_spec`; dynamic namespaces such as `need.<resource>` are
    still gated by that metadata.
 
 5. **Scope resolution**: jobs and crons start from the caller's session cursor
@@ -258,7 +260,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 ## 7. Completion Service
 
-`Complete { input, cursor }` request → cued runs partial parse:
+Completion runs locally through `cue-language`; it does not require daemon RPC:
 
 1. Tokenize up to cursor position
 2. Determine context:
@@ -268,7 +270,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
    - After IdRef prefix `J` → active job ID completion
    - After word → filesystem path / command completion
    - After operator → next segment (no completions, just indicate expected input)
-3. Return `CompletionList { items: Vec<CompletionItem> }`
+3. Return candidates to the invoking frontend
 
 ```rust
 struct CompletionItem {
@@ -281,7 +283,7 @@ struct CompletionItem {
 
 ## 8. Syntax Highlighting Service
 
-`Highlight { input }` request → full tokenize → return spans:
+Highlighting runs locally through the same tokenizer and returns spans:
 
 ```rust
 struct HighlightSpan {
@@ -335,8 +337,8 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (see `cue-core::command_spec`) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (see `cue-core::command_spec`) |
+| `:run` | Chain | ✓ (see `cue-language::command_spec`) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (see `cue-language::command_spec`) |
 | `:kill` | Job/Cron IdRef (`J<n>` or `C<n>`) | ✗ |
 | `:retry` | Job IdRef (`J<n>`) | ✗ |
 | `:out` | Job IdRef (`J<n>`) | ✗ |

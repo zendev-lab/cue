@@ -1,0 +1,16 @@
+[package]
+name = "cue-language"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cue DSL compiler, completion, and highlighting"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cue-core = { path = "../cue-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

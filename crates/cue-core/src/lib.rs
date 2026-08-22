@@ -6,7 +6,6 @@
 
 pub mod chain;
 pub mod command;
-pub mod command_spec;
 pub mod cron;
 pub mod event_channel;
 pub mod execution;

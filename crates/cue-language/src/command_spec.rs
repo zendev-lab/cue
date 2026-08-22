@@ -1,7 +1,4 @@
-//! Shared metadata for daemon-handled `:` commands.
-//!
-//! Keep command names, parser argument shape, help grouping, and completion
-//! details in one place so frontends and the daemon do not drift apart.
+//! Metadata for frontend `:` commands and their language syntax.
 
 /// High-level command grouping used by help and documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

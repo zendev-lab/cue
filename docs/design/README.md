@@ -33,7 +33,8 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 
 | Crate | Role |
 |---|---|
-| **cue-core** | Shared domain types, command metadata, protocol definitions, pure scheduling primitives |
+| **cue-core** | Shared execution/session/scope types, protocol definitions, and pure state reducers |
+| **cue-language** | Client-side tokenizer, parser, resolver, completion, highlighting, and `.cue` compilation |
 | **cue-daemon** / **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
 | **cue-client** | Shared client connection stack plus client CLI for `run`, `target resolve`, and `target list` |
 | **cue-tui** | Interactive TUI client (ratatui + crossterm) |

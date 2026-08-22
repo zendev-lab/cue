@@ -61,8 +61,8 @@ use cue_core::ipc::{
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{EventChannel, ScopeHash};
 
-use crate::parser::ResolvedCommand;
 use crate::resource::ProviderRegistry;
+use cue_language::ResolvedCommand;
 
 /// Default bounded channel capacity for actor mailboxes.
 pub(crate) const ACTOR_CHANNEL_CAP: usize = 256;
@@ -753,7 +753,7 @@ mod tests {
             .await
             .expect("receive scheduler connect response")
             .expect("connect direct scheduler client");
-        let command = crate::parser::parse_command(
+        let command = cue_language::parse_command(
             &format!("/usr/bin/touch {}", marker.display()),
             cue_core::mode::Mode::Job,
         )
