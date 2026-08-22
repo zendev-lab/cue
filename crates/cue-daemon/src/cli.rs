@@ -1036,6 +1036,9 @@ fn run_start_foreground(paths: DaemonRuntimePaths, clear_cancelled: bool) -> Res
     // race between concurrent foreground starts.
     let _instance_lock = acquire_instance_lock(&paths.lock)?;
     ensure_not_running_with_pid_path(&paths.pid, &paths.socket)?;
+    if paths.socket == crate::dirs::socket_path() {
+        crate::legacy_migration::prepare().context("prepare cue-shell legacy migration")?;
+    }
 
     let startup_restart = match prepare_foreground_startup(&paths.socket, clear_cancelled)? {
         ForegroundStartup::SuppressedByCancellation => {
@@ -1099,6 +1102,8 @@ async fn async_main(
     let db_path = crate::dirs::db_path()?;
     let scope_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
+    crate::legacy_migration::import_context(&scope_db)
+        .context("import cue-shell session and scope context")?;
     let scheduler_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
 

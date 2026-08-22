@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use crate::{CuedClient, ResolvedTransport, connect_ssh_transport, load_transport_config};
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use cue_core::execution::{ExecutionState, StepFailure, StepState};
 use cue_core::ipc::{EventPayload, ExecutionInfo, Message, OkPayload, ResponsePayload, Stream};
 
@@ -153,16 +152,10 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
             Message::Request { .. } => {
                 bail!("unexpected request message from cued");
             }
-            Message::Event { payload } => match payload {
-                EventPayload::OutputChunk { stream, data, .. } => {
-                    write_stream(stream, data.as_bytes())?;
-                }
-                EventPayload::OutputChunkBinary { stream, base64, .. } => {
-                    let bytes = decode_binary_output_chunk(&base64)?;
-                    write_stream(stream, &bytes)?;
-                }
-                _ => {}
-            },
+            Message::Event {
+                payload: EventPayload::OutputChunk { stream, data, .. },
+            } => write_stream(stream, &data)?,
+            Message::Event { .. } => {}
         }
     }
 }
@@ -194,20 +187,14 @@ fn write_stream(stream: Stream, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn decode_binary_output_chunk(base64: &str) -> Result<Vec<u8>> {
-    BASE64_STANDARD
-        .decode(base64.as_bytes())
-        .context("decode binary output chunk")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cue_core::ExecutionId;
     use cue_core::execution::{ExecutionPlan, ExecutionSpec, LaunchContext};
     use cue_core::ipc::{
         MAX_MESSAGE_SIZE, RequestPayload, SessionInfo, SessionScopeState, encode_message,
     };
+    use cue_core::{ExecutionId, StepId};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     async fn read_test_message<R>(stream: &mut R) -> Message
@@ -255,15 +242,6 @@ mod tests {
                 retry_of: None,
             },
         }
-    }
-
-    #[test]
-    fn binary_output_chunks_decode_to_original_bytes() {
-        let encoded = BASE64_STANDARD.encode([0, 159, 146, 150, b'\n']);
-
-        let decoded = decode_binary_output_chunk(&encoded).expect("decode binary chunk");
-
-        assert_eq!(decoded, vec![0, 159, 146, 150, b'\n']);
     }
 
     #[test]
@@ -470,9 +448,12 @@ mod tests {
             &mut server_stream,
             Message::Event {
                 payload: EventPayload::OutputChunk {
-                    id: "E7/S1".into(),
+                    id: StepId {
+                        execution: execution_id,
+                        index: 1,
+                    },
                     stream: Stream::Stdout,
-                    data: "fast\n".into(),
+                    data: b"fast\n".to_vec(),
                 },
             },
         )

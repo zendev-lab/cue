@@ -490,7 +490,7 @@ async fn step_attach_uses_stable_identity_and_connection_scoped_control() {
 
         match roundtrip(&mut stream, 11, RequestPayload::StepAttach { id: step_id }).await {
             ResponsePayload::Ok(OkPayload::FgAttached(attachment)) => {
-                assert_eq!(attachment.id, step_id.to_string());
+                assert_eq!(attachment.id, step_id);
                 assert_eq!(attachment.role, ForegroundRole::Controller);
             }
             other => panic!("expected step attachment, got {other:?}"),

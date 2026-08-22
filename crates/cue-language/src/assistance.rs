@@ -1,4 +1,47 @@
-use cue_core::ipc::{CompletionItem, CompletionKind, HighlightKind, HighlightSpan};
+use std::ops::Range;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub label: String,
+    pub insert_text: String,
+    pub kind: CompletionKind,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    Command,
+    Param,
+    Id,
+    Path,
+    Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: HighlightKind,
+}
+
+impl HighlightSpan {
+    pub fn range(&self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightKind {
+    CommandPrefix,
+    CommandName,
+    ModeParam,
+    Operator,
+    IdRef,
+    Word,
+    String,
+    Number,
+    Error,
+}
 
 use crate::{
     Token, Tokenizer,

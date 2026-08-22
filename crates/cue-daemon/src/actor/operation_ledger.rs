@@ -1,11 +1,13 @@
 //! Bounded daemon-lifetime idempotency ledger for side-effecting IPC requests.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use cue_core::ipc::{ResponsePayload, error_code};
+
+use crate::storage::StoredOperationFact;
 
 pub(super) const MAX_OPERATION_ID_BYTES: usize = 128;
 const DEFAULT_IDENTITY_CAPACITY: usize = 65_536;
@@ -43,6 +45,7 @@ impl BeginOutcome {
 pub(super) struct CompletedOperation {
     pub waiters: Vec<OperationWaiter>,
     pub response: ResponsePayload,
+    pub fact: StoredOperationFact,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +126,60 @@ impl OperationLedger {
             completed_bytes: 0,
             limits,
         }
+    }
+
+    pub fn restore(facts: Vec<StoredOperationFact>) -> anyhow::Result<Self> {
+        let mut ledger = Self::default();
+        if facts.len() > ledger.limits.identity_capacity {
+            anyhow::bail!(
+                "durable operation identity count {} exceeds ledger capacity {}",
+                facts.len(),
+                ledger.limits.identity_capacity
+            );
+        }
+        let now = Instant::now();
+        let now_ms = unix_time_ms();
+        for fact in facts {
+            let age_ms = now_ms.saturating_sub(fact.completed_at_ms).max(0) as u64;
+            let age = Duration::from_millis(age_ms);
+            let key = OperationKey {
+                session_namespace: fact.session_namespace,
+                operation_id_hash: fact.operation_id_hash,
+            };
+            let state = match fact.response {
+                Some(response) if age < ledger.limits.completed_ttl => {
+                    let response_bytes = serialized_response_size(&response);
+                    if response_bytes > ledger.limits.max_response_bytes {
+                        OperationState::Tombstone
+                    } else {
+                        ledger.completed_responses = ledger.completed_responses.saturating_add(1);
+                        ledger.completed_bytes =
+                            ledger.completed_bytes.saturating_add(response_bytes);
+                        OperationState::Completed {
+                            response: Box::new(response),
+                            completed_at: now.checked_sub(age).unwrap_or(now),
+                            response_bytes,
+                        }
+                    }
+                }
+                Some(_) | None => OperationState::Tombstone,
+            };
+            ledger.entries.insert(
+                key,
+                OperationEntry {
+                    fingerprint: fact.fingerprint,
+                    state,
+                },
+            );
+        }
+        while ledger.completed_responses > ledger.limits.response_capacity
+            || ledger.completed_bytes > ledger.limits.max_completed_bytes
+        {
+            if !ledger.evict_oldest_completed(None) {
+                break;
+            }
+        }
+        Ok(ledger)
     }
 
     #[cfg(test)]
@@ -247,6 +304,7 @@ impl OperationLedger {
     ) -> Option<CompletedOperation> {
         let key = self.routed_requests.remove(&routed_request)?;
         let entry = self.entries.get_mut(&key)?;
+        let fingerprint = entry.fingerprint;
         let OperationState::Pending { waiters } = &mut entry.state else {
             return None;
         };
@@ -256,9 +314,20 @@ impl OperationLedger {
         }
 
         let response_bytes = serialized_response_size(&response);
+        let completed_at_ms = unix_time_ms();
         if response_bytes > self.limits.max_response_bytes {
             entry.state = OperationState::Tombstone;
-            return Some(CompletedOperation { waiters, response });
+            return Some(CompletedOperation {
+                waiters,
+                response,
+                fact: StoredOperationFact {
+                    session_namespace: key.session_namespace,
+                    operation_id_hash: key.operation_id_hash,
+                    fingerprint,
+                    response: None,
+                    completed_at_ms,
+                },
+            });
         }
         entry.state = OperationState::Completed {
             response: Box::new(response.clone()),
@@ -275,7 +344,17 @@ impl OperationLedger {
             }
         }
 
-        Some(CompletedOperation { waiters, response })
+        Some(CompletedOperation {
+            waiters,
+            response: response.clone(),
+            fact: StoredOperationFact {
+                session_namespace: key.session_namespace,
+                operation_id_hash: key.operation_id_hash,
+                fingerprint,
+                response: Some(response),
+                completed_at_ms,
+            },
+        })
     }
 
     /// A disconnected transport must not consume pending waiter capacity. The
@@ -365,6 +444,14 @@ fn serialized_response_size(response: &ResponsePayload) -> usize {
     serde_json::to_vec(response)
         .map(|encoded| encoded.len())
         .unwrap_or(usize::MAX)
+}
+
+fn unix_time_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -611,6 +698,35 @@ mod tests {
 
         let (code, _) =
             unwrap_error(ledger.begin(namespace, "large", fingerprint("payload"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_STATE);
+    }
+
+    #[test]
+    fn durable_fact_restores_replay_or_tombstone_without_rerouting() {
+        let mut ledger = OperationLedger::default();
+        let namespace = OperationLedger::session_namespace("session-a");
+        let owner = waiter(1, 1);
+        let payload_fingerprint = fingerprint("payload");
+        assert!(matches!(
+            ledger.begin(namespace, "durable", payload_fingerprint, owner),
+            BeginOutcome::Route
+        ));
+        let completed = ledger
+            .complete(owner, ResponsePayload::ack())
+            .expect("complete durable operation");
+
+        let mut restored = OperationLedger::restore(vec![completed.fact.clone()])
+            .expect("restore replayable fact");
+        match restored.begin(namespace, "durable", payload_fingerprint, waiter(2, 1)) {
+            BeginOutcome::Respond(response) => assert_ack(&response),
+            other => panic!("expected durable replay, got {other:?}"),
+        }
+
+        let mut tombstone = completed.fact;
+        tombstone.response = None;
+        let mut restored = OperationLedger::restore(vec![tombstone]).expect("restore tombstone");
+        let (code, _) =
+            unwrap_error(restored.begin(namespace, "durable", payload_fingerprint, waiter(3, 1)));
         assert_eq!(code, error_code::INVALID_STATE);
     }
 }

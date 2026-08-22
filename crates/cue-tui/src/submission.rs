@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
-
 use cue_core::Mode;
-use cue_core::ipc::Stream;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSubmission {
@@ -17,8 +14,6 @@ enum PendingSubmissionKind {
     User,
     Retry { id: cue_core::ExecutionId },
     Silent { description: String },
-    DisplaySubscribe { id: String },
-    DisplayUnsubscribe { id: String },
 }
 
 impl PendingSubmission {
@@ -35,11 +30,6 @@ impl PendingSubmission {
             warnings,
             kind: PendingSubmissionKind::User,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn silent() -> Self {
-        Self::silent_request("silent request")
     }
 
     pub(crate) fn silent_request(description: impl Into<String>) -> Self {
@@ -83,26 +73,6 @@ impl PendingSubmission {
         pending
     }
 
-    pub(crate) fn display_subscribe(id: String) -> Self {
-        Self {
-            card_index: None,
-            input: String::new(),
-            mode: Mode::default(),
-            warnings: Vec::new(),
-            kind: PendingSubmissionKind::DisplaySubscribe { id },
-        }
-    }
-
-    pub(crate) fn display_unsubscribe(id: String) -> Self {
-        Self {
-            card_index: None,
-            input: String::new(),
-            mode: Mode::default(),
-            warnings: Vec::new(),
-            kind: PendingSubmissionKind::DisplayUnsubscribe { id },
-        }
-    }
-
     pub(crate) fn card_index(&self) -> Option<usize> {
         self.card_index
     }
@@ -123,14 +93,6 @@ impl PendingSubmission {
         format_ack_message(&self.input)
     }
 
-    pub(crate) fn normalized_command_label(&self) -> String {
-        normalize_command_label(&self.input)
-    }
-
-    pub(crate) fn display_request(&self) -> Option<DisplayRequest> {
-        display_request_from_submission(&self.input, self.mode)
-    }
-
     pub(crate) fn is_user_visible(&self) -> bool {
         matches!(
             self.kind,
@@ -141,53 +103,9 @@ impl PendingSubmission {
     pub(crate) fn silent_description(&self) -> Option<&str> {
         match &self.kind {
             PendingSubmissionKind::Silent { description } => Some(description),
-            PendingSubmissionKind::User
-            | PendingSubmissionKind::Retry { .. }
-            | PendingSubmissionKind::DisplaySubscribe { .. }
-            | PendingSubmissionKind::DisplayUnsubscribe { .. } => None,
+            PendingSubmissionKind::User | PendingSubmissionKind::Retry { .. } => None,
         }
     }
-
-    pub(crate) fn display_subscribe_id(&self) -> Option<&str> {
-        match &self.kind {
-            PendingSubmissionKind::DisplaySubscribe { id } => Some(id),
-            PendingSubmissionKind::User
-            | PendingSubmissionKind::Retry { .. }
-            | PendingSubmissionKind::Silent { .. }
-            | PendingSubmissionKind::DisplayUnsubscribe { .. } => None,
-        }
-    }
-
-    pub(crate) fn display_unsubscribe_id(&self) -> Option<&str> {
-        match &self.kind {
-            PendingSubmissionKind::DisplayUnsubscribe { id } => Some(id),
-            PendingSubmissionKind::User
-            | PendingSubmissionKind::Retry { .. }
-            | PendingSubmissionKind::Silent { .. }
-            | PendingSubmissionKind::DisplaySubscribe { .. } => None,
-        }
-    }
-}
-
-pub(crate) fn pending_display_subscription_requests<'a>(
-    pending: impl IntoIterator<Item = &'a PendingSubmission>,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut subscribes = BTreeSet::new();
-    let mut unsubscribes = BTreeSet::new();
-    for pending in pending {
-        match &pending.kind {
-            PendingSubmissionKind::DisplaySubscribe { id } => {
-                subscribes.insert(id.clone());
-            }
-            PendingSubmissionKind::DisplayUnsubscribe { id } => {
-                unsubscribes.insert(id.clone());
-            }
-            PendingSubmissionKind::User
-            | PendingSubmissionKind::Retry { .. }
-            | PendingSubmissionKind::Silent { .. } => {}
-        }
-    }
-    (subscribes, unsubscribes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,37 +121,6 @@ pub(crate) fn parse_local_command(input: &str) -> Option<LocalCommand> {
         ":clear" => Some(LocalCommand::Clear),
         ":quit" | ":exit" => Some(LocalCommand::Quit),
         ":restart" => Some(LocalCommand::Restart),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DisplayRequest {
-    pub(crate) stream: Stream,
-    pub(crate) follow: bool,
-}
-
-pub(crate) fn display_request_from_submission(input: &str, mode: Mode) -> Option<DisplayRequest> {
-    let trimmed = input.trim();
-    let command = if mode == Mode::Job && !trimmed.starts_with(':') {
-        return None;
-    } else {
-        trimmed.strip_prefix(':')?.split_whitespace().next()?
-    };
-
-    match command {
-        "out" => Some(DisplayRequest {
-            stream: Stream::Stdout,
-            follow: false,
-        }),
-        "tail" => Some(DisplayRequest {
-            stream: Stream::Stdout,
-            follow: true,
-        }),
-        "err" => Some(DisplayRequest {
-            stream: Stream::Stderr,
-            follow: false,
-        }),
         _ => None,
     }
 }
@@ -331,52 +218,18 @@ pub(crate) fn format_ack_message(input: &str) -> String {
     "ok".to_string()
 }
 
-pub(crate) fn normalize_command_label(input: &str) -> String {
-    let trimmed = input.trim();
-    for prefix in [":run", ":cron"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let rest = rest.trim();
-            if !rest.is_empty() {
-                return rest.to_string();
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn pending_submission_classifiers_expose_only_matching_intents() {
-        let subscribe = PendingSubmission::display_subscribe("J1".into());
-        let unsubscribe = PendingSubmission::display_unsubscribe("J2".into());
         let silent = PendingSubmission::silent_request("snapshot");
         let user = PendingSubmission::user(None, ":jobs".into(), Mode::Job, Vec::new());
 
-        assert_eq!(subscribe.display_subscribe_id(), Some("J1"));
-        assert_eq!(subscribe.display_unsubscribe_id(), None);
-        assert_eq!(unsubscribe.display_unsubscribe_id(), Some("J2"));
         assert_eq!(silent.silent_description(), Some("snapshot"));
         assert!(user.is_user_visible());
         assert_eq!(user.silent_description(), None);
-    }
-
-    #[test]
-    fn pending_subscription_requests_collect_display_intents() {
-        let pending = [
-            PendingSubmission::display_subscribe("J1".into()),
-            PendingSubmission::display_unsubscribe("J2".into()),
-            PendingSubmission::silent_request("snapshot"),
-            PendingSubmission::user(None, ":jobs".into(), Mode::Job, Vec::new()),
-        ];
-
-        let (subscribes, unsubscribes) = pending_display_subscription_requests(&pending);
-
-        assert_eq!(subscribes, BTreeSet::from(["J1".to_string()]));
-        assert_eq!(unsubscribes, BTreeSet::from(["J2".to_string()]));
-        assert!(pending[3].is_user_visible());
     }
 
     #[test]
@@ -385,25 +238,6 @@ mod tests {
         assert_eq!(parse_local_command(":exit"), Some(LocalCommand::Quit));
         assert_eq!(parse_local_command(":restart"), Some(LocalCommand::Restart));
         assert_eq!(parse_local_command(":run echo hi"), None);
-    }
-
-    #[test]
-    fn display_request_requires_colon_in_job_mode() {
-        assert_eq!(display_request_from_submission("out J1", Mode::Job), None);
-        assert_eq!(
-            display_request_from_submission(":tail J1", Mode::Job),
-            Some(DisplayRequest {
-                stream: Stream::Stdout,
-                follow: true,
-            })
-        );
-        assert_eq!(
-            display_request_from_submission(":err J1", Mode::Cron),
-            Some(DisplayRequest {
-                stream: Stream::Stderr,
-                follow: false,
-            })
-        );
     }
 
     #[test]
@@ -429,15 +263,5 @@ mod tests {
         assert_eq!(format_ack_message(":kill J1"), "kill requested for J1");
         assert_eq!(format_ack_message(":send J1 hi"), "sent J1 hi");
         assert_eq!(format_ack_message(":jobs"), "ok");
-    }
-
-    #[test]
-    fn command_labels_strip_explicit_run_and_cron_prefixes() {
-        assert_eq!(normalize_command_label(":run cargo test"), "cargo test");
-        assert_eq!(
-            normalize_command_label(":cron every 5m cargo test"),
-            "every 5m cargo test"
-        );
-        assert_eq!(normalize_command_label(":out J1"), ":out J1");
     }
 }

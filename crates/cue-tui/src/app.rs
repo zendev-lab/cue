@@ -3,18 +3,16 @@
 //! Central state machine: all mutations flow through [`AppState::update`]
 //! which pattern-matches on app-level messages and delegates to components.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 #[cfg(test)]
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
-    CronInfo, EventPayload, ExecutionInfo, ForegroundAttachmentInfo, ForegroundRole, JobInfo,
-    JobOpenHint, OkPayload, RequestPayload, ResponsePayload, ScheduleInfo, ScriptItemInfo,
-    ScriptItemResult, ScriptRunStatus, Stream,
+    EventPayload, ExecutionInfo, ForegroundAttachmentInfo, ForegroundRole, JobOpenHint, OkPayload,
+    RequestPayload, ResponsePayload, ScheduleInfo,
 };
 use cue_core::job::JobStatus;
 use cue_core::{EventChannel, Mode};
@@ -28,15 +26,12 @@ use crate::clipboard::{self, CopyTarget};
 use crate::completion::{self, CompletionScope};
 use crate::component::Component;
 use crate::component::input_line::{InputLine, InputMsg};
-use crate::component::main_view::{CardStatus, MainView, MainViewMsg, chain_step_label};
+use crate::component::main_view::{CardStatus, MainView, MainViewMsg};
 use crate::component::sidebar::{
     CronSidebarRecord, JobSidebarRecord, OverviewCounts, Sidebar, SidebarMsg, overview_counts,
 };
 use crate::component::status_bar::{StatusBar, StatusBarMsg, compact_session_badge};
-use crate::display::{
-    DisplayPane, DisplayPreview, DisplayStream, DisplayTabHit, display_stream_from_ipc,
-    output_channel_for_job_id, plan_display_subscriptions,
-};
+use crate::display::{DisplayPane, DisplayPreview, DisplayTabHit};
 use crate::focus::{FocusArea, is_mode_switch_key};
 use crate::footer::{self, FooterContext};
 use crate::foreground;
@@ -48,7 +43,6 @@ use crate::job_picker::{
 use crate::message::AppMsg;
 use crate::mouse_mode::MouseMode;
 use crate::record_format::{self, JobRecord};
-use crate::script_summary;
 use crate::session_binding::connector_with_named_session;
 use crate::sidebar_action;
 use crate::status_view;
@@ -61,8 +55,6 @@ use crate::target_settings::{
     saved_target_profile_feedback, target_profile_supports_live_reconnect,
     target_settings_content_rect, target_settings_popup_rect, target_settings_profile_hit,
 };
-#[cfg(test)]
-use cue_core::ipc::{ChainInfo, ScriptSource};
 
 #[derive(Debug, Clone)]
 struct JobRow {
@@ -232,16 +224,9 @@ pub(crate) struct AppState {
     jobs: Vec<JobRow>,
     crons: Vec<CronRow>,
     job_cards: HashMap<String, usize>,
-    cron_job_cards: HashMap<String, (String, usize)>,
-    /// Maps chain_id → card_index for chain cards.
-    chain_cards: HashMap<String, usize>,
-    /// Maps script_id → card_index for script summary cards.
-    script_cards: HashMap<String, usize>,
-    pending_script_finishes: HashMap<String, (ScriptRunStatus, i32, Option<usize>)>,
+    execution_output: HashMap<String, String>,
     fg_session: Option<FgSession>,
     display: DisplayPane,
-    /// Output job IDs confirmed subscribed on the current connection.
-    display_subscriptions: Vec<String>,
     job_picker: Option<JobPickerState>,
     target_settings: Option<TargetSettingsState>,
     target_settings_error: Option<String>,
@@ -277,13 +262,9 @@ impl AppState {
             jobs: Vec::new(),
             crons: Vec::new(),
             job_cards: HashMap::new(),
-            cron_job_cards: HashMap::new(),
-            chain_cards: HashMap::new(),
-            script_cards: HashMap::new(),
-            pending_script_finishes: HashMap::new(),
+            execution_output: HashMap::new(),
             fg_session: None,
             display: DisplayPane::default(),
-            display_subscriptions: Vec::new(),
             job_picker: None,
             target_settings: None,
             target_settings_error: None,
@@ -652,149 +633,6 @@ impl AppState {
         card_index
     }
 
-    fn record_script_finished(
-        &mut self,
-        script_id: String,
-        status: ScriptRunStatus,
-        exit_code: i32,
-        failed_item_index: Option<usize>,
-    ) {
-        if !self.apply_script_finished(&script_id, status, exit_code, failed_item_index)
-            && self.has_pending_user_submission()
-        {
-            self.pending_script_finishes
-                .insert(script_id, (status, exit_code, failed_item_index));
-        }
-    }
-
-    fn apply_script_finished(
-        &mut self,
-        script_id: &str,
-        status: ScriptRunStatus,
-        exit_code: i32,
-        failed_item_index: Option<usize>,
-    ) -> bool {
-        let Some(&card_index) = self.script_cards.get(script_id) else {
-            return false;
-        };
-        self.main_view.append_card_output(
-            card_index,
-            &script_summary::format_finished(status, exit_code, failed_item_index),
-        );
-        self.main_view.set_card_status(
-            card_index,
-            if status == ScriptRunStatus::Done {
-                CardStatus::Success
-            } else {
-                CardStatus::Error
-            },
-        );
-        true
-    }
-
-    fn apply_script_item_created(&mut self, script_id: &str, item: ScriptItemInfo) {
-        let mut sidebar_dirty = false;
-        match &item.result {
-            ScriptItemResult::Job {
-                job_id,
-                start_scope,
-                open_hint,
-            } => {
-                self.upsert_job(
-                    job_id.clone(),
-                    script_summary::summarize_source(&item.source),
-                    JobStatus::Running,
-                    start_scope.clone(),
-                    *open_hint,
-                    Vec::new(),
-                );
-                sidebar_dirty = true;
-            }
-            ScriptItemResult::Chain { chain, .. } => {
-                for job in &chain.jobs {
-                    if let (Some(job_id), Some(open_hint)) = (&job.job_id, &job.open_hint) {
-                        self.upsert_job(
-                            job_id.clone(),
-                            script_summary::summarize_source(&job.pipeline),
-                            job.status.clone(),
-                            job.start_scope.clone(),
-                            *open_hint,
-                            Vec::new(),
-                        );
-                        sidebar_dirty = true;
-                    }
-                }
-            }
-            ScriptItemResult::Cron { cron_id } => {
-                self.upsert_cron(
-                    cron_id.clone(),
-                    script_summary::summarize_source(&item.source),
-                    CronStatus::Scheduled,
-                );
-                sidebar_dirty = true;
-            }
-            ScriptItemResult::Message { .. } => {}
-        }
-        if sidebar_dirty {
-            self.sync_sidebar_items();
-        }
-        if let Some(&card_index) = self.script_cards.get(script_id) {
-            self.main_view
-                .append_card_output(card_index, &script_summary::format_item_created(&item));
-        }
-    }
-
-    fn has_pending_user_submission(&self) -> bool {
-        self.pending_submissions
-            .values()
-            .any(PendingSubmission::is_user_visible)
-    }
-
-    fn desired_display_subscriptions(&self) -> BTreeSet<String> {
-        self.display.desired_subscriptions()
-    }
-
-    fn current_display_subscriptions(&self) -> BTreeSet<String> {
-        self.display_subscriptions.iter().cloned().collect()
-    }
-
-    fn pending_display_subscription_requests(&self) -> (BTreeSet<String>, BTreeSet<String>) {
-        submission::pending_display_subscription_requests(self.pending_submissions.values())
-    }
-
-    fn set_display_subscriptions(&mut self, subscriptions: BTreeSet<String>) {
-        self.display_subscriptions = subscriptions.into_iter().collect();
-    }
-
-    fn confirm_display_subscribe(&mut self, id: &str) {
-        let mut current = self.current_display_subscriptions();
-        current.insert(id.to_string());
-        self.set_display_subscriptions(current);
-    }
-
-    fn confirm_display_unsubscribe(&mut self, id: &str) {
-        let mut current = self.current_display_subscriptions();
-        current.remove(id);
-        self.set_display_subscriptions(current);
-    }
-
-    fn handle_pending_ack(&mut self, pending: &PendingSubmission) {
-        if let Some(id) = pending.display_subscribe_id() {
-            self.confirm_display_subscribe(id);
-            self.sync_display_subscriptions();
-        }
-        if let Some(id) = pending.display_unsubscribe_id() {
-            self.confirm_display_unsubscribe(id);
-            self.sync_display_subscriptions();
-        }
-    }
-
-    fn disable_display_follow(&mut self, id: &str) {
-        if self.display.disable_follow(id) {
-            self.sync_display_subscriptions();
-        }
-    }
-
     fn handle_pending_error(&mut self, pending: &PendingSubmission, code: &str, message: &str) {
         if let Some(description) = pending.silent_description() {
             tracing::warn!(
@@ -804,88 +642,25 @@ impl AppState {
                 "silent request failed"
             );
         }
-        if let Some(id) = pending.display_subscribe_id() {
-            tracing::warn!(
-                job_id = %id,
-                code = %code,
-                message = %message,
-                "output subscription failed"
-            );
-            self.disable_display_follow(id);
-        }
-        if let Some(id) = pending.display_unsubscribe_id() {
-            tracing::warn!(
-                job_id = %id,
-                code = %code,
-                message = %message,
-                "output unsubscription failed"
-            );
-        }
-    }
-
-    fn sync_display_subscriptions(&mut self) {
-        let desired = self.desired_display_subscriptions();
-        let current = self.current_display_subscriptions();
-        let (pending_subscribes, pending_unsubscribes) =
-            self.pending_display_subscription_requests();
-        let plan = plan_display_subscriptions(
-            desired,
-            current,
-            &pending_subscribes,
-            &pending_unsubscribes,
-        );
-
-        for id in plan.subscribe {
-            let Some(channel) = output_channel_for_job_id(&id) else {
-                self.disable_display_follow(&id);
-                continue;
-            };
-            if self.enqueue_silent_request(
-                RequestPayload::subscribe(&[channel]),
-                "output subscribe",
-                PendingSubmission::display_subscribe(id.clone()),
-            ) {
-                tracing::debug!(job_id = %id, "queued output subscription");
-            }
-        }
-        for id in plan.unsubscribe {
-            let Some(channel) = output_channel_for_job_id(&id) else {
-                continue;
-            };
-            if self.enqueue_silent_request(
-                RequestPayload::unsubscribe(&[channel]),
-                "output unsubscribe",
-                PendingSubmission::display_unsubscribe(id.clone()),
-            ) {
-                tracing::debug!(job_id = %id, "queued output unsubscription");
-            }
-        }
     }
 
     fn open_preview_display(&mut self, preview: DisplayPreview) {
         self.display.open_preview(preview);
     }
 
-    fn show_output_display(
-        &mut self,
-        id: String,
-        stream: DisplayStream,
-        data: String,
-        truncated: bool,
-        follow: bool,
-    ) {
-        self.display
-            .show_output(id, stream, data, truncated, follow);
-        self.sync_display_subscriptions();
-    }
-
-    fn append_display_output(&mut self, id: &str, stream: Stream, data: &str) {
-        self.display.append_output(id, stream, data);
+    fn append_execution_output(&mut self, id: &cue_core::StepId, data: &str) {
+        let execution_id = id.execution.to_string();
+        self.execution_output
+            .entry(execution_id.clone())
+            .or_default()
+            .push_str(data);
+        if let Some(card_index) = self.job_cards.get(&execution_id).copied() {
+            self.main_view.append_card_output(card_index, data);
+        }
     }
 
     fn clear_display_pane(&mut self) {
         self.display.clear();
-        self.sync_display_subscriptions();
         self.close_target_settings();
     }
 
@@ -894,9 +669,7 @@ impl AppState {
     }
 
     fn close_display_tab(&mut self, index: usize) {
-        if self.display.close(index) {
-            self.sync_display_subscriptions();
-        }
+        self.display.close(index);
     }
 
     fn display_tab_hit(&self, display_area: Rect, point: Rect) -> Option<DisplayTabHit> {
@@ -1233,14 +1006,6 @@ impl AppState {
         }
     }
 
-    fn request_cron_snapshot(&mut self) {
-        let _ = self.enqueue_silent_request(
-            RequestPayload::ListSchedules { limit: None },
-            ":schedules",
-            PendingSubmission::silent_request(":schedules"),
-        );
-    }
-
     fn track_pending_submission(&mut self, request_id: u32, pending: PendingSubmission) {
         self.pending_submissions.insert(request_id, pending);
     }
@@ -1254,16 +1019,12 @@ impl AppState {
         attachment: ForegroundAttachmentInfo,
         card_index: Option<usize>,
     ) {
-        if attachment.id.starts_with('A') {
-            return;
-        }
-
         let (cols, rows) = self.fg_terminal_size();
         let mut parser = Box::new(vt100::Parser::new(rows, cols, 0));
         parser.process(&attachment.snapshot);
         self.pending_fg_role_requests.clear();
         self.fg_session = Some(FgSession {
-            id: attachment.id,
+            id: attachment.id.to_string(),
             attachment_id: attachment.attachment_id,
             role: attachment.role,
             control_available: attachment.control_available,
@@ -1551,7 +1312,6 @@ impl AppState {
                 let job = self.jobs[index].clone();
                 self.refresh_job_card(card_index, &job);
             }
-            self.refresh_cron_trigger_card(id);
         } else {
             self.jobs.push(JobRow {
                 id: id.to_string(),
@@ -1563,27 +1323,7 @@ impl AppState {
                 warnings: Vec::new(),
                 pending_reason: None,
             });
-            self.refresh_cron_trigger_card(id);
         }
-    }
-
-    fn ensure_job_card(&mut self, job_id: &str, input: String) -> usize {
-        if let Some(index) = self.job_cards.get(job_id).copied() {
-            if self
-                .main_view
-                .cards
-                .get(index)
-                .is_some_and(|card| card.mode == Mode::Job && card.label.as_deref() == Some(job_id))
-            {
-                return index;
-            }
-            self.job_cards.remove(job_id);
-        }
-
-        let index = self.main_view.push_card(input, Mode::Job);
-        self.main_view.set_card_label(index, job_id.to_string());
-        self.job_cards.insert(job_id.to_string(), index);
-        index
     }
 
     fn refresh_job_card(&mut self, card_index: usize, job: &JobRow) {
@@ -1597,34 +1337,14 @@ impl AppState {
 
     fn upsert_cron(&mut self, id: String, label: String, status: CronStatus) {
         if let Some(cron) = self.crons.iter_mut().find(|cron| cron.id == id) {
-            let cron_id = cron.id.clone();
             if !label.is_empty() {
                 cron.label = label;
             }
             cron.status = status;
-            self.refresh_cron_cards_for_cron(&cron_id);
             return;
         }
 
-        let cron_id = id.clone();
         self.crons.push(CronRow { id, label, status });
-        self.refresh_cron_cards_for_cron(&cron_id);
-    }
-
-    fn replace_jobs(&mut self, list: Vec<JobInfo>) {
-        self.jobs = list
-            .into_iter()
-            .map(|job| JobRow {
-                id: job.id,
-                label: job.pipeline,
-                status: job.status,
-                start_scope: job.start_scope,
-                end_scope: job.end_scope,
-                open_hint: job.open_hint,
-                warnings: Vec::new(),
-                pending_reason: job.pending_reason,
-            })
-            .collect();
     }
 
     fn replace_executions(&mut self, executions: Vec<ExecutionInfo>) {
@@ -1632,18 +1352,6 @@ impl AppState {
         for execution in &executions {
             self.upsert_execution(execution);
         }
-    }
-
-    fn replace_crons(&mut self, list: Vec<CronInfo>) {
-        self.crons = list
-            .into_iter()
-            .map(|cron| CronRow {
-                id: cron.id,
-                label: format!("{} {}", cron.schedule, cron.command),
-                status: cron.status,
-            })
-            .collect();
-        self.refresh_all_cron_trigger_cards();
     }
 
     fn replace_schedules(&mut self, schedules: Vec<ScheduleInfo>) {
@@ -1659,82 +1367,6 @@ impl AppState {
                 status: schedule.status,
             })
             .collect();
-        self.refresh_all_cron_trigger_cards();
-    }
-
-    fn ensure_cron_trigger_card(&mut self, cron_id: &str, job_id: &str) -> usize {
-        if let Some((existing_cron_id, card_index)) = self.cron_job_cards.get(job_id).cloned()
-            && existing_cron_id == cron_id
-            && self
-                .main_view
-                .cards
-                .get(card_index)
-                .is_some_and(|card| card.mode == Mode::Cron)
-        {
-            return card_index;
-        }
-
-        let card_index = self
-            .main_view
-            .push_card(format!("cron trigger {cron_id}"), Mode::Cron);
-        self.main_view
-            .set_card_label(card_index, cron_id.to_string());
-        self.cron_job_cards
-            .insert(job_id.to_string(), (cron_id.to_string(), card_index));
-        card_index
-    }
-
-    fn refresh_cron_trigger_card(&mut self, job_id: &str) {
-        let Some((cron_id, card_index)) = self.cron_job_cards.get(job_id).cloned() else {
-            return;
-        };
-
-        let cron = self.crons.iter().find(|cron| cron.id == cron_id).cloned();
-        let cron_label = cron
-            .as_ref()
-            .map(|cron| cron.label.clone())
-            .unwrap_or_else(|| cron_id.clone());
-        let cron_status = cron
-            .as_ref()
-            .map(|cron| cron.status)
-            .unwrap_or(CronStatus::Scheduled);
-        let job = self.jobs.iter().find(|job| job.id == job_id).cloned();
-
-        self.main_view.set_card_output(
-            card_index,
-            record_format::format_cron_trigger_record(
-                &cron_id,
-                &cron_label,
-                cron_status,
-                job.as_ref().map(job_record),
-            ),
-        );
-        self.main_view.set_card_status(
-            card_index,
-            job.as_ref()
-                .map(|job| status_view::job_card_status(&job.status))
-                .unwrap_or(CardStatus::Pending),
-        );
-    }
-
-    fn refresh_cron_cards_for_cron(&mut self, cron_id: &str) {
-        let job_ids: Vec<String> = self
-            .cron_job_cards
-            .iter()
-            .filter_map(|(job_id, (mapped_cron_id, _))| {
-                (mapped_cron_id == cron_id).then_some(job_id.clone())
-            })
-            .collect();
-        for job_id in job_ids {
-            self.refresh_cron_trigger_card(&job_id);
-        }
-    }
-
-    fn refresh_all_cron_trigger_cards(&mut self) {
-        let job_ids: Vec<String> = self.cron_job_cards.keys().cloned().collect();
-        for job_id in job_ids {
-            self.refresh_cron_trigger_card(&job_id);
-        }
     }
 
     fn open_cron_row(&mut self, row: usize) {
@@ -1886,9 +1518,6 @@ impl AppState {
                     self.main_view.clear_all();
                     self.clear_display_pane();
                     self.job_cards.clear();
-                    self.chain_cards.clear();
-                    self.script_cards.clear();
-                    self.pending_script_finishes.clear();
                     self.refresh_clear_action();
                 }
             }
@@ -2027,7 +1656,6 @@ impl AppState {
                 self.sync_mode_views();
                 self.subscribe_core_channels();
                 self.request_sidebar_snapshots();
-                self.sync_display_subscriptions();
                 self.refresh_clear_action();
             }
 
@@ -2037,8 +1665,6 @@ impl AppState {
                 self.pending_fg_role_requests.clear();
                 self.connected = false;
                 self.writer = None;
-                self.display_subscriptions.clear();
-                self.pending_script_finishes.clear();
                 self.close_job_picker();
                 self.status_bar.update(StatusBarMsg::Connected(false));
             }
@@ -2046,8 +1672,6 @@ impl AppState {
             AppMsg::ReconnectFailed { message } => {
                 self.connected = false;
                 self.writer = None;
-                self.display_subscriptions.clear();
-                self.pending_script_finishes.clear();
                 self.status_bar.update(StatusBarMsg::Connected(false));
                 if let Some(state) = self.target_settings.as_mut() {
                     state.set_notice(match self.pending_reconnect_profile_name.as_deref() {
@@ -2066,7 +1690,6 @@ impl AppState {
                 self.sync_mode_views();
                 self.subscribe_core_channels();
                 self.request_sidebar_snapshots();
-                self.sync_display_subscriptions();
                 self.refresh_clear_action();
                 // If this reconnect was triggered by a live target switch, apply
                 // the new profile name and show confirmation.
@@ -2086,7 +1709,7 @@ impl AppState {
                             id: response_job_id,
                             attachment_id: response_attachment_id,
                             ..
-                        }) if response_job_id == &request.job_id
+                        }) if response_job_id.to_string() == request.job_id
                             && response_attachment_id == &request.attachment_id => {}
                         ResponsePayload::Err { code, message } => {
                             self.note_fg_role_failure(request, code, message);
@@ -2104,16 +1727,15 @@ impl AppState {
                 match payload {
                     ResponsePayload::Ok(ok) => match ok {
                         OkPayload::Ack {} => {
-                            if let Some(pending) = pending.as_ref() {
-                                self.handle_pending_ack(pending);
-                                if pending.is_user_visible() {
-                                    self.show_submission_result(
-                                        pending,
-                                        pending.ack_message(),
-                                        CardStatus::Success,
-                                        None,
-                                    );
-                                }
+                            if let Some(pending) = pending.as_ref()
+                                && pending.is_user_visible()
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    pending.ack_message(),
+                                    CardStatus::Success,
+                                    None,
+                                );
                             }
                         }
                         OkPayload::ExecutionCreated { execution } => {
@@ -2123,9 +1745,15 @@ impl AppState {
                                 && pending.is_user_visible()
                             {
                                 let id = execution.id.to_string();
+                                let body = match self.execution_output.get(&id) {
+                                    Some(output) if !output.is_empty() => {
+                                        format!("{output}\n{}", format_execution_info(&execution))
+                                    }
+                                    _ => format_execution_info(&execution),
+                                };
                                 let card_index = self.show_submission_result(
                                     pending,
-                                    format_execution_info(&execution),
+                                    body,
                                     status_view::job_card_status(&execution_job_status(
                                         &execution.state,
                                     )),
@@ -2260,160 +1888,9 @@ impl AppState {
                                 );
                             }
                         }
-                        OkPayload::ScriptCreated {
-                            script_id,
-                            source,
-                            items,
-                            submit_error,
-                        } => {
-                            let mut sidebar_dirty = false;
-                            for item in &items {
-                                match &item.result {
-                                    ScriptItemResult::Job {
-                                        job_id,
-                                        start_scope,
-                                        open_hint,
-                                    } => {
-                                        self.upsert_job(
-                                            job_id.clone(),
-                                            script_summary::summarize_source(&item.source),
-                                            JobStatus::Running,
-                                            start_scope.clone(),
-                                            *open_hint,
-                                            Vec::new(),
-                                        );
-                                        sidebar_dirty = true;
-                                    }
-                                    ScriptItemResult::Chain { chain, .. } => {
-                                        for job in &chain.jobs {
-                                            if let (Some(job_id), Some(open_hint)) =
-                                                (&job.job_id, &job.open_hint)
-                                            {
-                                                self.upsert_job(
-                                                    job_id.clone(),
-                                                    script_summary::summarize_source(&job.pipeline),
-                                                    job.status.clone(),
-                                                    job.start_scope.clone(),
-                                                    *open_hint,
-                                                    Vec::new(),
-                                                );
-                                                sidebar_dirty = true;
-                                            }
-                                        }
-                                    }
-                                    ScriptItemResult::Cron { cron_id } => {
-                                        self.upsert_cron(
-                                            cron_id.clone(),
-                                            script_summary::summarize_source(&item.source),
-                                            CronStatus::Scheduled,
-                                        );
-                                        sidebar_dirty = true;
-                                    }
-                                    ScriptItemResult::Message { .. } => {}
-                                }
-                            }
-                            if sidebar_dirty {
-                                self.sync_sidebar_items();
-                            }
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                let card_index = self.show_submission_result(
-                                    pending,
-                                    script_summary::format_submission(
-                                        &source,
-                                        &items,
-                                        submit_error.as_ref(),
-                                    ),
-                                    if submit_error.is_some() {
-                                        CardStatus::Error
-                                    } else {
-                                        CardStatus::Streaming
-                                    },
-                                    Some(script_id.clone()),
-                                );
-                                self.script_cards.insert(script_id.clone(), card_index);
-                                if let Some((status, exit_code, failed_item_index)) =
-                                    self.pending_script_finishes.remove(&script_id)
-                                {
-                                    self.apply_script_finished(
-                                        &script_id,
-                                        status,
-                                        exit_code,
-                                        failed_item_index,
-                                    );
-                                }
-                            }
-                        }
-                        OkPayload::JobCreated {
-                            job_id,
-                            start_scope,
-                            open_hint,
-                            warnings,
-                            ..
-                        } => {
-                            let label = pending
-                                .as_ref()
-                                .map(PendingSubmission::normalized_command_label)
-                                .unwrap_or_else(|| job_id.clone());
-                            self.upsert_job(
-                                job_id.clone(),
-                                label,
-                                JobStatus::Running,
-                                start_scope,
-                                open_hint,
-                                warnings.clone(),
-                            );
-                            self.sync_sidebar_items();
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                let card_index = if let Some(card_index) = pending.card_index() {
-                                    self.main_view.set_card_label(card_index, job_id.clone());
-                                    self.job_cards.insert(job_id.clone(), card_index);
-                                    card_index
-                                } else {
-                                    self.ensure_job_card(&job_id, pending.input().to_string())
-                                };
-                                if let Some(job) =
-                                    self.jobs.iter().find(|job| job.id == job_id).cloned()
-                                {
-                                    self.refresh_job_card(card_index, &job);
-                                }
-                            }
-                        }
-                        OkPayload::ChainCreated {
-                            chain_id,
-                            job_ids,
-                            chain,
-                            warnings,
-                        } => {
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                let body = submission::decorate_output(
-                                    &warnings,
-                                    format!("{}: {}", chain_id, job_ids.join(", ")),
-                                );
-                                let card_index = self.show_submission_result(
-                                    pending,
-                                    body,
-                                    status_view::chain_card_status(&chain),
-                                    Some(chain_id.clone()),
-                                );
-                                // Register chain → card mapping and annotate the card.
-                                self.chain_cards.insert(chain_id.clone(), card_index);
-                                if chain.total_jobs > 1 {
-                                    self.main_view.update(MainViewMsg::SetCardChainLabel {
-                                        index: card_index,
-                                        label: format!("chain:{}", chain_id),
-                                    });
-                                }
-                            }
-                        }
                         OkPayload::FgAttached(attachment) => {
                             let attachment = *attachment;
-                            let id = attachment.id.clone();
+                            let id = attachment.id.to_string();
                             let card_index = if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
                             {
@@ -2436,25 +1913,12 @@ impl AppState {
                             role,
                             control_available,
                         } => {
-                            self.apply_fg_role_changed(&id, attachment_id, role, control_available);
-                        }
-                        OkPayload::CronAdded { cron_id } => {
-                            let label = pending
-                                .as_ref()
-                                .map(PendingSubmission::normalized_command_label)
-                                .unwrap_or_else(|| cron_id.clone());
-                            self.upsert_cron(cron_id.clone(), label, CronStatus::Scheduled);
-                            self.sync_sidebar_items();
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    cron_id.clone(),
-                                    CardStatus::Success,
-                                    Some(cron_id),
-                                );
-                            }
+                            self.apply_fg_role_changed(
+                                &id.to_string(),
+                                attachment_id,
+                                role,
+                                control_available,
+                            );
                         }
                         OkPayload::ScopeCreated { hash, summary } => {
                             if let Some(pending) = pending.as_ref()
@@ -2468,89 +1932,8 @@ impl AppState {
                                 );
                             }
                         }
-                        OkPayload::JobList(list) => {
-                            let body = record_format::format_job_list_snapshot(&list);
-                            self.replace_jobs(list);
-                            self.sync_sidebar_items();
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    body,
-                                    CardStatus::Success,
-                                    None,
-                                );
-                            }
-                        }
-                        OkPayload::CronList(list) => {
-                            let count = list.len();
-                            self.replace_crons(list);
-                            self.sync_sidebar_items();
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    format!("loaded {count} cron(s) into sidebar"),
-                                    CardStatus::Success,
-                                    None,
-                                );
-                            }
-                        }
-                        OkPayload::EvalText { text } => {
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    text,
-                                    CardStatus::Success,
-                                    None,
-                                );
-                            }
-                        }
                         OkPayload::Pong { version, .. } => {
                             tracing::debug!(?version, "pong received");
-                        }
-                        OkPayload::Output {
-                            id,
-                            data,
-                            truncated,
-                            ..
-                        } => {
-                            if let Some(pending) = pending.as_ref()
-                                && pending.is_user_visible()
-                            {
-                                let request = pending.display_request().unwrap_or(
-                                    submission::DisplayRequest {
-                                        stream: Stream::Stdout,
-                                        follow: false,
-                                    },
-                                );
-                                let display_stream = display_stream_from_ipc(request.stream);
-                                self.show_output_display(
-                                    id.clone(),
-                                    display_stream,
-                                    data,
-                                    truncated,
-                                    request.follow,
-                                );
-                                self.show_submission_result(
-                                    pending,
-                                    format!(
-                                        "{} {} for {id}",
-                                        if request.follow {
-                                            "following"
-                                        } else {
-                                            "opened"
-                                        },
-                                        display_stream.label()
-                                    ),
-                                    CardStatus::Success,
-                                    None,
-                                );
-                            }
                         }
                         _ => {
                             if let Some(pending) = pending.as_ref()
@@ -2597,8 +1980,14 @@ impl AppState {
                     self.upsert_execution(&execution);
                     if let Some(card_index) = self.job_cards.get(&execution.id.to_string()).copied()
                     {
-                        self.main_view
-                            .set_card_output(card_index, format_execution_info(&execution));
+                        let execution_id = execution.id.to_string();
+                        let body = match self.execution_output.get(&execution_id) {
+                            Some(output) if !output.is_empty() => {
+                                format!("{output}\n{}", format_execution_info(&execution))
+                            }
+                            _ => format_execution_info(&execution),
+                        };
+                        self.main_view.set_card_output(card_index, body);
                         self.main_view.set_card_status(
                             card_index,
                             status_view::job_card_status(&execution_job_status(&execution.state)),
@@ -2606,141 +1995,43 @@ impl AppState {
                     }
                     self.sync_sidebar_items();
                 }
-                EventPayload::OutputChunk { id, stream, data } => {
-                    self.append_display_output(&id, stream, &data);
-                }
-                EventPayload::OutputChunkBinary { id, stream, base64 } => {
-                    match BASE64_STANDARD.decode(base64.as_bytes()) {
-                        Ok(bytes) => {
-                            let data = String::from_utf8_lossy(&bytes);
-                            self.append_display_output(&id, stream, &data);
-                        }
-                        Err(error) => {
-                            tracing::warn!(%id, "invalid binary output chunk: {error}");
-                        }
-                    }
-                }
-                EventPayload::OutputEof { .. } => {}
-                EventPayload::JobCreated {
-                    job_id,
-                    pipeline,
-                    start_scope,
-                    open_hint,
-                    chain_id,
-                    chain_index,
-                    chain_total,
+                EventPayload::OutputChunk {
+                    id,
+                    stream: _,
+                    data,
                 } => {
-                    self.upsert_job(
-                        job_id.clone(),
-                        pipeline,
-                        JobStatus::Running,
-                        start_scope,
-                        open_hint,
-                        Vec::new(),
-                    );
-                    // Annotate the chain card with a step label when a new chain job starts.
-                    if let (Some(cid), Some(idx), Some(total)) =
-                        (chain_id, chain_index, chain_total)
-                        && let Some(&card_index) = self.chain_cards.get(&cid)
-                        && total > 1
-                    {
-                        self.main_view.update(MainViewMsg::SetCardChainLabel {
-                            index: card_index,
-                            label: chain_step_label(&cid, idx, total),
-                        });
-                    }
-                    self.refresh_cron_trigger_card(&job_id);
-                    self.sync_sidebar_items();
-                }
-                EventPayload::JobStateChanged {
-                    job_id,
-                    old_state: _,
-                    new_state,
-                    end_scope,
-                    ..
-                } => {
-                    self.update_job_status(&job_id, new_state, end_scope);
-                    self.sync_sidebar_items();
-                }
-                EventPayload::JobRemoved { job_id } => {
-                    self.jobs.retain(|job| job.id != job_id);
-                    self.job_cards.remove(&job_id);
-                    self.cron_job_cards.remove(&job_id);
-                    self.sync_sidebar_items();
-                }
-                EventPayload::ChainProgress { chain } => {
-                    if let Some(&card_index) = self.chain_cards.get(&chain.id) {
-                        self.main_view
-                            .set_card_status(card_index, status_view::chain_card_status(&chain));
-                        let running_step = chain
-                            .jobs
-                            .iter()
-                            .position(|j| j.status == cue_core::job::JobStatus::Running)
-                            .or_else(|| {
-                                chain
-                                    .jobs
-                                    .iter()
-                                    .rposition(|j| j.status == cue_core::job::JobStatus::Done)
-                                    .map(|i| i + 1)
-                            })
-                            .unwrap_or(0)
-                            .min(chain.total_jobs.saturating_sub(1));
-                        if chain.total_jobs > 1 {
-                            self.main_view.update(MainViewMsg::SetCardChainLabel {
-                                index: card_index,
-                                label: chain_step_label(&chain.id, running_step, chain.total_jobs),
-                            });
-                        }
-                    }
-                }
-                EventPayload::ScriptItemCreated { script_id, item } => {
-                    self.apply_script_item_created(&script_id, item);
-                }
-                EventPayload::ScriptFinished {
-                    script_id,
-                    status,
-                    exit_code,
-                    failed_item_index,
-                } => {
-                    self.record_script_finished(script_id, status, exit_code, failed_item_index);
+                    self.append_execution_output(&id, &String::from_utf8_lossy(&data));
                 }
                 EventPayload::FgOutput {
                     id,
                     attachment_id,
                     data,
                 } => {
-                    self.append_fg_output(&id, attachment_id, &data);
+                    self.append_fg_output(&id.to_string(), attachment_id, &data);
                 }
                 EventPayload::FgControlChanged {
                     id,
                     attachment_id,
                     control_available,
                 } => {
-                    self.update_fg_control_available(&id, attachment_id, control_available);
+                    self.update_fg_control_available(
+                        &id.to_string(),
+                        attachment_id,
+                        control_available,
+                    );
                 }
                 EventPayload::FgExited {
                     id,
                     attachment_id,
                     reason,
                 } => {
-                    self.finish_fg_session(&id, attachment_id, &reason);
-                }
-                EventPayload::CronTriggered { cron_id, job_id } => {
-                    self.ensure_cron_trigger_card(&cron_id, &job_id);
-                    self.refresh_cron_trigger_card(&job_id);
-                    self.request_cron_snapshot();
-                }
-                EventPayload::CronRemoved { cron_id } => {
-                    self.crons.retain(|cron| cron.id != cron_id);
-                    self.refresh_cron_cards_for_cron(&cron_id);
-                    self.sync_sidebar_items();
+                    self.finish_fg_session(&id.to_string(), attachment_id, &reason);
                 }
                 EventPayload::ShuttingDown { reason } => {
                     self.main_view.update(MainViewMsg::AppendOutput {
                         data: format!("⚠ Daemon shutting down: {reason}"),
                     });
                     self.connected = false;
-                    self.pending_script_finishes.clear();
                     self.status_bar.update(StatusBarMsg::Connected(false));
                 }
             },
@@ -3121,23 +2412,30 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use cue_core::ipc::Message;
+    use cue_core::ipc::{Message, Stream};
     use tokio::io::AsyncReadExt;
     use tokio::time::timeout;
+
+    fn step(execution: u64) -> cue_core::StepId {
+        cue_core::StepId {
+            execution: cue_core::ExecutionId(execution),
+            index: 1,
+        }
+    }
 
     fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
         state.track_pending_submission(id, pending);
     }
 
     fn fg_attachment(
-        id: &str,
+        execution: u64,
         role: ForegroundRole,
         control_available: bool,
         snapshot: impl Into<Vec<u8>>,
         snapshot_truncated: bool,
     ) -> OkPayload {
         OkPayload::FgAttached(Box::new(ForegroundAttachmentInfo {
-            id: id.into(),
+            id: step(execution),
             attachment_id: 1,
             role,
             control_available,
@@ -3175,152 +2473,6 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    fn pending_display_subscribe_id(state: &AppState, expected_job_id: &str) -> u32 {
-        state
-            .pending_submissions
-            .iter()
-            .find_map(|(request_id, pending)| {
-                (pending.display_subscribe_id() == Some(expected_job_id)).then_some(*request_id)
-            })
-            .expect("pending display subscribe request")
-    }
-
-    fn pending_display_unsubscribe_id(state: &AppState, expected_job_id: &str) -> u32 {
-        state
-            .pending_submissions
-            .iter()
-            .find_map(|(request_id, pending)| {
-                (pending.display_unsubscribe_id() == Some(expected_job_id)).then_some(*request_id)
-            })
-            .expect("pending display unsubscribe request")
-    }
-
-    fn chain_info(id: &str, statuses: Vec<JobStatus>) -> ChainInfo {
-        ChainInfo {
-            id: id.into(),
-            pipeline: "build -> test".into(),
-            total_jobs: statuses.len(),
-            jobs: statuses
-                .into_iter()
-                .enumerate()
-                .map(|(index, status)| cue_core::ipc::ChainJobInfo {
-                    index,
-                    pipeline: format!("step {index}"),
-                    status,
-                    job_id: Some(format!("J{}", index + 1)),
-                    start_scope: None,
-                    end_scope: None,
-                    open_hint: Some(JobOpenHint::Stream),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn script_finished_before_created_is_applied_to_created_card() {
-        let mut state = AppState::new();
-        let card_index = state
-            .main_view
-            .push_card("cue run fast.cue".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(
-                Some(card_index),
-                "cue run fast.cue".into(),
-                Mode::Job,
-                Vec::new(),
-            ),
-        );
-
-        state.update(AppMsg::ServerEvent(EventPayload::ScriptFinished {
-            script_id: "R1".into(),
-            status: ScriptRunStatus::Done,
-            exit_code: 0,
-            failed_item_index: None,
-        }));
-        assert!(state.pending_script_finishes.contains_key("R1"));
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
-                script_id: "R1".into(),
-                source: ScriptSource::File {
-                    path: "fast.cue".into(),
-                },
-                items: vec![],
-                submit_error: None,
-            }),
-        });
-
-        let card = &state.main_view.cards[card_index];
-        assert_eq!(card.status, CardStatus::Success);
-        assert!(card.output.contains("submitted 0 item(s)"));
-        assert!(card.output.contains("script finished: Done, exit=0"));
-        assert!(!state.pending_script_finishes.contains_key("R1"));
-    }
-
-    #[test]
-    fn script_item_created_updates_the_matching_script_card() {
-        let mut state = AppState::new();
-        let card_index = state
-            .main_view
-            .push_card("cue run two.cue".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(
-                Some(card_index),
-                "cue run two.cue".into(),
-                Mode::Job,
-                Vec::new(),
-            ),
-        );
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
-                script_id: "R1".into(),
-                source: ScriptSource::File {
-                    path: "two.cue".into(),
-                },
-                items: vec![],
-                submit_error: None,
-            }),
-        });
-
-        state.update(AppMsg::ServerEvent(EventPayload::ScriptItemCreated {
-            script_id: "R1".into(),
-            item: ScriptItemInfo {
-                index: 1,
-                source: "echo second".into(),
-                result: ScriptItemResult::Job {
-                    job_id: "J2".into(),
-                    start_scope: Some("S@abc12345".into()),
-                    open_hint: JobOpenHint::Stream,
-                },
-            },
-        }));
-
-        let card = &state.main_view.cards[card_index];
-        assert!(card.output.contains("2. echo second -> J2"));
-        assert!(state.jobs.iter().any(|job| job.id == "J2"));
-    }
-
-    #[test]
-    fn unknown_script_finished_without_pending_submission_is_not_cached() {
-        let mut state = AppState::new();
-
-        state.update(AppMsg::ServerEvent(EventPayload::ScriptFinished {
-            script_id: "R-other".into(),
-            status: ScriptRunStatus::Done,
-            exit_code: 0,
-            failed_item_index: None,
-        }));
-
-        assert!(state.pending_script_finishes.is_empty());
-        assert!(state.script_cards.is_empty());
-    }
-
     fn test_target_profile(
         name: &str,
         transport: &str,
@@ -3356,97 +2508,6 @@ mod tests {
             default_profile: default_profile.into(),
             profiles,
         }
-    }
-
-    #[test]
-    fn job_created_response_shows_job_id_not_stdout() {
-        let mut state = AppState::new();
-        let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
-        );
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::JobCreated {
-                job_id: "J1".into(),
-                start_scope: Some("S@abc12345".into()),
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                warnings: Vec::new(),
-            }),
-        });
-
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.label.as_deref(), Some("J1"));
-        assert_eq!(card.output, "J1\nstatus: running\nstart scope: S@abc12345");
-        assert_eq!(card.status, CardStatus::Streaming);
-        assert_eq!(state.jobs.len(), 1);
-        assert_eq!(state.jobs[0].label, "sleep 4");
-    }
-
-    #[test]
-    fn job_created_without_precreated_card_opens_command_log_record() {
-        let mut state = AppState::new();
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(None, "sleep 4".into(), Mode::Job, Vec::new()),
-        );
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::JobCreated {
-                job_id: "J1".into(),
-                start_scope: Some("S@abc12345".into()),
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                warnings: Vec::new(),
-            }),
-        });
-
-        assert_eq!(state.main_view.cards.len(), 1);
-        assert_eq!(
-            state.main_view.cards[0].output,
-            "J1\nstatus: running\nstart scope: S@abc12345"
-        );
-        assert_eq!(state.jobs.len(), 1);
-        assert_eq!(state.jobs[0].label, "sleep 4");
-    }
-
-    #[test]
-    fn output_events_do_not_overwrite_run_card() {
-        let mut state = AppState::new();
-        let card_index = state.main_view.push_card("ls".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(Some(card_index), "ls".into(), Mode::Job, Vec::new()),
-        );
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::JobCreated {
-                job_id: "J1".into(),
-                start_scope: Some("S@abc12345".into()),
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                warnings: Vec::new(),
-            }),
-        });
-        state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
-            id: "J1".into(),
-            stream: cue_core::ipc::Stream::Stdout,
-            data: "file.txt\n".into(),
-        }));
-
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.output, "J1\nstatus: running\nstart scope: S@abc12345");
     }
 
     #[test]
@@ -3510,100 +2571,6 @@ mod tests {
     }
 
     #[test]
-    fn output_response_without_precreated_card_opens_display_pane() {
-        let mut state = AppState::new();
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(None, ":out J1".into(), Mode::Job, Vec::new()),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::Output {
-                id: "J1".into(),
-                data: "hello\n".into(),
-                truncated: false,
-                encoding: Default::default(),
-                base64: None,
-            }),
-        });
-
-        assert_eq!(state.main_view.cards.len(), 1);
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.input, ":out J1");
-        assert_eq!(card.output, "opened stdout for J1");
-        assert_eq!(card.status, CardStatus::Success);
-        assert_eq!(state.display_pane_title(), " Display ".to_string());
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" stdout J1  × ".to_string()]
-        );
-        assert_eq!(state.display_pane_content(), "hello\n");
-    }
-
-    #[test]
-    fn tail_response_opens_following_stdout_tab() {
-        let mut state = AppState::new();
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(None, ":tail J1".into(), Mode::Job, Vec::new()),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::Output {
-                id: "J1".into(),
-                data: "hello\n".into(),
-                truncated: false,
-                encoding: Default::default(),
-                base64: None,
-            }),
-        });
-        state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
-            id: "J1".into(),
-            stream: cue_core::ipc::Stream::Stdout,
-            data: "world\n".into(),
-        }));
-
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.output, "following stdout for J1");
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" follow stdout J1  × ".to_string()]
-        );
-        assert_eq!(state.display_pane_content(), "hello\nworld\n");
-    }
-
-    #[test]
-    fn err_response_opens_stderr_tab() {
-        let mut state = AppState::new();
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(None, ":err J1".into(), Mode::Job, Vec::new()),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::Output {
-                id: "J1".into(),
-                data: "boom\n".into(),
-                truncated: false,
-                encoding: Default::default(),
-                base64: None,
-            }),
-        });
-
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" stderr J1  × ".to_string()]
-        );
-        assert_eq!(state.display_pane_content(), "boom\n");
-    }
-
-    #[test]
     fn scope_created_response_shows_summary_not_only_hash() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card(":cd /tmp".into(), Mode::Job);
@@ -3628,202 +2595,30 @@ mod tests {
     }
 
     #[test]
-    fn streaming_output_appends_only_to_active_display_pane() {
+    fn typed_step_output_is_buffered_and_appended_to_execution_card() {
         let mut state = AppState::new();
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
+        let step = cue_core::StepId {
+            execution: cue_core::ExecutionId(7),
+            index: 1,
+        };
 
         state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
-            id: "J1".into(),
-            stream: cue_core::ipc::Stream::Stdout,
-            data: "world\n".into(),
+            id: step,
+            stream: Stream::Stdout,
+            data: b"early\n".to_vec(),
         }));
-        state.update(AppMsg::ServerEvent(EventPayload::OutputChunkBinary {
-            id: "J1".into(),
-            stream: cue_core::ipc::Stream::Stdout,
-            base64: BASE64_STANDARD.encode([0xff, b'b', b'i', b'n', b'\n']),
-        }));
+        assert_eq!(state.execution_output.get("E7").unwrap(), "early\n");
+
+        let card_index = state.main_view.push_card("echo later".into(), Mode::Job);
+        state.job_cards.insert("E7".into(), card_index);
         state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
-            id: "J2".into(),
-            stream: cue_core::ipc::Stream::Stdout,
-            data: "ignored\n".into(),
+            id: step,
+            stream: Stream::Stdout,
+            data: b"later\n".to_vec(),
         }));
 
-        assert_eq!(
-            state.display_pane_content(),
-            format!("hello\nworld\n{}", String::from_utf8_lossy(b"\xffbin\n"))
-        );
-    }
-
-    #[test]
-    fn failed_follow_subscription_is_not_marked_active() {
-        let mut state = AppState::new();
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
-
-        assert!(state.display_subscriptions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn follow_subscription_becomes_active_only_after_ack() {
-        let mut state = AppState::new();
-        let _server_stream = attach_test_writer(&mut state);
-
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
-
-        let request_id = pending_display_subscribe_id(&state, "J1");
-        assert!(state.display_subscriptions.is_empty());
-
-        state.update(AppMsg::Response {
-            id: request_id,
-            payload: ResponsePayload::Ok(OkPayload::Ack {}),
-        });
-
-        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn failed_follow_subscription_response_is_not_marked_active() {
-        let mut state = AppState::new();
-        let _server_stream = attach_test_writer(&mut state);
-
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
-
-        let request_id = pending_display_subscribe_id(&state, "J1");
-        state.update(AppMsg::Response {
-            id: request_id,
-            payload: ResponsePayload::Err {
-                code: "event_bus".into(),
-                message: "subscribe failed".into(),
-            },
-        });
-
-        assert!(state.display_subscriptions.is_empty());
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" stdout J1  × ".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn reconnect_retries_follow_subscription_after_offline_open() {
-        let mut state = AppState::new();
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
-        assert!(state.display_subscriptions.is_empty());
-
-        let (client_stream, _server_stream) = tokio::io::duplex(4096);
-        let client = crate::client::CuedClient::from_stream(client_stream);
-        let (_reader, writer) = client.into_reader_and_writer_handle();
-        state.update(AppMsg::Reconnected { writer });
-
-        let request_id = pending_display_subscribe_id(&state, "J1");
-        assert!(state.display_subscriptions.is_empty());
-        state.update(AppMsg::Response {
-            id: request_id,
-            payload: ResponsePayload::Ok(OkPayload::Ack {}),
-        });
-
-        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn disconnect_clears_active_follow_subscriptions() {
-        let mut state = AppState::new();
-        let _server_stream = attach_test_writer(&mut state);
-
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
-        let request_id = pending_display_subscribe_id(&state, "J1");
-        state.update(AppMsg::Response {
-            id: request_id,
-            payload: ResponsePayload::Ok(OkPayload::Ack {}),
-        });
-        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
-
-        state.update(AppMsg::Disconnected);
-
-        assert!(state.display_subscriptions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn closing_follow_tab_keeps_subscription_active_until_unsubscribe_ack() {
-        let mut state = AppState::new();
-        let _server_stream = attach_test_writer(&mut state);
-
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            true,
-        );
-        let subscribe_id = pending_display_subscribe_id(&state, "J1");
-        state.update(AppMsg::Response {
-            id: subscribe_id,
-            payload: ResponsePayload::Ok(OkPayload::Ack {}),
-        });
-
-        state.close_display_tab(0);
-
-        let unsubscribe_id = pending_display_unsubscribe_id(&state, "J1");
-        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
-
-        state.update(AppMsg::Response {
-            id: unsubscribe_id,
-            payload: ResponsePayload::Ok(OkPayload::Ack {}),
-        });
-
-        assert!(state.display_subscriptions.is_empty());
-    }
-
-    #[test]
-    fn clear_display_resets_upper_pane() {
-        let mut state = AppState::new();
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            false,
-        );
-
-        state.update(AppMsg::ClearDisplay);
-
-        assert_eq!(state.display_pane_title(), " Display ".to_string());
-        assert!(state.display_pane_content().contains("Use `:out J1`"));
+        assert_eq!(state.main_view.cards[card_index].output, "later\n");
+        assert_eq!(state.execution_output.get("E7").unwrap(), "early\nlater\n");
     }
 
     #[test]
@@ -4456,20 +3251,8 @@ destination = "devbox"
     #[test]
     fn display_tabs_switch_and_close() {
         let mut state = AppState::new();
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "one\n".into(),
-            false,
-            false,
-        );
-        state.show_output_display(
-            "J2".into(),
-            DisplayStream::Stdout,
-            "two\n".into(),
-            false,
-            false,
-        );
+        state.open_preview_display(DisplayPreview::new("one", "first", "one\n"));
+        state.open_preview_display(DisplayPreview::new("two", "second", "two\n"));
 
         assert_eq!(state.active_display_tab(), Some(1));
         assert_eq!(state.display_tab_labels().len(), 2);
@@ -4478,29 +3261,20 @@ destination = "devbox"
         assert_eq!(state.display_pane_content(), "one\n");
 
         state.close_display_tab(0);
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" stdout J2  × ".to_string()]
-        );
+        assert_eq!(state.display_tab_labels(), vec![" second  × ".to_string()]);
         assert_eq!(state.display_pane_content(), "two\n");
     }
 
     #[test]
     fn copy_target_prefers_active_display_tab() {
         let mut state = AppState::new();
-        state.show_output_display(
-            "J1".into(),
-            DisplayStream::Stdout,
-            "hello\n".into(),
-            false,
-            false,
-        );
+        state.open_preview_display(DisplayPreview::new("execution:E1", "E1", "hello\n"));
         state.main_view.push_card("sleep 1".into(), Mode::Job);
 
         assert_eq!(
             state.copy_target(),
             Some(CopyTarget {
-                label: "stdout J1".into(),
+                label: "E1".into(),
                 content: "hello\n".into(),
             })
         );
@@ -4588,66 +3362,6 @@ destination = "devbox"
         let card = state.main_view.cards.last().expect("kill card");
         assert_eq!(card.input, ":kill C1");
         assert_eq!(card.mode, Mode::Cron);
-    }
-
-    #[test]
-    fn cron_trigger_event_creates_cron_record() {
-        let mut state = AppState::new();
-        state.crons.push(CronRow {
-            id: "C1".into(),
-            label: "every 5m cargo test".into(),
-            status: CronStatus::Scheduled,
-        });
-
-        state.update(AppMsg::ServerEvent(EventPayload::CronTriggered {
-            cron_id: "C1".into(),
-            job_id: "J42".into(),
-        }));
-
-        let card = state.main_view.cards.last().expect("cron trigger card");
-        assert_eq!(card.mode, Mode::Cron);
-        assert_eq!(card.label.as_deref(), Some("C1"));
-        assert!(card.output.contains("definition: every 5m cargo test"));
-        assert!(card.output.contains("job: awaiting snapshot"));
-    }
-
-    #[test]
-    fn cron_trigger_card_tracks_job_status_updates() {
-        let mut state = AppState::new();
-        state.crons.push(CronRow {
-            id: "C1".into(),
-            label: "every 5m cargo test".into(),
-            status: CronStatus::Scheduled,
-        });
-        state.update(AppMsg::ServerEvent(EventPayload::CronTriggered {
-            cron_id: "C1".into(),
-            job_id: "J42".into(),
-        }));
-
-        state.update(AppMsg::ServerEvent(EventPayload::JobCreated {
-            job_id: "J42".into(),
-            pipeline: "cargo test".into(),
-            start_scope: Some("S@abc".into()),
-            open_hint: JobOpenHint::Stream,
-            chain_id: None,
-            chain_index: None,
-            chain_total: None,
-        }));
-        state.update(AppMsg::ServerEvent(EventPayload::JobStateChanged {
-            job_id: "J42".into(),
-            old_state: JobStatus::Running,
-            new_state: JobStatus::Done,
-            end_scope: Some("S@def".into()),
-            chain_id: None,
-            chain_index: None,
-        }));
-
-        let card = state.main_view.cards.last().expect("cron trigger card");
-        assert_eq!(card.status, CardStatus::Success);
-        assert!(card.output.contains("J42"));
-        assert!(card.output.contains("status: done"));
-        assert!(card.output.contains("start scope: S@abc"));
-        assert!(card.output.contains("end scope: S@def"));
     }
 
     #[test]
@@ -4756,18 +3470,18 @@ destination = "devbox"
     }
 
     #[test]
-    fn fg_attach_without_precreated_card_opens_display_and_session() {
+    fn step_attach_without_precreated_card_opens_display_and_session() {
         let mut state = AppState::new();
         queue_pending(
             &mut state,
             1,
-            PendingSubmission::user(None, ":fg J1".into(), Mode::Job, Vec::new()),
+            PendingSubmission::user(None, ":fg E1/S1".into(), Mode::Job, Vec::new()),
         );
 
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(fg_attachment(
-                "J1",
+                1,
                 ForegroundRole::Controller,
                 false,
                 Vec::new(),
@@ -4778,8 +3492,8 @@ destination = "devbox"
         assert!(state.fg_active());
         assert_eq!(state.main_view.cards.len(), 1);
         let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.input, ":fg J1");
-        assert_eq!(card.label.as_deref(), Some("J1"));
+        assert_eq!(card.input, ":fg E1/S1");
+        assert_eq!(card.label.as_deref(), Some("E1/S1"));
         assert_eq!(card.status, CardStatus::Streaming);
     }
 
@@ -4792,7 +3506,7 @@ destination = "devbox"
 
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J1".into(),
+                id: step(1),
                 attachment_id: 1,
                 role: ForegroundRole::Observer,
                 control_available: false,
@@ -4809,11 +3523,11 @@ destination = "devbox"
     }
 
     #[test]
-    fn fg_watch_starts_from_snapshot_and_filters_output_by_job_id() {
+    fn fg_watch_starts_from_snapshot_and_filters_output_by_step_id() {
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J1".into(),
+                id: step(1),
                 attachment_id: 11,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -4829,24 +3543,18 @@ destination = "devbox"
         assert!(state.fg_footer_text().contains("history truncated"));
 
         state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
-            id: "J2".into(),
+            id: step(2),
             attachment_id: 11,
             data: b"foreign\r\n".to_vec(),
         }));
         assert!(!state.fg_screen().unwrap().contents().contains("foreign"));
 
         state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
-            id: String::new(),
-            attachment_id: 0,
-            data: b"legacy\r\n".to_vec(),
-        }));
-        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
-            id: "J1".into(),
+            id: step(1),
             attachment_id: 11,
             data: b"live\r\n".to_vec(),
         }));
         let contents = state.fg_screen().unwrap().contents();
-        assert!(!contents.contains("legacy"));
         assert!(contents.contains("live"));
     }
 
@@ -4855,7 +3563,7 @@ destination = "devbox"
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J2".into(),
+                id: step(2),
                 attachment_id: 22,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -4866,21 +3574,21 @@ destination = "devbox"
         );
 
         state.update(AppMsg::ServerEvent(EventPayload::FgControlChanged {
-            id: "J2".into(),
+            id: step(2),
             attachment_id: 21,
             control_available: false,
         }));
         state.update(AppMsg::ServerEvent(EventPayload::FgExited {
-            id: "J2".into(),
+            id: step(2),
             attachment_id: 21,
             reason: "done".into(),
         }));
 
-        assert_eq!(state.fg_id(), Some("J2"));
+        assert_eq!(state.fg_id(), Some("E2/S1"));
         assert!(state.fg_footer_text().contains("control available"));
 
         state.update(AppMsg::ServerEvent(EventPayload::FgControlChanged {
-            id: "J2".into(),
+            id: step(2),
             attachment_id: 22,
             control_available: false,
         }));
@@ -4888,42 +3596,11 @@ destination = "devbox"
     }
 
     #[test]
-    fn legacy_foreground_attachment_accepts_only_legacy_epoch_events() {
+    fn delayed_role_response_for_same_step_cannot_mutate_new_attachment() {
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J1".into(),
-                attachment_id: 0,
-                role: ForegroundRole::Observer,
-                control_available: true,
-                snapshot: Vec::new(),
-                snapshot_truncated: false,
-            },
-            None,
-        );
-
-        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
-            id: String::new(),
-            attachment_id: 0,
-            data: b"legacy\r\n".to_vec(),
-        }));
-        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
-            id: "J1".into(),
-            attachment_id: 1,
-            data: b"wrong generation\r\n".to_vec(),
-        }));
-
-        let contents = state.fg_screen().unwrap().contents();
-        assert!(contents.contains("legacy"));
-        assert!(!contents.contains("wrong generation"));
-    }
-
-    #[test]
-    fn delayed_role_response_for_same_job_cannot_mutate_new_attachment() {
-        let mut state = AppState::new();
-        state.start_fg_session(
-            ForegroundAttachmentInfo {
-                id: "J5".into(),
+                id: step(5),
                 attachment_id: 52,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -4936,7 +3613,7 @@ destination = "devbox"
         state.update(AppMsg::Response {
             id: 99,
             payload: ResponsePayload::Ok(OkPayload::FgRoleChanged {
-                id: "J5".into(),
+                id: step(5),
                 attachment_id: 51,
                 role: ForegroundRole::Controller,
                 control_available: false,
@@ -4976,7 +3653,7 @@ destination = "devbox"
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J6".into(),
+                id: step(6),
                 attachment_id: 6,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -5016,7 +3693,7 @@ destination = "devbox"
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J7".into(),
+                id: step(7),
                 attachment_id: 7,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -5052,7 +3729,7 @@ destination = "devbox"
         state.update(AppMsg::Response {
             id: claim_id,
             payload: ResponsePayload::Ok(OkPayload::FgRoleChanged {
-                id: "J7".into(),
+                id: step(7),
                 attachment_id: 7,
                 role: ForegroundRole::Controller,
                 control_available: false,
@@ -5085,7 +3762,7 @@ destination = "devbox"
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J3".into(),
+                id: step(3),
                 attachment_id: 3,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -5131,7 +3808,7 @@ destination = "devbox"
         let mut state = AppState::new();
         state.start_fg_session(
             ForegroundAttachmentInfo {
-                id: "J4".into(),
+                id: step(4),
                 attachment_id: 4,
                 role: ForegroundRole::Controller,
                 control_available: false,
@@ -5159,7 +3836,7 @@ destination = "devbox"
         state.update(AppMsg::Response {
             id: request_id,
             payload: ResponsePayload::Ok(OkPayload::FgRoleChanged {
-                id: "J4".into(),
+                id: step(4),
                 attachment_id: 4,
                 role: ForegroundRole::Observer,
                 control_available: true,
@@ -5235,86 +3912,6 @@ destination = "devbox"
     }
 
     #[test]
-    fn chain_created_does_not_overwrite_leaf_label() {
-        let mut state = AppState::new();
-        let card_index = state.main_view.push_card("sleep 4 -> ls".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(
-                Some(card_index),
-                "sleep 4 -> ls".into(),
-                Mode::Job,
-                Vec::new(),
-            ),
-        );
-
-        state.update(AppMsg::ServerEvent(EventPayload::JobCreated {
-            job_id: "J1".into(),
-            pipeline: "sleep 4".into(),
-            start_scope: Some("S@abc12345".into()),
-            open_hint: JobOpenHint::Stream,
-            chain_id: None,
-            chain_index: None,
-            chain_total: None,
-        }));
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::ChainCreated {
-                chain_id: "CH1".into(),
-                job_ids: vec!["J1".into()],
-                chain: cue_core::ipc::ChainInfo {
-                    id: "CH1".into(),
-                    pipeline: "sleep 4 -> ls".into(),
-                    total_jobs: 1,
-                    jobs: vec![],
-                },
-                warnings: Vec::new(),
-            }),
-        });
-
-        assert_eq!(state.jobs[0].label, "sleep 4");
-        assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
-        assert_eq!(state.main_view.cards.last().unwrap().output, "CH1: J1");
-    }
-
-    #[test]
-    fn chain_card_status_follows_chain_progress_snapshot() {
-        let mut state = AppState::new();
-        let card_index = state.main_view.push_card("build -> test".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(
-                Some(card_index),
-                "build -> test".into(),
-                Mode::Job,
-                Vec::new(),
-            ),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::ChainCreated {
-                chain_id: "CH1".into(),
-                job_ids: vec!["J1".into()],
-                chain: chain_info("CH1", vec![JobStatus::Running, JobStatus::Pending]),
-                warnings: Vec::new(),
-            }),
-        });
-
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.status, CardStatus::Streaming);
-
-        state.update(AppMsg::ServerEvent(EventPayload::ChainProgress {
-            chain: chain_info("CH1", vec![JobStatus::Failed, JobStatus::Pending]),
-        }));
-
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.status, CardStatus::Error);
-    }
-
-    #[test]
     fn missing_operator_spacing_warns_on_submit() {
         let mut state = AppState::new();
         state.update(AppMsg::Submit("sleep 4->ls".into()));
@@ -5359,128 +3956,17 @@ destination = "devbox"
     }
 
     #[test]
-    fn silent_snapshot_responses_do_not_consume_user_cards() {
-        let mut state = AppState::new();
-        let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
-        queue_pending(&mut state, 1, PendingSubmission::silent());
-        queue_pending(
-            &mut state,
-            2,
-            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::JobList(vec![])),
-        });
-        state.update(AppMsg::Response {
-            id: 2,
-            payload: ResponsePayload::Ok(OkPayload::JobCreated {
-                job_id: "J1".into(),
-                start_scope: None,
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                warnings: Vec::new(),
-            }),
-        });
-
-        let card = &state.main_view.cards[card_index];
-        assert_eq!(card.label.as_deref(), Some("J1"));
-        assert_eq!(card.output, "J1\nstatus: running");
-    }
-
-    #[test]
-    fn responses_match_pending_submissions_by_request_id() {
-        let mut state = AppState::new();
-        let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
-        queue_pending(
-            &mut state,
-            10,
-            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
-        );
-        queue_pending(&mut state, 11, PendingSubmission::silent());
-
-        state.update(AppMsg::Response {
-            id: 11,
-            payload: ResponsePayload::Ok(OkPayload::JobList(vec![])),
-        });
-        state.update(AppMsg::Response {
-            id: 10,
-            payload: ResponsePayload::Ok(OkPayload::JobCreated {
-                job_id: "J1".into(),
-                start_scope: None,
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                warnings: Vec::new(),
-            }),
-        });
-
-        let card = &state.main_view.cards[card_index];
-        assert_eq!(card.label.as_deref(), Some("J1"));
-        assert_eq!(card.output, "J1\nstatus: running");
-    }
-
-    #[test]
-    fn job_created_event_carries_start_scope_into_sidebar() {
-        let mut state = AppState::new();
-
-        state.update(AppMsg::ServerEvent(EventPayload::JobCreated {
-            job_id: "J1".into(),
-            pipeline: "sleep 4".into(),
-            start_scope: Some("S@abc12345".into()),
-            open_hint: JobOpenHint::Stream,
-            chain_id: None,
-            chain_index: None,
-            chain_total: None,
-        }));
-
-        assert_eq!(state.jobs.len(), 1);
-        assert_eq!(state.jobs[0].label, "sleep 4");
-        assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
-    }
-
-    #[test]
-    fn job_list_snapshot_preserves_start_scope() {
-        let mut state = AppState::new();
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::JobList(vec![JobInfo {
-                id: "J1".into(),
-                session_id: None,
-                status: JobStatus::Running,
-                pipeline: "sleep 4".into(),
-                exit_code: None,
-                start_scope: Some("S@abc12345".into()),
-                end_scope: None,
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                pending_reason: None,
-            }])),
-        });
-
-        assert_eq!(state.jobs.len(), 1);
-        assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
-    }
-
-    #[test]
     fn fg_output_updates_terminal_modes_and_preserves_formatted_contents() {
         let mut state = AppState::new();
         queue_pending(
             &mut state,
             1,
-            PendingSubmission::user(None, ":fg J1".into(), Mode::Job, Vec::new()),
+            PendingSubmission::user(None, ":fg E1/S1".into(), Mode::Job, Vec::new()),
         );
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(fg_attachment(
-                "J1",
+                1,
                 ForegroundRole::Controller,
                 false,
                 Vec::new(),
@@ -5488,7 +3974,7 @@ destination = "devbox"
             )),
         });
         state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
-            id: "J1".into(),
+            id: step(1),
             attachment_id: 1,
             data: b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[31mhello\x1b[0m".to_vec(),
         }));
@@ -5500,7 +3986,7 @@ destination = "devbox"
         assert!(screen.contents().contains("hello"));
 
         state.update(AppMsg::ServerEvent(EventPayload::FgExited {
-            id: "J1".into(),
+            id: step(1),
             attachment_id: 1,
             reason: "detached".into(),
         }));

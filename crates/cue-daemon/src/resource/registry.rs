@@ -160,6 +160,24 @@ impl ProviderRegistry {
         self.providers.iter().map(|p| (p.id(), p.probe())).collect()
     }
 
+    /// Active reservation count per provider, sorted by provider id.
+    pub fn active_reservation_counts(&self) -> Vec<(ProviderId, usize)> {
+        let state = self.state.lock().expect("resource registry mutex poisoned");
+        self.providers
+            .iter()
+            .map(|provider| {
+                let id = provider.id();
+                let count = state
+                    .reservations
+                    .values()
+                    .flatten()
+                    .filter(|grant| grant.provider_id == id)
+                    .count();
+                (id, count)
+            })
+            .collect()
+    }
+
     /// Lookup the provider that owns `key`, if any. Public so the scheduler
     /// can pre-validate `Need` before queuing a job.
     pub fn provider_for_key(&self, key: &str) -> Option<ProviderId> {

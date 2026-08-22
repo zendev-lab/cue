@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-const APP_DIR: &str = "cue-shell";
+const APP_DIR: &str = "cue";
 const CLIENT_CONFIG_FILE: &str = "client.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

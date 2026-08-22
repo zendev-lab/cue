@@ -253,6 +253,7 @@ pub(super) async fn spawn(
     mut rx: mpsc::Receiver<GatewayMsg>,
     socket_path: PathBuf,
     sys: ActorSystem,
+    runtime_db: crate::storage::SharedConnection,
     lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> Result<()> {
     // Startup owns stale-socket cleanup while holding the socket-specific
@@ -264,11 +265,18 @@ pub(super) async fn spawn(
 
     // Shared state: client_id → bounded outbound queues and eviction signal.
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-    // One daemon-lifetime ledger spans every transport connection.
-    let operations: SharedOperationLedger = Arc::new(Mutex::new(OperationLedger::default()));
+    // One authoritative in-memory ledger spans every transport connection and
+    // is hydrated from durable completion facts before accepting requests.
+    let facts = crate::storage::with_connection(&runtime_db, crate::storage::load_operation_facts)
+        .await
+        .context("load durable operation facts")?;
+    let operations: SharedOperationLedger = Arc::new(Mutex::new(
+        OperationLedger::restore(facts).context("restore operation ledger")?,
+    ));
 
     let clients_for_dispatch = Arc::clone(&clients);
     let operations_for_dispatch = Arc::clone(&operations);
+    let runtime_db_for_dispatch = runtime_db.clone();
 
     // Accept loop — runs in its own task.
     let sys_accept = sys.clone();
@@ -317,6 +325,15 @@ pub(super) async fn spawn(
                     let completion = operation_ledger(&operations_for_dispatch)
                         .complete(routed_request, payload.clone());
                     if let Some(completion) = completion {
+                        let fact = completion.fact;
+                        if let Err(error) =
+                            crate::storage::with_connection(&runtime_db_for_dispatch, move |conn| {
+                                crate::storage::store_operation_fact(conn, &fact)
+                            })
+                            .await
+                        {
+                            error!(%error, "gateway: failed to persist operation fact");
+                        }
                         for waiter in completion.waiters {
                             queue_response_for_client(
                                 &clients,
@@ -878,6 +895,48 @@ async fn route_request(
                 request_id,
                 payload,
                 "send typed scope list response",
+            )
+            .await?;
+        }
+
+        RequestPayload::ListResources {} => {
+            if current_binding(sys, client_id).await?.is_none() {
+                send_handshake_required(sys, client_id, request_id).await?;
+                return Ok(None);
+            }
+            let routes = sys.resources.key_routes();
+            let reservations: std::collections::BTreeMap<_, _> = sys
+                .resources
+                .active_reservation_counts()
+                .into_iter()
+                .collect();
+            let providers = sys
+                .resources
+                .snapshot()
+                .into_iter()
+                .map(|(id, snapshot)| cue_core::ipc::ResourceProviderInfo {
+                    keys: routes
+                        .iter()
+                        .filter_map(|(key, provider)| (provider == &id).then_some(key.clone()))
+                        .collect(),
+                    active_reservations: reservations.get(&id).copied().unwrap_or(0),
+                    captured_at_ms: snapshot
+                        .captured_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    units: snapshot.units,
+                    id: id.to_string(),
+                })
+                .collect();
+            send_typed_response(
+                sys,
+                client_id,
+                request_id,
+                ResponsePayload::Ok(OkPayload::ResourceList(providers)),
+                "send typed resource list response",
             )
             .await?;
         }
@@ -2042,7 +2101,10 @@ mod tests {
         begin_client_event_hold_fence(&state, 42);
         let event = ClientEvent::session(
             EventPayload::FgOutput {
-                id: "J1".into(),
+                id: cue_core::StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
                 attachment_id: 1,
                 data: b"after-cut".to_vec(),
             },

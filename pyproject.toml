@@ -1,5 +1,5 @@
 [project]
-name = "cue-shell"
+name = "cue-run"
 description = "Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules"
 readme = "README.md"
 requires-python = ">=3.13"

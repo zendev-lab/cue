@@ -520,7 +520,7 @@ enum MatchingForegroundEvent {
 
 fn matching_foreground_event(
     payload: EventPayload,
-    id: &str,
+    id: &cue_core::StepId,
     attachment_id: u64,
 ) -> Option<MatchingForegroundEvent> {
     match payload {
@@ -550,16 +550,12 @@ fn matching_foreground_event(
 }
 
 fn foreground_event_matches(
-    active_job_id: &str,
+    active_step_id: &cue_core::StepId,
     active_attachment_id: u64,
-    event_job_id: &str,
+    event_step_id: &cue_core::StepId,
     event_attachment_id: u64,
 ) -> bool {
-    if active_attachment_id != event_attachment_id {
-        return false;
-    }
-    event_job_id == active_job_id
-        || (active_attachment_id == 0 && event_attachment_id == 0 && event_job_id.is_empty())
+    active_attachment_id == event_attachment_id && event_step_id == active_step_id
 }
 
 #[derive(Serialize)]
@@ -567,7 +563,7 @@ fn foreground_event_matches(
 enum ForegroundWatchRecord<'a> {
     Snapshot {
         schema_version: u32,
-        job_id: &'a str,
+        step_id: &'a str,
         attachment_id: u64,
         role: ForegroundRole,
         control_available: bool,
@@ -576,19 +572,19 @@ enum ForegroundWatchRecord<'a> {
     },
     Output {
         schema_version: u32,
-        job_id: &'a str,
+        step_id: &'a str,
         attachment_id: u64,
         data_base64: String,
     },
     ControlChanged {
         schema_version: u32,
-        job_id: &'a str,
+        step_id: &'a str,
         attachment_id: u64,
         control_available: bool,
     },
     Exited {
         schema_version: u32,
-        job_id: &'a str,
+        step_id: &'a str,
         attachment_id: u64,
         reason: &'a str,
     },
@@ -600,12 +596,13 @@ fn emit_foreground_snapshot(
     attachment: &ForegroundAttachmentInfo,
     jsonl: bool,
 ) -> anyhow::Result<()> {
+    let id = attachment.id.to_string();
     if jsonl {
         write_jsonl(
             stdout,
             &ForegroundWatchRecord::Snapshot {
                 schema_version: 1,
-                job_id: &attachment.id,
+                step_id: &id,
                 attachment_id: attachment.attachment_id,
                 role: attachment.role,
                 control_available: attachment.control_available,
@@ -635,17 +632,18 @@ fn emit_foreground_snapshot(
 fn emit_foreground_event(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
-    id: &str,
+    id: &cue_core::StepId,
     attachment_id: u64,
     event: MatchingForegroundEvent,
     jsonl: bool,
 ) -> anyhow::Result<()> {
+    let id = id.to_string();
     match event {
         MatchingForegroundEvent::Output { data } if jsonl => write_jsonl(
             stdout,
             &ForegroundWatchRecord::Output {
                 schema_version: 1,
-                job_id: id,
+                step_id: &id,
                 attachment_id,
                 data_base64: BASE64_STANDARD.encode(data),
             },
@@ -659,7 +657,7 @@ fn emit_foreground_event(
             stdout,
             &ForegroundWatchRecord::ControlChanged {
                 schema_version: 1,
-                job_id: id,
+                step_id: &id,
                 attachment_id,
                 control_available,
             },
@@ -676,7 +674,7 @@ fn emit_foreground_event(
             stdout,
             &ForegroundWatchRecord::Exited {
                 schema_version: 1,
-                job_id: id,
+                step_id: &id,
                 attachment_id,
                 reason: &reason,
             },
@@ -684,7 +682,7 @@ fn emit_foreground_event(
         MatchingForegroundEvent::Exited { reason } => {
             writeln!(
                 stderr,
-                "foreground job {id} attachment={attachment_id} exited: {reason}"
+                "foreground step {id} attachment={attachment_id} exited: {reason}"
             )
             .context("write foreground exit status")?;
             Ok(())
@@ -1103,6 +1101,13 @@ fn print_target_help() {
 mod tests {
     use super::*;
 
+    fn step(execution: u64) -> cue_core::StepId {
+        cue_core::StepId {
+            execution: cue_core::ExecutionId(execution),
+            index: 1,
+        }
+    }
+
     #[test]
     fn bare_client_prints_help() {
         assert_eq!(
@@ -1256,11 +1261,11 @@ mod tests {
     fn foreground_event_filter_requires_job_and_attachment_epoch() {
         let matched = matching_foreground_event(
             EventPayload::FgOutput {
-                id: "J7".into(),
+                id: step(7),
                 attachment_id: 12,
                 data: vec![0, 0xff],
             },
-            "J7",
+            &step(7),
             12,
         );
         assert_eq!(
@@ -1273,11 +1278,11 @@ mod tests {
         assert_eq!(
             matching_foreground_event(
                 EventPayload::FgControlChanged {
-                    id: "J8".into(),
+                    id: step(8),
                     attachment_id: 12,
                     control_available: true,
                 },
-                "J7",
+                &step(7),
                 12,
             ),
             None
@@ -1285,49 +1290,21 @@ mod tests {
         assert_eq!(
             matching_foreground_event(
                 EventPayload::FgExited {
-                    id: "J7".into(),
+                    id: step(7),
                     attachment_id: 11,
                     reason: "stale attachment".into(),
                 },
-                "J7",
+                &step(7),
                 12,
             ),
             None
-        );
-
-        assert_eq!(
-            matching_foreground_event(
-                EventPayload::FgOutput {
-                    id: String::new(),
-                    attachment_id: 0,
-                    data: b"legacy".to_vec(),
-                },
-                "J7",
-                0,
-            ),
-            Some(MatchingForegroundEvent::Output {
-                data: b"legacy".to_vec()
-            })
-        );
-        assert_eq!(
-            matching_foreground_event(
-                EventPayload::FgOutput {
-                    id: String::new(),
-                    attachment_id: 0,
-                    data: b"stale".to_vec(),
-                },
-                "J7",
-                12,
-            ),
-            None,
-            "a current attachment must ignore legacy epoch-zero events"
         );
     }
 
     #[test]
     fn raw_foreground_output_preserves_exact_pty_bytes() {
         let attachment = ForegroundAttachmentInfo {
-            id: "J7".into(),
+            id: step(7),
             attachment_id: 12,
             role: ForegroundRole::Observer,
             control_available: true,
@@ -1342,7 +1319,7 @@ mod tests {
         emit_foreground_event(
             &mut stdout,
             &mut stderr,
-            "J7",
+            &step(7),
             12,
             MatchingForegroundEvent::ControlChanged {
                 control_available: false,
@@ -1353,7 +1330,7 @@ mod tests {
         emit_foreground_event(
             &mut stdout,
             &mut stderr,
-            "J7",
+            &step(7),
             12,
             MatchingForegroundEvent::Output {
                 data: vec![b'X', 0, 0xfe],
@@ -1364,14 +1341,14 @@ mod tests {
 
         assert_eq!(stdout, vec![0, 0xff, b'\n', b'X', 0, 0xfe]);
         let status = String::from_utf8(stderr).expect("status is UTF-8");
-        assert!(status.contains("watching J7 attachment=12"));
+        assert!(status.contains("watching E7/S1 attachment=12"));
         assert!(status.contains("available=false"));
     }
 
     #[test]
     fn jsonl_foreground_records_encode_binary_and_lifecycle_events() {
         let attachment = ForegroundAttachmentInfo {
-            id: "J7".into(),
+            id: step(7),
             attachment_id: 12,
             role: ForegroundRole::Observer,
             control_available: true,
@@ -1386,7 +1363,7 @@ mod tests {
         emit_foreground_event(
             &mut stdout,
             &mut stderr,
-            "J7",
+            &step(7),
             12,
             MatchingForegroundEvent::Exited {
                 reason: "process exited".into(),
@@ -1403,7 +1380,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["type"], "snapshot");
-        assert_eq!(records[0]["job_id"], "J7");
+        assert_eq!(records[0]["step_id"], "E7/S1");
         assert_eq!(records[0]["attachment_id"], 12);
         assert_eq!(records[0]["data_base64"], "AP8=");
         assert_eq!(records[0]["snapshot_truncated"], true);
