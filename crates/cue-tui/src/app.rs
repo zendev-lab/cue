@@ -3151,10 +3151,7 @@ mod tests {
     }
 
     fn attach_shared_foreground_test_writer(state: &mut AppState) -> tokio::io::DuplexStream {
-        attach_test_writer_with_capabilities(
-            state,
-            [cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS],
-        )
+        attach_test_writer_with_capabilities(state, [cue_core::ipc::IPC_CAPABILITY_EXECUTION_V3])
     }
 
     fn attach_test_writer_with_capabilities<'a>(
@@ -4999,7 +4996,7 @@ destination = "devbox"
         assert!(
             state
                 .fg_footer_text()
-                .contains(cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+                .contains(cue_core::ipc::IPC_CAPABILITY_EXECUTION_V3)
         );
         assert!(state.fg_footer_text().contains("upgrade/restart cued"));
         assert!(state.pending_fg_role_requests.is_empty());
