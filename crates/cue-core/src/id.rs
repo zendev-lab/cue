@@ -18,6 +18,17 @@ pub struct ChainId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScriptId(pub u32);
 
+/// Unified execution sequence number, displayed as E1, E2, ...
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ExecutionId(pub u64);
+
+/// Stable process-step identity within one execution, displayed as E1/S1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StepId {
+    pub execution: ExecutionId,
+    pub index: u32,
+}
+
 /// Content-addressed scope hash (blake3), displayed as S@a3f1...
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScopeHash(pub [u8; 32]);
@@ -68,6 +79,18 @@ impl fmt::Display for ChainId {
 impl fmt::Display for ScriptId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "R{}", self.0)
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "E{}", self.0)
+    }
+}
+
+impl fmt::Display for StepId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/S{}", self.execution, self.index)
     }
 }
 
@@ -135,7 +158,44 @@ impl FromStr for ScriptId {
     }
 }
 
+impl FromStr for ExecutionId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_u64(input, "E", "execution").map(Self)
+    }
+}
+
+impl FromStr for StepId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let (execution, step) = input
+            .split_once("/S")
+            .ok_or_else(|| ParseIdError::new("step", input))?;
+        let execution = execution
+            .parse::<ExecutionId>()
+            .map_err(|_| ParseIdError::new("step", input))?;
+        let index = step
+            .parse::<u32>()
+            .ok()
+            .filter(|index| *index > 0)
+            .ok_or_else(|| ParseIdError::new("step", input))?;
+        Ok(Self { execution, index })
+    }
+}
+
 fn parse_prefixed_id(input: &str, prefix: &str, kind: &'static str) -> Result<u32, ParseIdError> {
+    let digits = input
+        .strip_prefix(prefix)
+        .ok_or_else(|| ParseIdError::new(kind, input))?;
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(ParseIdError::new(kind, input));
+    }
+    digits.parse().map_err(|_| ParseIdError::new(kind, input))
+}
+
+fn parse_prefixed_u64(input: &str, prefix: &str, kind: &'static str) -> Result<u64, ParseIdError> {
     let digits = input
         .strip_prefix(prefix)
         .ok_or_else(|| ParseIdError::new(kind, input))?;
@@ -155,6 +215,15 @@ mod tests {
         assert_eq!(CronId(3).to_string(), "C3");
         assert_eq!(ChainId(7).to_string(), "CH7");
         assert_eq!(ScriptId(9).to_string(), "R9");
+        assert_eq!(ExecutionId(11).to_string(), "E11");
+        assert_eq!(
+            StepId {
+                execution: ExecutionId(11),
+                index: 3,
+            }
+            .to_string(),
+            "E11/S3"
+        );
     }
 
     #[test]
@@ -163,6 +232,14 @@ mod tests {
         assert_eq!("C3".parse::<CronId>(), Ok(CronId(3)));
         assert_eq!("CH7".parse::<ChainId>(), Ok(ChainId(7)));
         assert_eq!("R9".parse::<ScriptId>(), Ok(ScriptId(9)));
+        assert_eq!("E11".parse::<ExecutionId>(), Ok(ExecutionId(11)));
+        assert_eq!(
+            "E11/S3".parse::<StepId>(),
+            Ok(StepId {
+                execution: ExecutionId(11),
+                index: 3,
+            })
+        );
     }
 
     #[test]
@@ -171,6 +248,8 @@ mod tests {
         assert!("C+1".parse::<CronId>().is_err());
         assert!("CH".parse::<ChainId>().is_err());
         assert!("Rabc".parse::<ScriptId>().is_err());
+        assert!("E-1".parse::<ExecutionId>().is_err());
+        assert!("E1/S0".parse::<StepId>().is_err());
     }
 
     #[test]
