@@ -9,7 +9,7 @@
 //!
 //! * [`Provider`] — the pluggable resource backend trait.
 //! * [`ProviderRegistry`] — atomically routes a job's `Need` map to the
-//!   right providers and tracks reservations per `JobId`.
+//!   right providers and tracks reservations per `StepId`.
 //! * [`MockProvider`] — used by registry/scheduler tests; also reachable
 //!   from cross-crate integration tests via `cue_daemon::resource::mock`.
 //!

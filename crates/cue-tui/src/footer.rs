@@ -1,4 +1,4 @@
-use cue_core::Mode;
+use cue_language::Mode;
 
 use crate::focus::FocusArea;
 use crate::target_settings::target_settings_footer_text;

@@ -22,7 +22,7 @@
 //!   `try_reserve` call.
 //!
 //! The module is dependency-free aside from `serde`, `thiserror`, and the
-//! existing `crate::id::JobId`. All types `derive` `Clone + Debug + Serialize
+//! existing `crate::id::StepId`. All types `derive` `Clone + Debug + Serialize
 //! + Deserialize` so they can flow through IPC unchanged.
 
 use std::{
@@ -35,7 +35,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::JobId;
+use crate::id::StepId;
 
 // ---------------------------------------------------------------------------
 // ProviderId
@@ -82,7 +82,7 @@ impl From<String> for ProviderId {
 
 /// Identifier of a single reservation. Format and uniqueness are the
 /// provider's responsibility (e.g. NVML provider may use
-/// `gpu-<job_id>-<random>`).
+/// `gpu-<step_id>-<random>`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReservationId(pub String);
 
@@ -476,13 +476,13 @@ impl Snapshot {
 /// A single successful reservation returned by `Provider::reserve`.
 ///
 /// Owned by the daemon's `ProviderRegistry` and persisted in memory until the
-/// owning job reaches a terminal state. `env` is merged into the spawned
+/// owning step reaches a terminal state. `env` is merged into the spawned
 /// scope; `info` carries provider-specific bookkeeping (e.g. reserved bytes
 /// per GPU index) for `:resources` output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reservation {
     pub id: ReservationId,
-    pub job_id: JobId,
+    pub step_id: StepId,
     pub provider_id: ProviderId,
     /// Environment overrides that must be applied to the spawned scope
     /// (e.g. `CUDA_VISIBLE_DEVICES`, `CUDA_DEVICE_ORDER`).
@@ -500,12 +500,12 @@ pub struct Reservation {
 impl Reservation {
     pub fn new(
         id: impl Into<ReservationId>,
-        job_id: JobId,
+        step_id: StepId,
         provider_id: impl Into<ProviderId>,
     ) -> Self {
         Self {
             id: id.into(),
-            job_id,
+            step_id,
             provider_id: provider_id.into(),
             env: BTreeMap::new(),
             info: BTreeMap::new(),
@@ -793,7 +793,14 @@ mod tests {
 
     #[test]
     fn reservation_serde_roundtrip_preserves_fields() {
-        let mut r = Reservation::new(ReservationId::new("g-1"), JobId(7), ProviderId::new("gpu"));
+        let mut r = Reservation::new(
+            ReservationId::new("g-1"),
+            StepId {
+                execution: crate::ExecutionId(7),
+                index: 1,
+            },
+            ProviderId::new("gpu"),
+        );
         r.env.insert("CUDA_VISIBLE_DEVICES".into(), "0,2".into());
         r.info.insert(
             "reserved_mem".into(),
@@ -805,7 +812,7 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: Reservation = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, r.id);
-        assert_eq!(back.job_id, r.job_id);
+        assert_eq!(back.step_id, r.step_id);
         assert_eq!(back.provider_id, r.provider_id);
         assert_eq!(back.env, r.env);
         assert_eq!(back.info, r.info);
@@ -815,7 +822,14 @@ mod tests {
 
     #[test]
     fn reservation_skips_empty_optional_maps_when_serialised() {
-        let r = Reservation::new("g-2", JobId(1), "gpu");
+        let r = Reservation::new(
+            "g-2",
+            StepId {
+                execution: crate::ExecutionId(1),
+                index: 1,
+            },
+            "gpu",
+        );
         let json = serde_json::to_string(&r).unwrap();
         assert!(
             !json.contains("\"env\""),

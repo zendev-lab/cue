@@ -293,26 +293,9 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_word(&mut self) -> Result<Token, TokenizeError> {
         let start = self.pos;
 
-        // Check for job/cron ID refs. Scopes are content-addressed hashes, not
-        // numeric parser IDs.
-        if let Some(kind) = self.try_id_kind() {
-            let prefix_pos = self.pos;
-            self.pos += 1; // skip prefix letter
-            let num_start = self.pos;
-            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
-            if self.pos > num_start {
-                // Make sure next char is not alphanumeric (otherwise it's a regular word)
-                if (self.pos >= self.bytes.len() || !is_ident_char(self.bytes[self.pos]))
-                    && let Ok(n) = self.slice(num_start, self.pos).parse::<u32>()
-                {
-                    self.last_significant = Some(TokenClass::Other);
-                    return Ok(Token::IdRef(kind, n));
-                }
-            }
-            // Not an ID ref, fall through to word
-            self.pos = prefix_pos;
+        if let Some(token) = self.try_typed_id() {
+            self.last_significant = Some(TokenClass::Other);
+            return Ok(token);
         }
 
         // Mode params interior tokens
@@ -478,12 +461,57 @@ impl<'a> Tokenizer<'a> {
         self.in_mode_params && (b == b'=' || b == b',')
     }
 
-    fn try_id_kind(&self) -> Option<IdKind> {
-        match self.peek()? {
-            b'J' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Job),
-            b'C' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Cron),
-            _ => None,
+    fn try_typed_id(&mut self) -> Option<Token> {
+        let start = self.pos;
+        let prefix = self.peek()?;
+        if !matches!(prefix, b'E' | b'T') || !self.peek_at(1)?.is_ascii_digit() {
+            return None;
         }
+        self.pos += 1;
+        let number_start = self.pos;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        let Ok(number) = self.slice(number_start, self.pos).parse::<u64>() else {
+            self.pos = start;
+            return None;
+        };
+        if number == 0 {
+            self.pos = start;
+            return None;
+        }
+
+        let kind = if prefix == b'E' && self.peek() == Some(b'/') {
+            if self.peek_at(1) != Some(b'S') || !self.peek_at(2).is_some_and(|b| b.is_ascii_digit())
+            {
+                self.pos = start;
+                return None;
+            }
+            self.pos += 2;
+            let index_start = self.pos;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.pos += 1;
+            }
+            let Ok(index) = self.slice(index_start, self.pos).parse::<u32>() else {
+                self.pos = start;
+                return None;
+            };
+            if index == 0 {
+                self.pos = start;
+                return None;
+            }
+            IdKind::Step
+        } else if prefix == b'E' {
+            IdKind::Execution
+        } else {
+            IdKind::Schedule
+        };
+
+        if self.peek().is_some_and(is_ident_char) || self.peek() == Some(b'/') {
+            self.pos = start;
+            return None;
+        }
+        Some(Token::IdRef(kind, self.slice(start, self.pos).to_string()))
     }
 
     fn operator_has_required_whitespace(&self, start: usize, len: usize) -> bool {
@@ -769,13 +797,40 @@ mod tests {
 
     #[test]
     fn id_refs() {
-        let toks = tokens(":kill J1");
         assert_eq!(
-            toks,
+            tokens(":kill E1"),
             vec![
                 Token::Command("kill".into()),
-                Token::IdRef(IdKind::Job, 1),
+                Token::IdRef(IdKind::Execution, "E1".into()),
                 Token::Eof,
+            ]
+        );
+        assert_eq!(
+            tokens(":fg E2/S3"),
+            vec![
+                Token::Command("fg".into()),
+                Token::IdRef(IdKind::Step, "E2/S3".into()),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            tokens(":pause T4"),
+            vec![
+                Token::Command("pause".into()),
+                Token::IdRef(IdKind::Schedule, "T4".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_job_and_cron_ids_are_plain_words() {
+        assert_eq!(
+            tokens("J1 C2"),
+            vec![
+                Token::Word("J1".into()),
+                Token::Word("C2".into()),
+                Token::Eof
             ]
         );
     }
@@ -795,12 +850,13 @@ mod tests {
 
     #[test]
     fn oversized_id_refs_stay_words_instead_of_wrapping_to_zero() {
-        let toks = tokens("echo J4294967296");
+        let toks = tokens("echo E18446744073709551616 E1/S4294967296");
         assert_eq!(
             toks,
             vec![
                 Token::Word("echo".into()),
-                Token::Word("J4294967296".into()),
+                Token::Word("E18446744073709551616".into()),
+                Token::Word("E1/S4294967296".into()),
                 Token::Eof,
             ]
         );

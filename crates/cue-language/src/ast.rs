@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
+use cue_core::pipeline::PipeOp;
 
 use super::token::{IdKind, Span, Value};
 
@@ -39,16 +39,16 @@ pub(super) enum Argument {
     /// Chain expression (for `:run`, bare input in JOB/CRON mode).
     Chain(ChainNode),
     /// Entity ID reference (for `:kill`, `:out`, `:fg`, `:retry`).
-    IdRef(IdKind, u32),
-    /// Free-form text arguments for builtins like `:send`.
+    IdRef(IdKind, String),
+    /// Free-form text for typed scope and frontend configuration commands.
     Text(String),
-    /// Entity ID with optional byte count (for `:tail J3 1024`).
-    TailRef(IdKind, u32, Option<usize>),
-    /// No argument (`:jobs`, `:crons`, `:help`).
+    /// Entity ID with optional byte count (for `:tail E3/S1 1024`).
+    TailRef(IdKind, String, Option<usize>),
+    /// No argument (`:executions`, `:schedules`, `:help`).
     Empty,
 }
 
-/// Chain AST — tree structure of job-level operations.
+/// Composition tree before it is compiled to an `ExecutionPlan`.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ChainNode {
     Leaf(JobExpr),
@@ -64,8 +64,19 @@ pub(super) enum ChainNode {
     },
 }
 
-/// Job-internal expression. This is one cue Job even when it contains
-/// shell-style logical operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SerialOp {
+    Then,
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ParallelOp {
+    All,
+    Race,
+}
+
+/// Conditional execution expression.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum JobExpr {
     Pipeline(Pipeline),
@@ -79,7 +90,7 @@ pub(super) enum JobExpr {
     },
 }
 
-/// Pipeline = one Job's process chain.
+/// Pipeline of direct process segments.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Pipeline {
     pub(super) segments: Vec<PipeSegment>,

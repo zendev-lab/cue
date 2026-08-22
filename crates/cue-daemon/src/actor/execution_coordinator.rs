@@ -11,17 +11,16 @@ use cue_core::ipc::{
     StepOutput, StreamText, error_code,
 };
 use cue_core::scope::EnvDelta;
-use cue_core::{EventChannel, ExecutionId, JobId, ScopeHash, StepId};
+use cue_core::{EventChannel, ExecutionId, ScopeHash, StepId};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
 use super::{
-    ActorSystem, ExecutionCoordinatorMsg, GatewayMsg, ProcessJobOptions, ProcessMgrMsg,
-    ProcessSpawnAdapter, ResponseTarget, ScopeStoreMsg, SessionBinding, publish_session_event,
+    ActorSystem, ExecutionCoordinatorMsg, GatewayMsg, ProcessMgrMsg, ProcessSpawnAdapter,
+    ProcessStepOptions, ResponseTarget, ScopeStoreMsg, SessionBinding, publish_session_event,
 };
 use crate::storage;
 
-const FIRST_EXECUTION_PROCESS_JOB: u32 = 0x8000_0000;
 const DEFAULT_OUTPUT_TAIL: usize = cue_core::ipc::MAX_MESSAGE_SIZE / 4;
 
 struct Waiter {
@@ -37,7 +36,6 @@ struct ExecutionRecord {
     wrapper_default: bool,
     direct_output_client: Option<u64>,
     adapter_required: bool,
-    jobs: BTreeMap<StepId, JobId>,
     waiters: Vec<Waiter>,
     finished_published: bool,
 }
@@ -94,7 +92,6 @@ impl ExecutionRecord {
 
 struct CoordinatorState {
     next_execution: u64,
-    next_process_job: u32,
     records: BTreeMap<ExecutionId, ExecutionRecord>,
     draining: bool,
     drain_waiters: Vec<oneshot::Sender<()>>,
@@ -104,7 +101,6 @@ impl CoordinatorState {
     fn new(next_execution: u64, records: BTreeMap<ExecutionId, ExecutionRecord>) -> Self {
         Self {
             next_execution,
-            next_process_job: FIRST_EXECUTION_PROCESS_JOB,
             records,
             draining: false,
             drain_waiters: Vec::new(),
@@ -117,12 +113,6 @@ impl CoordinatorState {
         }
         let id = ExecutionId(self.next_execution);
         self.next_execution = self.next_execution.checked_add(1)?;
-        Some(id)
-    }
-
-    fn alloc_process_job(&mut self) -> Option<JobId> {
-        let id = JobId(self.next_process_job);
-        self.next_process_job = self.next_process_job.checked_add(1)?;
         Some(id)
     }
 }
@@ -154,7 +144,6 @@ pub(super) async fn spawn(
             wrapper_default: stored.wrapper_default,
             direct_output_client: None,
             adapter_required: stored.adapter_required,
-            jobs: BTreeMap::new(),
             waiters: Vec::new(),
             finished_published,
         };
@@ -343,7 +332,6 @@ async fn submit(
             .unwrap_or(sys.config.wrapper.enabled),
         direct_output_client: request_id.map(|_| client_id),
         adapter_required,
-        jobs: BTreeMap::new(),
         waiters: Vec::new(),
         finished_published: false,
     };
@@ -414,7 +402,7 @@ async fn drive_execution(
         if transition.newly_ready.is_empty() && transition.to_cancel.is_empty() {
             break;
         }
-        stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+        stop_cancelled_steps(transition.to_cancel, sys).await;
 
         let mut made_progress = false;
         for node_id in transition.newly_ready {
@@ -441,7 +429,7 @@ async fn drive_execution(
                         ),
                     };
                     if let Ok(transition) = completion {
-                        stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+                        stop_cancelled_steps(transition.to_cancel, sys).await;
                     }
                     publish_execution_state_change(&record, old_state, sys).await;
                 }
@@ -449,20 +437,9 @@ async fn drive_execution(
                     let Some(step_id) = node.step_id else {
                         continue;
                     };
-                    let Some(job_id) = state.alloc_process_job() else {
-                        mark_step_infrastructure_failure(
-                            &mut record,
-                            node_id,
-                            "execution process id space exhausted".into(),
-                            sys,
-                        )
-                        .await;
-                        made_progress = true;
-                        continue;
-                    };
                     let grants = match sys
                         .resources
-                        .try_reserve(job_id, &record.execution.spec().launch_context.needs)
+                        .try_reserve(step_id, &record.execution.spec().launch_context.needs)
                     {
                         Ok(grants) => grants,
                         Err(_) => continue,
@@ -489,7 +466,7 @@ async fn drive_execution(
                     let spawn_scope = match spawn_scope {
                         Ok(scope) => scope,
                         Err(message) => {
-                            sys.resources.release(job_id);
+                            sys.resources.release(step_id);
                             mark_step_infrastructure_failure(&mut record, node_id, message, sys)
                                 .await;
                             continue;
@@ -502,10 +479,9 @@ async fn drive_execution(
                         .cloned()
                         .unwrap_or(StepState::Queued);
                     if record.execution.mark_running(node_id).is_err() {
-                        sys.resources.release(job_id);
+                        sys.resources.release(step_id);
                         continue;
                     }
-                    record.jobs.insert(step_id, job_id);
                     publish_step_state_change(
                         &record,
                         step_id,
@@ -516,14 +492,13 @@ async fn drive_execution(
                     .await;
                     publish_execution_state_change(&record, old_execution_state, sys).await;
                     if let Err(error) = persist_record(db, &record).await {
-                        sys.resources.release(job_id);
-                        record.jobs.remove(&step_id);
+                        sys.resources.release(step_id);
                         let old_execution_state = record.execution.state();
                         let failure = NodeOutcome::Failed(StepFailure::Infrastructure {
                             message: format!("persist running step before spawn: {error}"),
                         });
                         if let Ok(transition) = record.execution.mark_finished(node_id, failure) {
-                            stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+                            stop_cancelled_steps(transition.to_cancel, sys).await;
                         }
                         let new_step_state = record
                             .execution
@@ -542,7 +517,7 @@ async fn drive_execution(
                         continue;
                     }
                     let launch = &record.execution.spec().launch_context;
-                    let options = ProcessJobOptions {
+                    let options = ProcessStepOptions {
                         cwd_override: None,
                         sandbox: launch
                             .workspace_view
@@ -559,20 +534,19 @@ async fn drive_execution(
                                 step_id,
                             }
                         }),
-                        execution_step: step_id,
                     };
                     if sys
                         .process_mgr
-                        .send(ProcessMgrMsg::SpawnJob {
-                            job_id,
-                            plan: cue_core::pipeline::JobPlan::Pipeline(pipeline),
+                        .send(ProcessMgrMsg::SpawnStep {
+                            step_id,
+                            pipeline,
                             scope_hash: spawn_scope,
                             options: Box::new(options),
                         })
                         .await
                         .is_err()
                     {
-                        sys.resources.release(job_id);
+                        sys.resources.release(step_id);
                         let old = record
                             .execution
                             .step_state(step_id)
@@ -585,7 +559,7 @@ async fn drive_execution(
                                 message: "process manager unavailable".into(),
                             }),
                         ) {
-                            stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+                            stop_cancelled_steps(transition.to_cancel, sys).await;
                         }
                         let new = record
                             .execution
@@ -632,7 +606,7 @@ async fn mark_step_infrastructure_failure(
         NodeOutcome::Failed(StepFailure::Infrastructure { message }),
     );
     if let Ok(transition) = completion {
-        stop_cancelled_steps(record, transition.to_cancel, sys).await;
+        stop_cancelled_steps(transition.to_cancel, sys).await;
     }
     if let Some(step_id) = node.step_id {
         let state = record
@@ -657,9 +631,7 @@ async fn step_finished(
         warn!(%step_id, "execution coordinator: completion for unknown step");
         return;
     };
-    if let Some(job_id) = record.jobs.get(&step_id).copied() {
-        sys.resources.release(job_id);
-    }
+    sys.resources.release(step_id);
     if !record.execution.state().is_terminal()
         && let Some(node) = record
             .execution
@@ -671,7 +643,7 @@ async fn step_finished(
         let old_step_states = step_states(&record);
         let outcome = if exit_code == 0 {
             NodeOutcome::Succeeded
-        } else if exit_code == cue_core::job::EXIT_CODE_UNAVAILABLE {
+        } else if exit_code == cue_core::launch::EXIT_CODE_UNAVAILABLE {
             NodeOutcome::Failed(StepFailure::Infrastructure {
                 message: "process result unavailable".into(),
             })
@@ -680,7 +652,7 @@ async fn step_finished(
         };
         if let Ok(transition) = record.execution.mark_finished(node.id, outcome) {
             publish_changed_step_states(&record, &old_step_states, sys).await;
-            stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+            stop_cancelled_steps(transition.to_cancel, sys).await;
             publish_execution_state_change(&record, old_execution_state, sys).await;
         }
     }
@@ -713,7 +685,7 @@ async fn cancel(
     let old_state = record.execution.state();
     let old_step_states = step_states(&record);
     let transition = record.execution.cancel(mode);
-    stop_cancelled_steps(&record, transition.to_cancel, sys).await;
+    stop_cancelled_steps(transition.to_cancel, sys).await;
     publish_changed_step_states(&record, &old_step_states, sys).await;
     publish_execution_state_change(&record, old_state, sys).await;
     finish_if_terminal(&mut record, sys).await;
@@ -747,12 +719,7 @@ async fn attach_step(
         .await;
         return;
     }
-    let job_id = {
-        matches!(record.execution.step_state(id), Some(StepState::Running))
-            .then(|| record.jobs.get(&id).copied())
-            .flatten()
-    };
-    let Some(job_id) = job_id else {
+    if !matches!(record.execution.step_state(id), Some(StepState::Running)) {
         send_response(
             sys,
             client_id,
@@ -761,13 +728,13 @@ async fn attach_step(
         )
         .await;
         return;
-    };
+    }
     let (reply, attached) = oneshot::channel();
     if sys
         .process_mgr
         .send(ProcessMgrMsg::AttachFg {
             client_id,
-            job_id,
+            step_id: id,
             role,
             legacy_snapshot_event: false,
             reply,
@@ -795,27 +762,25 @@ async fn attach_step(
     send_response(sys, client_id, request_id, response).await;
 }
 
-async fn kill_job(sys: &ActorSystem, job_id: JobId) {
+async fn kill_step(sys: &ActorSystem, step_id: StepId) {
     let (reply, stopped) = oneshot::channel();
     if sys
         .process_mgr
-        .send(ProcessMgrMsg::KillJob { job_id, reply })
+        .send(ProcessMgrMsg::KillStep { step_id, reply })
         .await
         .is_err()
     {
         return;
     }
     if let Err(error) = stopped.await {
-        warn!(%job_id, %error, "execution coordinator: process stop acknowledgement dropped");
+        warn!(%step_id, %error, "execution coordinator: process stop acknowledgement dropped");
     }
 }
 
-async fn stop_cancelled_steps(record: &ExecutionRecord, steps: Vec<StepId>, sys: &ActorSystem) {
+async fn stop_cancelled_steps(steps: Vec<StepId>, sys: &ActorSystem) {
     for step_id in steps {
-        if let Some(job_id) = record.jobs.get(&step_id).copied() {
-            kill_job(sys, job_id).await;
-            sys.resources.release(job_id);
-        }
+        kill_step(sys, step_id).await;
+        sys.resources.release(step_id);
     }
 }
 
@@ -976,7 +941,7 @@ async fn read_output(
     };
     let mut steps = Vec::with_capacity(selected.len());
     for step_id in selected {
-        let stem = super::process_output_stem(JobId(0), step_id);
+        let stem = super::process_output_stem(step_id);
         let stdout = read_stream_tail(
             output_dir.join(format!("{stem}.log")),
             stdout_bytes.unwrap_or(DEFAULT_OUTPUT_TAIL),

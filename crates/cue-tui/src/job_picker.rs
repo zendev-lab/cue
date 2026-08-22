@@ -1,6 +1,6 @@
-use cue_core::Mode;
 use cue_core::cron::CronStatus;
-use cue_core::job::JobStatus;
+use cue_core::execution::ExecutionState;
+use cue_language::Mode;
 use ratatui::layout::Rect;
 
 use crate::geometry::{centered_rect, inner_rect};
@@ -20,7 +20,7 @@ pub(crate) struct JobPickerItem {
 pub(crate) struct JobPickerRecord<'a> {
     pub(crate) id: &'a str,
     pub(crate) label: &'a str,
-    pub(crate) status: &'a JobStatus,
+    pub(crate) status: &'a ExecutionState,
 }
 
 pub(crate) struct CronPickerRecord<'a> {
@@ -30,7 +30,7 @@ pub(crate) struct CronPickerRecord<'a> {
 }
 
 pub(crate) fn job_picker_item(record: JobPickerRecord<'_>) -> Option<JobPickerItem> {
-    matches!(record.status, JobStatus::Running).then(|| JobPickerItem {
+    matches!(record.status, ExecutionState::Running).then(|| JobPickerItem {
         id: record.id.to_string(),
         label: record.label.to_string(),
         status_icon: crate::status_view::job_status_icon(record.status),
@@ -119,7 +119,7 @@ mod tests {
             job_picker_item(JobPickerRecord {
                 id: "J7",
                 label: "server",
-                status: &JobStatus::Running,
+                status: &ExecutionState::Running,
             }),
             Some(JobPickerItem {
                 id: "J7".into(),
@@ -131,7 +131,7 @@ mod tests {
             job_picker_item(JobPickerRecord {
                 id: "J8",
                 label: "done",
-                status: &JobStatus::Done,
+                status: &ExecutionState::Succeeded,
             }),
             None
         );

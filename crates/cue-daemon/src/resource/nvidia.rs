@@ -18,7 +18,7 @@ use anyhow::Result;
 use tracing::warn;
 
 use cue_core::{
-    JobId,
+    StepId,
     resource::{
         Grant, Need, ProviderId, Reject, Reservation, ReservationId, ResourceQuantity,
         ResourceUnit, Snapshot,
@@ -185,8 +185,8 @@ impl NvidiaGpuProvider {
         };
         if needed_gpus == 0 {
             return Ok(Reservation::new(
-                format!("{}-{}", self.id, req.job_id),
-                req.job_id,
+                format!("{}-{}", self.id, req.step_id),
+                req.step_id,
                 self.id.clone(),
             ));
         }
@@ -229,7 +229,7 @@ impl NvidiaGpuProvider {
             return Err(reject);
         }
 
-        let grant_id = ReservationId::new(format!("{}-{}", self.id, req.job_id));
+        let grant_id = ReservationId::new(format!("{}-{}", self.id, req.step_id));
         let exclusive = mem_per_gpu == 0 && req.need.contains(&self.gpu_key);
         let units: Vec<GpuReservation> = selected
             .iter()
@@ -265,7 +265,7 @@ impl NvidiaGpuProvider {
 
         Ok(Reservation {
             id: grant_id,
-            job_id: req.job_id,
+            step_id: req.step_id,
             provider_id: self.id.clone(),
             env,
             info,
@@ -414,7 +414,13 @@ mod tests {
         ]);
 
         let grant = provider
-            .reserve(&ReserveRequest::new(JobId(1), need))
+            .reserve(&ReserveRequest::new(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                need,
+            ))
             .expect("grant");
         assert_eq!(
             grant.env.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
@@ -432,7 +438,13 @@ mod tests {
         let need = Need::from_pairs([("gpu_mem", ResourceQuantity::Bytes(bytes(24)))]);
 
         let reject = provider
-            .reserve(&ReserveRequest::new(JobId(1), need))
+            .reserve(&ReserveRequest::new(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                need,
+            ))
             .expect_err("should reject");
         assert!(
             reject.reason.contains("max effective free 23GiB"),
@@ -447,17 +459,35 @@ mod tests {
         let need = Need::from_pairs([("gpu_mem", ResourceQuantity::Bytes(bytes(50)))]);
 
         let first = provider
-            .reserve(&ReserveRequest::new(JobId(1), need.clone()))
+            .reserve(&ReserveRequest::new(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                need.clone(),
+            ))
             .expect("first grant");
         assert!(
             provider
-                .reserve(&ReserveRequest::new(JobId(2), need.clone()))
+                .reserve(&ReserveRequest::new(
+                    StepId {
+                        execution: cue_core::ExecutionId(2),
+                        index: 1
+                    },
+                    need.clone()
+                ))
                 .is_err()
         );
         provider.release(&first.id);
         assert!(
             provider
-                .reserve(&ReserveRequest::new(JobId(3), need))
+                .reserve(&ReserveRequest::new(
+                    StepId {
+                        execution: cue_core::ExecutionId(3),
+                        index: 1
+                    },
+                    need
+                ))
                 .is_ok()
         );
     }
@@ -468,17 +498,35 @@ mod tests {
         let need = Need::from_pairs([("gpu", ResourceQuantity::Count(1))]);
 
         let first = provider
-            .reserve(&ReserveRequest::new(JobId(1), need.clone()))
+            .reserve(&ReserveRequest::new(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                need.clone(),
+            ))
             .expect("first grant");
         assert!(
             provider
-                .reserve(&ReserveRequest::new(JobId(2), need.clone()))
+                .reserve(&ReserveRequest::new(
+                    StepId {
+                        execution: cue_core::ExecutionId(2),
+                        index: 1
+                    },
+                    need.clone()
+                ))
                 .is_err()
         );
         provider.release(&first.id);
         assert!(
             provider
-                .reserve(&ReserveRequest::new(JobId(3), need))
+                .reserve(&ReserveRequest::new(
+                    StepId {
+                        execution: cue_core::ExecutionId(3),
+                        index: 1
+                    },
+                    need
+                ))
                 .is_ok()
         );
     }

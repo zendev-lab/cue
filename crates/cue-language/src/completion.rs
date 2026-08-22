@@ -3,8 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::Mode;
 use anyhow::Context;
-use cue_core::Mode;
 
 use crate::command_spec::command_names;
 
@@ -13,8 +13,9 @@ pub struct CompletionScope<'a> {
     pub content: &'a str,
     pub cursor: usize,
     pub word_range: std::ops::Range<usize>,
-    pub job_ids: &'a [String],
-    pub cron_ids: &'a [String],
+    pub execution_ids: &'a [String],
+    pub step_ids: &'a [String],
+    pub schedule_ids: &'a [String],
 }
 
 pub fn completion_candidates(scope: CompletionScope<'_>) -> anyhow::Result<Vec<String>> {
@@ -36,7 +37,12 @@ pub fn completion_candidates(scope: CompletionScope<'_>) -> anyhow::Result<Vec<S
         return Ok(builtin_command_candidates(word));
     }
 
-    let ids = target_id_candidates(tokens[0], scope.job_ids, scope.cron_ids);
+    let ids = target_id_candidates(
+        tokens[0],
+        scope.execution_ids,
+        scope.step_ids,
+        scope.schedule_ids,
+    );
     Ok(ids
         .into_iter()
         .filter(|candidate| candidate.starts_with(word))
@@ -75,14 +81,24 @@ fn shared_prefix(items: &[String]) -> String {
     prefix
 }
 
-fn target_id_candidates(command: &str, job_ids: &[String], cron_ids: &[String]) -> Vec<String> {
+fn target_id_candidates(
+    command: &str,
+    execution_ids: &[String],
+    step_ids: &[String],
+    schedule_ids: &[String],
+) -> Vec<String> {
     match command {
-        ":out" | ":err" | ":tail" | ":retry" | ":fg" | ":watch" | ":wait" | ":send" => {
-            job_ids.to_vec()
+        ":out" | ":err" | ":tail" => {
+            let mut ids = execution_ids.to_vec();
+            ids.extend_from_slice(step_ids);
+            ids
         }
-        ":kill" | ":cancel" | ":pause" | ":resume" | ":log" => {
-            let mut ids = job_ids.to_vec();
-            ids.extend_from_slice(cron_ids);
+        ":retry" | ":wait" | ":cancel" | ":log" => execution_ids.to_vec(),
+        ":fg" | ":watch" => step_ids.to_vec(),
+        ":pause" | ":resume" | ":remove" => schedule_ids.to_vec(),
+        ":kill" => {
+            let mut ids = execution_ids.to_vec();
+            ids.extend_from_slice(schedule_ids);
             ids
         }
         _ => Vec::new(),
@@ -92,7 +108,6 @@ fn target_id_candidates(command: &str, job_ids: &[String], cron_ids: &[String]) 
 pub(crate) fn builtin_command_candidates(word: &str) -> Vec<String> {
     let prefix = word.strip_prefix(':').unwrap_or(word);
     command_names()
-        .chain(["restart"])
         .filter(|command| command.starts_with(prefix))
         .map(|command| format!(":{command}"))
         .collect()
@@ -360,40 +375,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_target_completion_filters_job_and_cron_ids_by_command() {
-        let job_ids = vec!["J1".to_string(), "J2".to_string()];
-        let cron_ids = vec!["C1".to_string()];
+    fn builtin_target_completion_filters_typed_ids_by_command() {
+        let execution_ids = vec!["E1".to_string(), "E2".to_string()];
+        let step_ids = vec!["E1/S1".to_string()];
+        let schedule_ids = vec!["T1".to_string()];
         let wait_candidates = completion_candidates(CompletionScope {
             mode: Mode::Job,
-            content: ":wait J",
+            content: ":wait E",
             cursor: 7,
             word_range: 6..7,
-            job_ids: &job_ids,
-            cron_ids: &cron_ids,
+            execution_ids: &execution_ids,
+            step_ids: &step_ids,
+            schedule_ids: &schedule_ids,
         })
         .expect("wait completion");
         let watch_candidates = completion_candidates(CompletionScope {
             mode: Mode::Job,
-            content: ":watch J",
+            content: ":watch E",
             cursor: 8,
             word_range: 7..8,
-            job_ids: &job_ids,
-            cron_ids: &cron_ids,
+            execution_ids: &execution_ids,
+            step_ids: &step_ids,
+            schedule_ids: &schedule_ids,
         })
         .expect("watch completion");
         let kill_candidates = completion_candidates(CompletionScope {
             mode: Mode::Job,
-            content: ":kill C",
+            content: ":kill T",
             cursor: 7,
             word_range: 6..7,
-            job_ids: &job_ids,
-            cron_ids: &cron_ids,
+            execution_ids: &execution_ids,
+            step_ids: &step_ids,
+            schedule_ids: &schedule_ids,
         })
         .expect("kill completion");
 
-        assert_eq!(wait_candidates, vec!["J1".to_string(), "J2".to_string()]);
-        assert_eq!(watch_candidates, vec!["J1".to_string(), "J2".to_string()]);
-        assert_eq!(kill_candidates, vec!["C1".to_string()]);
+        assert_eq!(wait_candidates, execution_ids);
+        assert_eq!(watch_candidates, step_ids);
+        assert_eq!(kill_candidates, schedule_ids);
     }
 
     #[test]

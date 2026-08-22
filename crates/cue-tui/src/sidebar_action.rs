@@ -1,21 +1,30 @@
-use cue_core::ipc::JobOpenHint;
-use cue_core::job::JobStatus;
+use cue_core::execution::ExecutionState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionOpenHint {
+    Stream,
+    Fg,
+}
 
 /// Convert a sidebar display row (newest-first) to the underlying vec index (oldest-first).
 pub(crate) fn display_row_to_index(row: usize, len: usize) -> Option<usize> {
     len.checked_sub(1)?.checked_sub(row)
 }
 
-pub(crate) fn job_open_command(id: &str, status: &JobStatus, open_hint: JobOpenHint) -> String {
-    if matches!(status, JobStatus::Running) && open_hint == JobOpenHint::Fg {
+pub(crate) fn job_open_command(
+    id: &str,
+    status: &ExecutionState,
+    open_hint: ExecutionOpenHint,
+) -> String {
+    if matches!(status, ExecutionState::Running) && open_hint == ExecutionOpenHint::Fg {
         format!(":fg {id}")
     } else {
         format!(":tail {id}")
     }
 }
 
-pub(crate) fn running_job_kill_command(id: &str, status: &JobStatus) -> Option<String> {
-    matches!(status, JobStatus::Running).then(|| format!(":kill {id}"))
+pub(crate) fn running_job_kill_command(id: &str, status: &ExecutionState) -> Option<String> {
+    matches!(status, ExecutionState::Running).then(|| format!(":kill {id}"))
 }
 
 pub(crate) fn cron_kill_command(id: &str) -> String {
@@ -38,19 +47,19 @@ mod tests {
     #[test]
     fn job_open_command_attaches_only_foreground_capable_running_jobs() {
         assert_eq!(
-            job_open_command("J7", &JobStatus::Running, JobOpenHint::Fg),
+            job_open_command("J7", &ExecutionState::Running, ExecutionOpenHint::Fg),
             ":fg J7"
         );
         assert_eq!(
-            job_open_command("J7", &JobStatus::Running, JobOpenHint::Stream),
+            job_open_command("J7", &ExecutionState::Running, ExecutionOpenHint::Stream),
             ":tail J7"
         );
         assert_eq!(
-            job_open_command("J7", &JobStatus::Done, JobOpenHint::Fg),
+            job_open_command("J7", &ExecutionState::Succeeded, ExecutionOpenHint::Fg),
             ":tail J7"
         );
         assert_eq!(
-            job_open_command("J7", &JobStatus::Failed, JobOpenHint::Stream),
+            job_open_command("J7", &ExecutionState::Failed, ExecutionOpenHint::Stream),
             ":tail J7"
         );
     }
@@ -58,10 +67,13 @@ mod tests {
     #[test]
     fn kill_commands_are_limited_to_running_jobs_and_crons() {
         assert_eq!(
-            running_job_kill_command("J7", &JobStatus::Running),
+            running_job_kill_command("J7", &ExecutionState::Running),
             Some(":kill J7".into())
         );
-        assert_eq!(running_job_kill_command("J7", &JobStatus::Done), None);
+        assert_eq!(
+            running_job_kill_command("J7", &ExecutionState::Succeeded),
+            None
+        );
         assert_eq!(cron_kill_command("C2"), ":kill C2");
     }
 }

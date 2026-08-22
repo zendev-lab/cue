@@ -6,7 +6,7 @@
 //!
 //! Protocol:
 //! * `probe` stdin: empty; stdout: `{ "units": [{"id":"...","attrs":{...}}] }`
-//! * `reserve` stdin: `{ "job_id":"J1", "needs": {...} }`; stdout either
+//! * `reserve` stdin: `{ "step_id":"E1/S1", "needs": {...} }`; stdout either
 //!   `{ "ok": true, "grant_id":"...", "env": {...}, "info": {...} }` or
 //!   `{ "ok": false, "reason":"..." }`
 //! * `release` stdin: `{ "grant_id":"..." }`; stdout ignored.
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use cue_core::{
-    JobId,
+    StepId,
     resource::{
         Grant, Need, ProviderId, Reject, Reservation, ReservationId, ResourceQuantity,
         ResourceUnit, Snapshot,
@@ -181,7 +181,7 @@ impl Provider for CliProvider {
 
     fn reserve(&self, req: &ReserveRequest) -> Result<Grant, Reject> {
         let request = ReserveRequestPayload {
-            job_id: req.job_id.to_string(),
+            step_id: req.step_id.to_string(),
             needs: &req.need,
         };
         let stdin = serde_json::to_vec(&request)
@@ -209,7 +209,7 @@ impl Provider for CliProvider {
         })?;
         Ok(Reservation {
             id: ReservationId::new(grant_id),
-            job_id: req.job_id,
+            step_id: req.step_id,
             provider_id: self.id.clone(),
             env: response.env,
             info: response.info,
@@ -251,7 +251,7 @@ struct ProbeResponse {
 
 #[derive(Debug, Serialize)]
 struct ReserveRequestPayload<'a> {
-    job_id: String,
+    step_id: String,
     needs: &'a Need,
 }
 
@@ -320,7 +320,13 @@ mod tests {
 
         let need = Need::from_pairs([("license", ResourceQuantity::Count(1))]);
         let grant = provider
-            .reserve(&ReserveRequest::new(JobId(7), need))
+            .reserve(&ReserveRequest::new(
+                StepId {
+                    execution: cue_core::ExecutionId(7),
+                    index: 1,
+                },
+                need,
+            ))
             .expect("grant");
         assert_eq!(grant.id, ReservationId::new("g1"));
         assert_eq!(
@@ -342,7 +348,10 @@ mod tests {
 
         let err = provider
             .reserve(&ReserveRequest::new(
-                JobId(1),
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
                 Need::from_pairs([("license", ResourceQuantity::Count(1))]),
             ))
             .expect_err("missing grant_id should reject");

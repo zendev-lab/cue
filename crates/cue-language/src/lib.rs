@@ -9,12 +9,11 @@ pub mod command_spec;
 mod compiler;
 mod completion;
 mod duration;
+mod mode;
 mod parse;
 mod resolver;
 mod token;
 mod tokenizer;
-
-use cue_core::mode::Mode;
 
 pub use assistance::{
     CompletionItem, CompletionKind, HighlightKind, HighlightSpan, complete_input, highlight_input,
@@ -23,18 +22,23 @@ pub use compiler::{
     CompileError, CompiledCommand, FrontendAction, compile_command, compile_file, render_help,
 };
 pub use completion::{CompletionScope, completion_candidates, completion_replacement};
+pub use mode::Mode;
 pub use parse::ParseError;
 pub use parse::ParseErrorKind;
-pub use resolver::{ResolvedCommand, ResolvedScriptItem};
 pub use token::Token;
 pub use tokenizer::Tokenizer;
 
-pub fn parse_command(input: &str, mode: Mode) -> Result<ResolvedCommand, ParseError> {
+pub(crate) fn parse_command(
+    input: &str,
+    mode: Mode,
+) -> Result<resolver::ResolvedCommand, ParseError> {
     let ast = parse::Parser::parse(input)?;
     resolver::Resolver::resolve(ast, mode)
 }
 
-pub fn parse_file_script_command(input: &str) -> Result<ResolvedCommand, ParseError> {
+pub(crate) fn parse_file_script_command(
+    input: &str,
+) -> Result<resolver::ResolvedCommand, ParseError> {
     let ast = parse::Parser::parse_file_script(input)?;
     resolver::Resolver::resolve(ast, Mode::Job)
 }

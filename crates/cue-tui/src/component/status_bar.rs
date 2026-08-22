@@ -1,7 +1,7 @@
 //! Header bar component — top line showing session state and actions.
 
 use crossterm::event::{KeyEvent, MouseEvent};
-use cue_core::Mode;
+use cue_language::Mode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};

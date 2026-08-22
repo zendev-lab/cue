@@ -12,13 +12,13 @@
 //!    rejects, every prior reservation is rolled back (each provider
 //!    `release`d) before the rejection is returned. This avoids partial
 //!    holds across providers.
-//! 3. **Per-job release.** Reservations are tracked by `JobId` so the
-//!    scheduler can issue one `release(job_id)` on terminal job
+//! 3. **Per-step release.** Reservations are tracked by `StepId` so the
+//!    scheduler can issue one `release(step_id)` on terminal step
 //!    transitions, regardless of how many providers were involved.
 //!
 //! The registry is *not* an actor; it lives behind an `Arc` and uses
 //! `std::sync::Mutex` internally. The bookkeeping is small enough
-//! (one entry per active job) that there's no value in promoting it
+//! (one entry per active step) that there's no value in promoting it
 //! to its own task. Per-provider serialisation is the provider's
 //! responsibility (e.g. NVML provider holds its own `Mutex`).
 
@@ -29,7 +29,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use cue_core::{
-    JobId,
+    StepId,
     resource::{Grant, Need, ProviderId, Snapshot},
 };
 
@@ -52,13 +52,13 @@ pub struct ProviderRegistry {
     by_id: BTreeMap<ProviderId, Arc<dyn Provider>>,
     /// Reverse routing table: `need.X` → provider id.
     key_to_provider: HashMap<String, ProviderId>,
-    /// Per-job reservation bookkeeping (cleared by `release`).
+    /// Per-step reservation bookkeeping (cleared by `release`).
     state: Mutex<RegistryState>,
 }
 
 #[derive(Default)]
 struct RegistryState {
-    reservations: HashMap<JobId, Vec<TrackedGrant>>,
+    reservations: HashMap<StepId, Vec<TrackedGrant>>,
 }
 
 impl fmt::Debug for ProviderRegistry {
@@ -190,8 +190,8 @@ impl ProviderRegistry {
     ///
     /// Returns `Ok(Vec<Grant>)` on full success; the caller is expected to
     /// merge `grant.env` into the spawning scope and pass the grants to
-    /// `release(job_id)` when the job terminates.
-    pub fn try_reserve(&self, job_id: JobId, need: &Need) -> Result<Vec<Grant>, RejectGroup> {
+    /// `release(step_id)` when the step terminates.
+    pub fn try_reserve(&self, step_id: StepId, need: &Need) -> Result<Vec<Grant>, RejectGroup> {
         if need.is_empty() {
             return Ok(Vec::new());
         }
@@ -236,7 +236,7 @@ impl ProviderRegistry {
                 .get(&pid)
                 .expect("by_id should contain every routed provider id");
 
-            let req = ReserveRequest::new(job_id, sub_need);
+            let req = ReserveRequest::new(step_id, sub_need);
             match provider.reserve(&req) {
                 Ok(grant) => {
                     acquired.push(TrackedGrant {
@@ -259,12 +259,12 @@ impl ProviderRegistry {
             }
         }
 
-        // Track for later `release(job_id)`.
+        // Track for later `release(step_id)`.
         {
             let mut state = self.state.lock().expect("registry state lock poisoned");
             state
                 .reservations
-                .entry(job_id)
+                .entry(step_id)
                 .or_default()
                 .extend(acquired.clone());
         }
@@ -272,14 +272,14 @@ impl ProviderRegistry {
         Ok(acquired.into_iter().map(|tg| tg.grant).collect())
     }
 
-    /// Release every reservation currently held by `job_id`. Idempotent:
+    /// Release every reservation currently held by `step_id`. Idempotent:
     /// calling on an unknown job id is a no-op.
     ///
     /// Returns the number of reservations released (useful in tests).
-    pub fn release(&self, job_id: JobId) -> usize {
+    pub fn release(&self, step_id: StepId) -> usize {
         let to_release: Vec<TrackedGrant> = {
             let mut state = self.state.lock().expect("registry state lock poisoned");
-            state.reservations.remove(&job_id).unwrap_or_default()
+            state.reservations.remove(&step_id).unwrap_or_default()
         };
         let n = to_release.len();
         for tg in to_release {
@@ -335,7 +335,15 @@ mod tests {
         let reg = ProviderRegistry::from_providers(vec![p1]).unwrap();
 
         let need = Need::from_pairs([("tpu_mem", count(1))]);
-        let err = reg.try_reserve(JobId(1), &need).unwrap_err();
+        let err = reg
+            .try_reserve(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                &need,
+            )
+            .unwrap_err();
         assert_eq!(err.provider_id, ProviderId::new("core"));
         assert!(err.reject.reason.contains("unknown resource key"));
         assert!(err.reject.reason.contains("tpu_mem"));
@@ -346,7 +354,15 @@ mod tests {
         let p1 = Arc::new(MockProvider::new("gpu", &["gpu"]));
         let reg = ProviderRegistry::from_providers(vec![p1.clone()]).unwrap();
 
-        let grants = reg.try_reserve(JobId(1), &Need::new()).unwrap();
+        let grants = reg
+            .try_reserve(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                &Need::new(),
+            )
+            .unwrap();
         assert!(grants.is_empty());
         assert_eq!(p1.reserve_calls(), 0);
     }
@@ -362,7 +378,15 @@ mod tests {
             ("gpu_mem", ResourceQuantity::Bytes(24 * 1024 * 1024 * 1024)),
             ("tpu", count(2)),
         ]);
-        let grants = reg.try_reserve(JobId(1), &need).unwrap();
+        let grants = reg
+            .try_reserve(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                &need,
+            )
+            .unwrap();
         assert_eq!(grants.len(), 2);
 
         // Each provider got only its own keys.
@@ -386,7 +410,15 @@ mod tests {
         let reg = ProviderRegistry::from_providers(vec![gpu.clone(), tpu.clone()]).unwrap();
 
         let need = Need::from_pairs([("gpu", count(1)), ("tpu", count(1))]);
-        let err = reg.try_reserve(JobId(1), &need).unwrap_err();
+        let err = reg
+            .try_reserve(
+                StepId {
+                    execution: cue_core::ExecutionId(1),
+                    index: 1,
+                },
+                &need,
+            )
+            .unwrap_err();
         assert_eq!(err.provider_id, ProviderId::new("tpu"));
         assert_eq!(err.reject.reason, "tpu unavailable");
 
@@ -404,18 +436,35 @@ mod tests {
         let reg = ProviderRegistry::from_providers(vec![gpu.clone(), tpu.clone()]).unwrap();
 
         let need = Need::from_pairs([("gpu", count(1)), ("tpu", count(1))]);
-        let grants = reg.try_reserve(JobId(7), &need).unwrap();
+        let grants = reg
+            .try_reserve(
+                StepId {
+                    execution: cue_core::ExecutionId(7),
+                    index: 1,
+                },
+                &need,
+            )
+            .unwrap();
         assert_eq!(grants.len(), 2);
         assert_eq!(reg.active_reservation_count(), 2);
 
-        let n = reg.release(JobId(7));
+        let n = reg.release(StepId {
+            execution: cue_core::ExecutionId(7),
+            index: 1,
+        });
         assert_eq!(n, 2);
         assert_eq!(gpu.release_calls(), 1);
         assert_eq!(tpu.release_calls(), 1);
         assert_eq!(reg.active_reservation_count(), 0);
 
         // Idempotent: releasing again is a no-op.
-        assert_eq!(reg.release(JobId(7)), 0);
+        assert_eq!(
+            reg.release(StepId {
+                execution: cue_core::ExecutionId(7),
+                index: 1
+            }),
+            0
+        );
         assert_eq!(gpu.release_calls(), 1);
     }
 
@@ -440,6 +489,12 @@ mod tests {
         // Provider never saw this id, but release shouldn't panic.
         gpu.release(&ReservationId::new("nonexistent"));
         assert_eq!(gpu.release_calls(), 1);
-        assert_eq!(reg.release(JobId(99)), 0);
+        assert_eq!(
+            reg.release(StepId {
+                execution: cue_core::ExecutionId(99),
+                index: 1
+            }),
+            0
+        );
     }
 }
