@@ -2829,7 +2829,7 @@ mod tests {
     #[test]
     fn enter_on_targets_preview_saves_default_profile() {
         let unique = format!(
-            "cue-shell-targets-{}-{}",
+            "cue-targets-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2936,7 +2936,7 @@ destination = "devbox"
     #[tokio::test]
     async fn saving_unix_profile_offers_live_reconnect() {
         let unique = format!(
-            "cue-shell-targets-unix-{}-{}",
+            "cue-targets-unix-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3017,7 +3017,7 @@ socket = "/tmp/alt.sock"
     #[tokio::test]
     async fn saving_ssh_profile_offers_live_reconnect() {
         let unique = format!(
-            "cue-shell-targets-ssh-{}-{}",
+            "cue-targets-ssh-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

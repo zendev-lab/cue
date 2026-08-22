@@ -1,4 +1,4 @@
-//! Shared client connection stack for cue-shell frontends.
+//! Shared client connection stack for Cue frontends.
 
 pub mod cli;
 mod client;

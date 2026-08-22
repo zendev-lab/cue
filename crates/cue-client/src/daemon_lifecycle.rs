@@ -377,28 +377,23 @@ fn daemon_bin_candidates_from_sources(
     }
 
     push_unique(&mut candidates, "cued".into());
-    push_unique(&mut candidates, "cue-daemon".into());
     candidates
 }
 
 fn daemon_candidates_for_path(path: &Path) -> Vec<String> {
     let mut candidates = Vec::new();
-    for bin_name in ["cued", "cue-daemon"] {
-        let sibling = path.with_file_name(bin_name);
-        if sibling.is_file() {
-            push_unique(&mut candidates, sibling.display().to_string());
-        }
+    let sibling = path.with_file_name("cued");
+    if sibling.is_file() {
+        push_unique(&mut candidates, sibling.display().to_string());
     }
 
     if let Some(parent) = path.parent()
         && parent.file_name().is_some_and(|name| name == "deps")
         && let Some(bin_dir) = parent.parent()
     {
-        for bin_name in ["cued", "cue-daemon"] {
-            let cargo_bin = bin_dir.join(bin_name);
-            if cargo_bin.is_file() {
-                push_unique(&mut candidates, cargo_bin.display().to_string());
-            }
+        let cargo_bin = bin_dir.join("cued");
+        if cargo_bin.is_file() {
+            push_unique(&mut candidates, cargo_bin.display().to_string());
         }
     }
 
@@ -487,11 +482,7 @@ mod tests {
 
         assert_eq!(
             daemon_bin_candidates_from_sources(None, Some(cue), None),
-            vec![
-                cued.display().to_string(),
-                "cued".to_string(),
-                "cue-daemon".to_string(),
-            ]
+            vec![cued.display().to_string(), "cued".to_string()]
         );
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
@@ -507,11 +498,7 @@ mod tests {
 
         assert_eq!(
             daemon_bin_candidates_from_sources(None, None, Some(cue)),
-            vec![
-                cued.display().to_string(),
-                "cued".to_string(),
-                "cue-daemon".to_string(),
-            ]
+            vec![cued.display().to_string(), "cued".to_string()]
         );
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
@@ -529,11 +516,7 @@ mod tests {
 
         assert_eq!(
             daemon_bin_candidates_from_sources(None, Some(cue), None),
-            vec![
-                cued.display().to_string(),
-                "cued".to_string(),
-                "cue-daemon".to_string(),
-            ]
+            vec![cued.display().to_string(), "cued".to_string()]
         );
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
@@ -543,7 +526,7 @@ mod tests {
     fn daemon_bin_falls_back_to_path_lookup() {
         assert_eq!(
             daemon_bin_candidates_from_sources(None, None, None),
-            vec!["cued".to_string(), "cue-daemon".to_string()]
+            vec!["cued".to_string()]
         );
     }
 

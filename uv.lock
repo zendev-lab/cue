@@ -3,5 +3,5 @@ revision = 3
 requires-python = ">=3.13"
 
 [[package]]
-name = "cue-shell"
+name = "cue-run"
 source = { editable = "." }

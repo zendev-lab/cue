@@ -34,7 +34,7 @@ pub struct Config {
 }
 
 const DEFAULT_GIT_NO_VERIFY_HINT: &str = "Run the commit normally; if hooks fail, inspect and fix the hook/check or ask before any alternative.";
-const DEFAULT_DAEMON_CONFIG: &str = r#"# cue-shell daemon runtime configuration.
+const DEFAULT_DAEMON_CONFIG: &str = r#"# Cue daemon runtime configuration.
 # This file is created automatically on first daemon startup and is safe to edit.
 # Existing files are never overwritten; missing built-in guardrails are still
 # merged at load time.
@@ -424,7 +424,7 @@ fn default_max_script_runs() -> usize {
 /// ```toml
 /// [sandbox]
 /// # Root under which each sandboxed job gets its own <root>/<job-id>/{upper,work}.
-/// default_upper_root = "/dev/shm/cue-shell-sandbox"
+/// default_upper_root = "/dev/shm/cue-sandbox"
 /// # Refuse to prepare a sandbox when the upper-root filesystem has less than
 /// # this fraction of space available (0.0 disables the guard). Protects shared
 /// # memory (/dev/shm) from being exhausted by runaway writes.
@@ -465,7 +465,7 @@ impl SandboxConfig {
 }
 
 fn default_sandbox_upper_root() -> PathBuf {
-    PathBuf::from("/dev/shm/cue-shell-sandbox")
+    PathBuf::from("/dev/shm/cue-sandbox")
 }
 
 fn default_sandbox_min_free_ratio() -> f64 {
@@ -753,7 +753,7 @@ mod tests {
                 .expect("system time")
                 .as_nanos()
         ));
-        let path = root.join("cue-shell").join("daemon.toml");
+        let path = root.join("cue").join("daemon.toml");
 
         ensure_default_daemon_config(&path).expect("write default config");
 
@@ -792,7 +792,7 @@ mod tests {
                 .expect("system time")
                 .as_nanos()
         ));
-        let path = root.join("cue-shell/daemon.toml");
+        let path = root.join("cue/daemon.toml");
         std::fs::create_dir_all(path.parent().expect("config parent"))
             .expect("create config parent");
         std::fs::write(&path, "[warn]\ncommands = []\n").expect("write config");
@@ -1425,7 +1425,7 @@ git = "Review git command before running."
         let config = Config::default();
         assert_eq!(
             config.sandbox.default_upper_root,
-            Path::new("/dev/shm/cue-shell-sandbox")
+            Path::new("/dev/shm/cue-sandbox")
         );
         assert_eq!(config.sandbox.min_free_ratio, 0.1);
     }

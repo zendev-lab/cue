@@ -6,7 +6,7 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
-# cue-shell specific terms
+# Cue specific terms
 cued = "cued"
 cron = "cron"
 tui = "tui"

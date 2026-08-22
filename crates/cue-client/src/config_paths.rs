@@ -93,7 +93,7 @@ fn config_dir_from_env(
     home: Option<OsString>,
 ) -> Result<PathBuf> {
     let Some(dir) = optional_config_dir_from_env(xdg_config_home, home) else {
-        bail!("HOME is not set; set HOME or XDG_CONFIG_HOME to resolve cue-shell config paths");
+        bail!("HOME is not set; set HOME or XDG_CONFIG_HOME to resolve Cue config paths");
     };
     Ok(dir)
 }
@@ -111,7 +111,7 @@ fn optional_config_dir_from_env(
 #[cfg(test)]
 fn home_dir_from_env(home: Option<OsString>) -> Result<PathBuf> {
     let Some(home) = non_empty_env(home) else {
-        bail!("HOME is not set; set HOME or XDG_CONFIG_HOME to resolve cue-shell config paths");
+        bail!("HOME is not set; set HOME or XDG_CONFIG_HOME to resolve Cue config paths");
     };
     Ok(PathBuf::from(home))
 }

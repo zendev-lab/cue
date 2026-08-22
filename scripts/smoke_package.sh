@@ -25,7 +25,6 @@ uv tool run --from "$package_path" cue-client --version
 uv tool run --from "$package_path" cue-client target resolve --json
 uv tool run --from "$package_path" cue-client target list --json
 uv tool run --from "$package_path" cue-tui --version
-uv tool run --from "$package_path" cue-daemon --version
 uv tool run --from "$package_path" cued --version
 uv tool run --from "$package_path" cue client target resolve --json
 uv tool run --from "$package_path" cue daemon --version

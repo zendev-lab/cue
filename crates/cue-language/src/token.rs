@@ -54,7 +54,7 @@ pub enum Token {
     Word(String),
     /// An entity ID reference like J1 or C3.
     IdRef(IdKind, u32),
-    /// Unquoted bash syntax cue-shell does not interpret.
+    /// Unquoted bash syntax Cue does not interpret.
     ///
     /// Kept as a token rather than a tokenizer error so raw-text builtins such
     /// as `:send` can still carry these bytes as literal payload; the parser
@@ -76,9 +76,9 @@ pub enum IdKind {
     Cron,
 }
 
-/// An unquoted bash construct cue-shell recognizes only to reject.
+/// An unquoted bash construct Cue recognizes only to reject.
 ///
-/// cue-shell never hands a command line to a shell, so these bytes cannot mean
+/// Cue never hands a command line to a shell, so these bytes cannot mean
 /// what bash would make them mean. Recognizing them explicitly is what turns a
 /// silently wrong argv into a diagnosable error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,11 +108,11 @@ impl ShellSyntax {
         }
     }
 
-    /// The cue-shell equivalent, or why there is none.
+    /// The Cue equivalent, or why there is none.
     pub fn hint(self) -> &'static str {
         match self.kind {
             ShellSyntaxKind::Redirect => {
-                "cue-shell runs commands directly instead of through a shell, so redirection would not be applied; pipe with `|>` / `|&>` / `|!>`, or let the command write the file itself"
+                "Cue runs commands directly instead of through a shell, so redirection would not be applied; pipe with `|>` / `|&>` / `|!>`, or let the command write the file itself"
             }
             ShellSyntaxKind::Semicolon => {
                 "use `->` to continue on success, `~>` to continue regardless, or `&&` / `||` to stay inside one job"

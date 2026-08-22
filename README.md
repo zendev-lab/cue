@@ -1,416 +1,168 @@
-# cue-shell
+# Cue
 
-Durable process substrate with named sessions shared by humans and agents.
+Cue is a persistent, observable local execution runtime for work shared by
+humans and agents. `cued` owns process, PTY, scope, resource, schedule, output,
+and recovery state; clients submit one typed `ExecutionSpec` and observe one
+`ExecutionId` (`E<n>`) with stable process-step IDs (`E<n>/S<n>`).
 
-> ⚠️ **Pre-1.0** — core JOB / CRON flows, `.cue` scripts, real `:fg` PTY
-> attach, client target resolution, and the official command set are implemented.
-> Public contracts may still change before 1.0. Agent runtime concerns live above cue-shell.
+> **Pre-1.0:** IPC v3 is an intentional hard cut. Older `Eval`, `RunScript`,
+> job, chain, and script-state clients are rejected during capability checks.
 
-## Overview
+Cue is not a general shell, workflow engine, fleet manager, or policy daemon.
+Its shell-like language remains a frontend convenience: `cue-language` compiles
+interactive input and `.cue` files locally into the same typed execution
+contract used by non-language clients.
 
-cue-shell (`cue`) is a terminal-native runtime for durable async processes. It is **not** a traditional shell — it's a structured environment where sessions, jobs, scopes, chains, and crons are first-class primitives.
+## What Cue owns
 
-### Key Features
+- durable executions, steps, named sessions, scopes, schedules, and idempotency facts;
+- process groups, resource admission, workspace views, wrappers, PTYs, output, and events;
+- multiple PTY observers with one explicit controller lease;
+- disconnect-safe background work and restart recovery;
+- a constrained per-spawn adapter seam for host policy enforcement.
 
-- **Three-layer architecture**: Process substrate (`cued` daemon) → Core model → Frontends (TUI/MCP/API)
-- **Named shared sessions**: humans and agents attach to one persistent job/scope context instead of maintaining separate terminal state
-- **Primary interaction modes**: JOB ⚡ · CRON ⏰ — switch with `Shift+Tab`
-- **`:` prefix commands**: Vim-style builtin access (`:run`, `:kill`, `:jobs`, `:cron`, ...)
-- **`.cue` file scripts**: `cue run <file.cue>` submits one `R<n>` script with fail-fast execution
-- **Shared foreground PTY attach**: `:fg J<n>` claims the single controller lease; `:watch J<n>` observes the same terminal read-only
-- **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
-- **Scope persistence**: Environment snapshots with delta storage and lifecycle management
-- **Chain syntax**: `->` serial · `~>` ignore-failure · `|||` parallel · `|?|` any-success; `&&` / `||` stay inside one job
-- **Daemon durability**: named sessions, job history, cron definitions, and safe scope cursors survive client disconnects and daemon restarts
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│  L3 Frontend: TUI / MCP / REST API      │
-├─────────────────────────────────────────┤
-│  L2 Core model (cue-core)                │
-│  Session · Job · Scope · Chain · Cron   │
-├─────────────────────────────────────────┤
-│  L1 Process substrate (cued daemon)     │
-│  Unix socket · SQLite · Process mgmt    │
-└─────────────────────────────────────────┘
-```
-
-## Workspace Structure
-
-```
-crates/
-├── cue-core/   — Core types and logic: Session, Job, Scope, Chain, Cron
-├── cue-client/ — Client connection stack and `cue-client` CLI for session/target/run commands
-├── cue-daemon/ — Background daemon library plus `cue-daemon` / `cued` CLIs
-├── cue-tui/    — Interactive TUI frontend plus `cue-tui` CLI
-├── cue-cli/    — `cue` aggregator entrypoint for explicit namespaces and extensions
-skills/
-└── cue/        — Agent guidance maintained with cue-shell contracts
-```
+Higher layers own agent/workflow policy, approvals, secrets, remote-fleet
+coordination, and general DAG/retry semantics. In particular, `cued` has no DSH
+mode or DSH dependency: DSH confinement is supplied by `dsh-tool-cue` through a
+short-lived SpawnAdapter broker.
 
 ## Agent skill
 
 [`skills/cue/SKILL.md`](skills/cue/SKILL.md) is the canonical agent-facing Cue
-Skill. cue-shell binaries do not load it; downstream products pin verified
-snapshots for their own hosts.
+Skill. Cue binaries do not load it; downstream products pin verified snapshots
+for their own hosts.
 
-## Installation
+## Install and commands
+
+The Python distribution is `cue-run`; the product and commands remain Cue:
 
 ```bash
-# Install the official command set from PyPI:
-# `cue`, `cue-client`, `cue-tui`, `cue-daemon`, and `cued`.
-uv tool install cue-shell
+uv tool install cue-run
+
+cue --help
+cue tui
+cue run build.cue
+cue client session list --json
+cue daemon status
+cued --version
 ```
+
+The installed command set is `cue`, `cue-client`, `cue-tui`, and `cued`.
+`cue daemon ...` forwards to `cued`; there is no standalone `cue-daemon`
+command alias. Because Google CUE also installs a `cue` command, installation
+diagnostics detect a foreign binary rather than assuming it is this runtime.
+
+## Language frontend
+
+Commands are direct argv, not implicit `/bin/sh` strings:
+
+```cue
+cargo test
+RUST_LOG=debug cargo test
+MODE=release ./scripts/build
+printf hello |> wc -c
+cargo fmt -> cargo clippy
+cargo test ||| cargo test --doc
+```
+
+Leading `NAME=value` words apply only to that pipeline segment. They are typed
+environment overrides and never mutate the session scope. Assignment-shaped
+arguments after the executable remain ordinary argv.
+
+Composition maps directly to `ExecutionPlan`:
+
+| Language | Typed node | Meaning |
+| --- | --- | --- |
+| `A |> B` | one `Pipeline` | connect exact argv segments with a pipe |
+| `A && B`, `A -> B` | `OnSuccess` | run B only after A succeeds |
+| `A || B` | `OnFailure` | run B only after A fails |
+| `A ~> B` | `Always` | run B after either result |
+| `A ||| B` | `ParallelAll` | run all branches; all must succeed |
+| `A |?| B` | `AnySuccess` | succeed after the first successful branch |
+
+A `.cue` file is parsed and compiled by the client into one fail-fast execution
+with source metadata:
+
+```bash
+cue run scripts/build.cue
+```
+
+Retry is deliberately a new submission with `retry_of`; an old execution is
+never revived or assigned a second lifecycle.
+
+## Runtime contract
+
+Execution state is exactly `queued | running | succeeded | failed | cancelled`.
+A forced stop is `cancelled` with a forced reason. Each actual pipeline segment
+has one stable `StepId`; PTY attach/watch/control and output address that step.
+
+IPC v3 uses length-prefixed strict JSON over a local Unix socket or the same
+framing through `cued gateway --stdio` for explicit SSH profiles. Core requests
+are:
+
+- `SubmitExecution`, `GetExecution`, `ListExecutions`, `WaitExecution`;
+- `CancelExecution { graceful | force }`, `ReadExecutionOutput`;
+- typed scope/session and schedule operations;
+- typed step PTY attach/watch/control operations.
+
+Execution events are `ExecutionCreated`, `ExecutionStateChanged`,
+`StepStateChanged`, `OutputChunk`, and `ExecutionFinished`. PTY attachment
+lifecycle events remain a separate typed control stream.
+
+See [IPC protocol](docs/design/ipc-protocol.md), [core types](docs/design/core-types.md),
+and [daemon architecture](docs/design/daemon-architecture.md).
+
+## Spawn preparation and policy adapters
+
+Every process segment passes through one preparation path, in this order:
+
+1. scope, environment, and resource admission;
+2. argv expansion;
+3. workspace view;
+4. configured wrapper;
+5. optional SpawnAdapter `PrepareSpawn`;
+6. `Command::new` and spawn.
+
+`SettleSpawn` receives the process result and a bounded diagnostic stderr/PTY
+tail. An unavailable adapter fails closed before spawn; an unavailable settle
+call preserves the process result but finishes the execution as an
+infrastructure failure. Adapter sockets must be private, same-UID Unix sockets
+inside Cue's runtime adapter directory. Opaque tokens are not placed in the
+environment, database, output, or events. Schedule templates cannot persist an
+ephemeral adapter.
+
+## Files and migration
+
+Cue uses standard XDG roots under `cue`:
+
+- config: `$XDG_CONFIG_HOME/cue/`;
+- data/database/output: `$XDG_DATA_HOME/cue/`;
+- state/logs: `$XDG_STATE_HOME/cue/`;
+- runtime/socket/adapters: `$XDG_RUNTIME_DIR/cue/`.
+
+On first upgraded startup, the migration takes the instance lock, rejects
+symlinks, archives the legacy `cue-shell` v18 database and output read-only,
+and imports only safe session/scope/config context. Legacy J/CH/R history and
+cron records are not dual-read or imported. The migration is idempotent and
+leaves the old data untouched if publication or import fails.
 
 ## Development
 
 ```bash
-# Prerequisites: Rust 1.95+, just
-
-# Build
-cargo build
-
-# Start daemon in foreground
-cued -f
-
-# Show the top-level aggregator help
-cargo run -p cue-cli --bin cue --
-
-# Start TUI (auto-connect / auto-reconnect)
-cargo run -p cue-tui --bin cue-tui
-# or through the aggregator
-cargo run -p cue-cli --bin cue -- tui
-
-# Create, inspect, and share a durable named session
-cargo run -p cue-cli --bin cue -- session create dev
-cargo run -p cue-cli --bin cue -- session list
-cargo run -p cue-cli --bin cue -- tui --session dev
-
-# Restart the daemon directly
-cargo run -p cue-daemon --bin cue-daemon -- restart
-# `cued` remains as a daemon alias
-cargo run -p cue-daemon --bin cued -- restart
-
-# Restart from inside the TUI
-:restart
-
-# Run checks
 just check
-
-# Run tests
 just test
-
-# Full CI locally (requires rustup with Rust 1.95 and uv)
-just ci
-
-# Install pre-commit hooks
-just pre-commit-install
+just msrv
+just package-smoke
+just pre-commit
 ```
 
-See [`docs/testing.md`](docs/testing.md) for test ownership, static-policy boundaries,
-and the checks that make up the local and hosted CI gates.
-
-## Design Documents
-
-See [`docs/design/README.md`](docs/design/README.md) for the design index:
-
-- **Design overview** — Three-layer architecture, crates, primitives, IPC summary
-- **conceptual-model.md** — Jobs/scopes indexing, sequential composition, atomic tool surface
-- **commands-and-modes.md** — Command reference, mode system, `:cron` syntax
-- **cue-script.md** — `.cue` file script contract for `cue run <file.cue>`
-
-## Client + daemon config
-
-cue-shell uses split config files in the platform config dir:
-
-- `client.toml` — client-side transport/profile selection used by `cue-client`, `cue-tui`, and `cue client ...`
-- `daemon.toml` — daemon-side runtime defaults used by `cue-daemon` / `cued`
-
-### Named sessions
-
-Named sessions are daemon-owned process workspaces. Creating one captures the
-current cwd/environment scope; another human or agent client can attach by name
-and sees the same owned jobs, crons, output events, and subsequent scope cursor.
-Closing a TUI or client does not delete the session or stop its jobs.
-
-```text
-cue session create dev
-cue session list
-cue tui --session dev
-CUE_SESSION=dev cue run examples/hello.cue
-```
-
-Finished sessions can be hidden from the everyday list without deleting their
-state:
-
-```text
-cue session archive old-dev
-cue session list --archived
-cue session list --all --json
-cue session restore old-dev
-```
-
-Archive is deliberately reversible: the session identity, scope cursor, job
-history, and retained terminal history remain intact. `cue session list` shows
-active sessions by default, and archived sessions cannot be attached until
-restored. The daemon refuses to archive a session that still has connected
-clients, non-terminal jobs, pending script/chain work, or an owned cron; detach
-clients and explicitly finish/cancel/remove those blockers first. There is no
-force-archive or deletion path. Archive-aware clients require the daemon's
-`session-archive` IPC capability and fail locally with an upgrade/restart hint
-before sending an unsupported request to an older daemon.
-
-Scopes containing credential-like environment values are deliberately not
-written to SQLite. After a daemon restart such a session reports
-`needs_refresh`; recover it explicitly from a trusted process environment with
-`cue tui --session dev --session-refresh` or
-`CUE_SESSION=dev cue run examples/hello.cue --session-refresh`. Ordinary
-reconnects never replace an already-ready shared scope.
-
-Foreground PTY jobs can be shared without sharing write access:
-
-```text
-:fg J1       # attach and claim the controller lease
-:watch J1    # attach as a read-only observer
-cue fg watch J1 --session dev  # persistent non-interactive observer
-```
-
-Every attachment receives the current terminal snapshot and subsequent live
-output. Exactly one attached client may send keys, paste, resize, or use
-`:send` against that PTY. In the fullscreen terminal view, `Ctrl+]` releases
-control (or claims it when free), `Ctrl+Z` detaches, and `Ctrl+Y` copies the
-visible terminal. Releasing control keeps the client attached as an observer;
-disconnecting releases its controller lease without stopping the job.
-
-`cue fg watch` keeps its daemon connection open until the PTY job exits. Its
-default stdout is the exact initial terminal snapshot followed by matching live
-PTY bytes, so it can be redirected without text conversion; lifecycle notices
-go to stderr. Add `--jsonl` for `snapshot`, `output`, `control_changed`, and
-`exited` records (binary fields are base64), or `--session-refresh` when a
-selected named session explicitly needs recovery after a daemon restart.
-
-### `.cue` file script mode
-
-Scripts are `.cue` files executed through the client CLI, with a top-level shortcut retained by the aggregator:
-
-```text
-cue-client run examples/hello.cue
-cue client run examples/hello.cue
-cue run examples/hello.cue
-```
-
-A script run gets an id such as `R12`. Top-level items run in file order with
-fail-fast semantics: if one item exits non-zero, later items are not submitted
-and `cue run` exits with that code. Bare non-`:` items default to `:run`, while
-explicit `:` commands remain available for builtins and `:run(...)` mode params.
-Output still belongs canonically to jobs, while the daemon delivers script job
-output and terminal script status directly to the `cue run` process so
-stdout/stderr and the final exit code do not depend on event-channel
-subscriptions.
-
-Interactive JOB multiline input is not a script entry point; put multi-item
-workflows in a `.cue` file. See [`docs/design/cue-script.md`](docs/design/cue-script.md)
-and [`examples/`](examples/).
-
-### Client transport and extension config
-
-`cue-client` and `cue-tui` default to a local Unix socket profile, so local users do not need any config for the current flow. The top-level `cue` command is an explicit aggregator: bare `cue` prints help, `cue session ...` forwards to `cue-client session ...`, `cue client ...` forwards to `cue-client ...`, `cue tui ...` forwards to `cue-tui`, and `cue daemon ...` forwards to `cue-daemon`. Target/profile commands are intentionally namespaced under the client surface; use `cue-client target ...` or `cue client target ...` rather than `cue target ...`.
-
-To make the split explicit:
-
-```toml
-[transport]
-default_profile = "local"
-
-[transport.profiles.local]
-transport = "unix"
-# socket = "/custom/path/to/cued.sock"
-
-[transport.profiles.remote-dev]
-transport = "ssh"
-destination = "user@example.com"
-gateway_command = "cued gateway --stdio"
-start_command = "cued start"
-```
-
-The `local` profile name is reserved for Unix socket transport; use another
-profile name for SSH targets.
-
-Phase 1 uses the system OpenSSH client and runs the configured gateway command
-over SSH, so the client speaks the same IPC through `cued gateway --stdio`.
-Remote daemon startup still stays explicit: `cue` will **not** run
-`start_command` for you. `cue-client` owns client-side transport parsing and
-resolution, so CLI/TUI frontends share the same `client.toml` behavior.
-
-When `auto_detect_ssh` is enabled, cue-shell adds implicit SSH profiles from
-`~/.ssh/config`. Additional cluster inventory can be configured generically
-without hardcoding scheduler-specific names in cue-shell:
-
-```toml
-[transport.discovery]
-# Values are host lists separated by comma, semicolon, or whitespace.
-env_hosts = ["CLUSTER_HOSTS"]
-# Values are endpoint lists; cue-shell extracts hosts from host:port or URI values.
-env_endpoints = ["CLUSTER_ENDPOINTS"]
-# Values point to files containing one host per line or host plus extra columns.
-env_hostfiles = ["CLUSTER_HOSTFILE"]
-# Values use bracket range syntax such as gpu-[01-03,08].
-env_bracket_ranges = ["CLUSTER_NODELIST"]
-```
-
-Site-specific schedulers should be wired through this config or through external
-`cue-*` extensions rather than hardcoded in the cue-shell core. Other frontends,
-including Pi cue integrations, should use the cue-client resolver if they need to honor `client.toml`:
-
-```text
-cue-client target resolve --json
-cue client target resolve --json
-cue-client target list --json
-```
-
-Direct daemon/socket integrations only see the server side and will not apply client profile selection by themselves.
-
-`cue` can also dispatch external CLI extensions from `client.toml` after checking aggregator namespaces and direct shortcuts:
-
-```toml
-[extensions.commands.foo]
-program = "cue-foo"
-description = "Foo extension"
-```
-
-`program` is the executable path/name; extension arguments come from the `cue foo ...`
-invocation. Then `cue foo arg` runs `cue-foo arg`. Aggregator namespaces and shortcuts such as `client`, `tui`, `daemon`, `run`, `target`, `help`, and `version` take precedence, and extension names must be kebab-case without colliding with built-in or first-party subcommands. Optional PATH lookup for unknown `cue-<name>` binaries can be enabled explicitly:
-
-```toml
-[extensions]
-path_lookup = true
-```
-
-### Daemon runtime config
-
-On first startup, `cued` creates `~/.config/cue-shell/daemon.toml` with the built-in guardrails.
-`daemon.toml` can block unsafe commands or command arguments and attach remediation hints.
-Block rules run before advisory warnings, so a command can both warn generally
-and fail fast for specific arguments.
-
-```toml
-[block.versioned_commands]
-python = "Use script_run/script_eval or uv run python ...; direct Python launchers are blocked."
-
-[block.commands]
-sh = "Avoid shell wrappers. Use cue-shell direct-exec, cwd=..., or cue operators."
-
-[block.commands.git]
-"--no-verify" = "Run the commit normally; if hooks fail, inspect and fix the hook/check."
-
-[block.commands.npm]
-"--force" = "Use the lockfile and normal install path."
-
-[warn.commands]
-cd = "Prefer cwd=... over cd in command strings."
-```
-
-Matching is literal, not glob or regex based:
-
-- `[block.commands] sh = "..."` blocks a command whose `argv[0]` basename is exactly `sh`. It matches `sh` and `/bin/sh`; it does not match `zsh`, `/bin/zsh`, or `shellcheck`.
-- `[block.versioned_commands] python = "..."` blocks command basenames `python`, `python2`, `python3`, `python3.12`, etc.; it does not match `python-config`.
-- The generated default config uses `[block.versioned_commands] python = "..."` to block direct `python`, `python3`, and versioned launchers such as `python3.12`, so Python execution goes through `script_run` / `script_eval` or explicit `uv run python ...`.
-- Each `[block.commands.<name>]` entry maps one blocked argument pattern to its remediation hint. The command name is also matched by exact `argv[0]` basename.
-- Argument patterns are checked against each argv token independently, not against the joined command line. `"--no-verify"` matches an argument token `--no-verify`; it also matches `--no-verify=...` via the `--flag=value` convention.
-- `[warn.commands]` maps an exact command basename to an advisory hint.
-
-`daemon.toml` can cap persisted job/script history:
-
-```toml
-[retention]
-max_job_history = 200
-max_script_runs = 100
-```
-
-It can also enable a runtime wrapper such as `rtk`. Wrapping is allowlist-only:
-commands not listed under `[wrapper.allowlist]` are never wrapped, and an empty
-allowlist wraps nothing.
-
-```toml
-[wrapper]
-enabled = true
-binary = "rtk"
-
-[wrapper.allowlist]
-commands = ["cargo", "git", "pnpm", "node"]
-```
-
-`:wrap on/off/status` overrides only the session-level enablement. Per-command
-mode params such as `:run(wrapper=false) cargo test` and cron params such as
-`:cron(wrapper=true) every 5m cargo test` override enablement for that
-invocation, but still must match the allowlist.
-
-`daemon.toml` configures the overlay workspace sandbox used by
-`:run(sandbox=overlay)`:
-
-```toml
-[sandbox]
-# Root under which each sandboxed job gets its own <root>/<job-id>/{upper,work}.
-# Defaults to shared memory so writes stay off disk; point it at a disk-backed
-# path if /dev/shm is too small for your builds.
-default_upper_root = "/dev/shm/cue-shell-sandbox"
-# Refuse to start a sandbox when the upper-root filesystem has less than this
-# fraction free (0.0 disables the guard). Protects /dev/shm from runaway writes.
-min_free_ratio = 0.1
-```
-
-Each sandboxed job gets an independent per-job upper/work pair, so concurrent
-jobs never share an overlay layer, and the writes are discarded when the job
-finishes. An explicit `:run(sandbox=overlay, sandbox.upper=<dir>)` treats `<dir>`
-as an upper *root* (the daemon still appends `/<job-id>/{upper,work}`), while
-`sandbox.upper=tmpfs` forces a fresh in-memory upper for that job. Overlay
-sandboxing is a workspace view, **not** a security boundary — it does not isolate
-absolute paths outside the working tree, network access, process credentials, or
-environment variables. See `docs/design/sandbox-threat-model.md` for the full
-trust model.
-
-NVIDIA resource discovery is enabled by default. On hosts with a working NVML
-runtime, the daemon automatically registers the `gpu` and `gpu_mem` resource
-keys. On hosts without NVML or NVIDIA devices, startup continues without an
-NVIDIA provider. Operators can opt out explicitly:
-
-```toml
-[resources.nvidia]
-enabled = false
-```
-
-Managed GPU jobs request `need.gpu` and `need.gpu_mem`; the daemon injects the
-selected devices through `CUDA_VISIBLE_DEVICES`.
-
-Typical remote flow:
-
-```bash
-# Step 1: start the remote daemon explicitly
-ssh user@example.com "cued start"
-
-# Step 2: connect with the SSH transport profile
-cue
-```
-
-If the remote daemon is not running (or its socket is missing), `cue` starts the
-TUI offline and keeps retrying the configured gateway. `cue run <file>` still
-fails immediately because file-script execution needs a live daemon.
-
-## Project Status
-
-| Component | Status |
-|-----------|--------|
-| Design docs | ✅ Active |
-| Cargo workspace | ✅ Multi-crate workspace |
-| CI/CD | ✅ Tests, package smokes, PyPI/GitHub release path |
-| cue-core | ✅ Core types / IPC / parser in place |
-| cue-client | ✅ Named sessions / transport profiles / target JSON / script runner |
-| cue-daemon | ✅ Durable sessions / jobs / crons / scopes / PTY attach |
-| cue-tui | ✅ Session attach / interactive job+cron frontend / reconnect view |
-| cue-cli | ✅ Aggregator / extension dispatch / package feature gates for first-party commands |
-
-## License
-
-Licensed under the [MIT License](LICENSE).
+The workspace is split by responsibility:
+
+- `cue-core`: IPC v3 and typed execution/scope/schedule state;
+- `cue-language`: tokenizer, parser, resolver, compiler, completion, highlighting;
+- `cue-daemon`: the single execution/session/resource/PTY/persistence owner;
+- `cue-client`: transport, reconnect, SSH, version checks, and daemon lifecycle;
+- `cue-tui`: an interactive client built on `cue-client` and `cue-language`;
+- `cue-cli`: the installed command aggregator and Maturin companion binaries.
+
+See [testing](docs/testing.md) and the [design index](docs/design/README.md).

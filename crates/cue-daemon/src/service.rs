@@ -1,6 +1,7 @@
 //! Platform service management.
 //!
-//! - macOS: `launchd` via `~/Library/LaunchAgents/com.cue-shell.cued.plist`
+//! - macOS: `launchd` via the retained pre-v3 service label, so upgrades replace
+//!   the existing service instead of installing a second daemon.
 //! - Linux: `systemd --user` via `~/.config/systemd/user/cued.service`
 //!
 //! The design uses `KeepAlive: { SuccessfulExit: false }` on macOS so that a
@@ -15,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use crate::command_util::CommandSpec;
 
 #[cfg(target_os = "macos")]
+// Legacy service identity intentionally retained for in-place upgrade.
 const SERVICE_LABEL: &str = "com.cue-shell.cued";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +307,7 @@ fn service_file_content(exe_path: &Path, _log_path: &Path) -> Result<String> {
     let exe = canonical_service_exe_path(exe_path)?;
     Ok(format!(
         "[Unit]\n\
-         Description=cued — background daemon for cue-shell\n\
+         Description=cued — Cue execution daemon\n\
          After=default.target\n\
          StartLimitIntervalSec=30\n\
          StartLimitBurst=5\n\

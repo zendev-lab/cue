@@ -79,7 +79,7 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
             args: args.collect(),
         }),
         Some("daemon") => Ok(CueCommand::Forward {
-            program: "cue-daemon".into(),
+            program: "cued".into(),
             args: args.collect(),
         }),
         Some("run") => {
@@ -142,7 +142,7 @@ fn exec_cue_program(program: &str, args: &[OsString]) -> anyhow::Result<()> {
     }
 
     bail!(
-        "required cue command `{program}` was not found next to `cue` or on PATH; install the full cue-shell command set"
+        "required cue command `{program}` was not found next to `cue` or on PATH; install the full Cue command set"
     )
 }
 
@@ -289,7 +289,7 @@ mod tests {
             ])
             .expect("parse command"),
             CueCommand::Forward {
-                program: "cue-daemon".into(),
+                program: "cued".into(),
                 args: vec![OsString::from("status")],
             }
         );

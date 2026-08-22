@@ -1,4 +1,4 @@
-//! `cue-tui` — interactive TUI entry point for cue-shell.
+//! `cue-tui` — interactive TUI entry point for Cue.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -375,7 +375,7 @@ where
 
 fn ssh_install_hint(profile_name: &str) -> String {
     format!(
-        "client profile `{profile_name}` uses `transport = \"ssh\"`, but OpenSSH `ssh` was not found in PATH. cue-shell phase 1 uses the system OpenSSH client. Install it (macOS: `brew install openssh`; Debian/Ubuntu: `sudo apt install openssh-client`; Fedora: `sudo dnf install openssh-clients`) or switch back to a unix transport profile."
+        "client profile `{profile_name}` uses `transport = \"ssh\"`, but OpenSSH `ssh` was not found in PATH. Cue phase 1 uses the system OpenSSH client. Install it (macOS: `brew install openssh`; Debian/Ubuntu: `sudo apt install openssh-client`; Fedora: `sudo dnf install openssh-clients`) or switch back to a unix transport profile."
     )
 }
 

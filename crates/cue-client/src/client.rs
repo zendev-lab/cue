@@ -923,7 +923,7 @@ impl MultiplexedClient {
         self.call(RequestPayload::ShowEnv { tail_bytes }).await
     }
 
-    /// Show cue-shell config with an optional byte tail.
+    /// Show cue config with an optional byte tail.
     pub async fn show_config(&self, tail_bytes: Option<usize>) -> Result<ResponsePayload> {
         self.call(RequestPayload::ShowConfig { tail_bytes }).await
     }
@@ -1002,7 +1002,7 @@ impl<T> ClientStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 type BoxedClientStream = Box<dyn ClientStream>;
 
-/// Resolve the default socket path: `$XDG_RUNTIME_DIR/cue-shell/cued.sock`.
+/// Resolve the default socket path: `$XDG_RUNTIME_DIR/cue/cued.sock`.
 pub fn default_socket_path() -> PathBuf {
     default_socket_path_from_env(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir())
 }

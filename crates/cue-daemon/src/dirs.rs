@@ -1,10 +1,10 @@
 //! XDG-compliant directory resolution for cued.
 //!
 //! ```text
-//! Runtime:  $XDG_RUNTIME_DIR/cue-shell/  (socket, pid)
-//! Data:     $XDG_DATA_HOME/cue-shell/    (db, output)
-//! State:    $XDG_STATE_HOME/cue-shell/   (logs)
-//! Config:   $XDG_CONFIG_HOME/cue-shell/  (config)
+//! Runtime:  $XDG_RUNTIME_DIR/cue/  (socket, pid, adapters)
+//! Data:     $XDG_DATA_HOME/cue/    (db, output, legacy archive)
+//! State:    $XDG_STATE_HOME/cue/   (logs)
+//! Config:   $XDG_CONFIG_HOME/cue/  (config)
 //! ```
 
 use std::ffi::OsString;
@@ -33,7 +33,7 @@ fn runtime_dir_from_env(xdg_runtime_dir: Option<OsString>, temp_dir: PathBuf) ->
     }
 }
 
-/// Path to the Unix domain socket: `$XDG_RUNTIME_DIR/cue-shell/cued.sock`.
+/// Path to the Unix domain socket: `$XDG_RUNTIME_DIR/cue/cued.sock`.
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("cued.sock")
 }
@@ -68,7 +68,7 @@ pub(crate) fn runtime_adapter_dir() -> PathBuf {
 
 // ── Data dir (SQLite + output logs) ──
 
-/// `$XDG_DATA_HOME/cue-shell/` (fallback `~/.local/share/cue-shell/`).
+/// `$XDG_DATA_HOME/cue/` (fallback `~/.local/share/cue/`).
 pub fn data_dir() -> Result<PathBuf> {
     data_dir_from_env(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
@@ -95,7 +95,7 @@ pub fn output_dir() -> Result<PathBuf> {
 
 // ── State dir (logs) ──
 
-/// `$XDG_STATE_HOME/cue-shell/` (fallback `~/.local/state/cue-shell/`).
+/// `$XDG_STATE_HOME/cue/` (fallback `~/.local/state/cue/`).
 pub fn state_dir() -> Result<PathBuf> {
     state_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
@@ -117,7 +117,7 @@ pub fn log_path() -> Result<PathBuf> {
 
 // ── Config dir ──
 
-/// `$XDG_CONFIG_HOME/cue-shell/` (fallback `~/.config/cue-shell/`).
+/// `$XDG_CONFIG_HOME/cue/` (fallback `~/.config/cue/`).
 pub fn config_dir() -> Result<PathBuf> {
     config_dir_from_env(
         std::env::var_os("XDG_CONFIG_HOME"),
