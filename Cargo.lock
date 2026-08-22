@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "cue-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "cue-client",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "cue-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "cue-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "cue-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "cue-language"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "cue-core",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "cue-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",

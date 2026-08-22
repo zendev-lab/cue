@@ -29,8 +29,9 @@ short-lived SpawnAdapter broker.
 ## Agent skill
 
 [`skills/cue/SKILL.md`](skills/cue/SKILL.md) is the canonical agent-facing Cue
-Skill. Cue binaries do not load it; downstream products pin verified snapshots
-for their own hosts.
+Skill. Cue binaries do not load it. Node hosts install `@zendev-lab/cue` and
+mount the package's exported `cueSkillsRoot`; the published package contains
+this authority directly rather than a downstream source copy.
 
 ## Install and commands
 

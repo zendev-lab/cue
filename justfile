@@ -50,13 +50,17 @@ package-smoke:
     ./scripts/smoke_package.sh "$package_dir"/*.whl
     ./scripts/smoke_package.sh "$package_dir"/*.tar.gz
 
+# Pack and exercise the canonical Cue Skill npm package.
+npm-package-smoke:
+    node scripts/smoke_npm_package.mjs
+
 # Clean build artifacts
 clean:
     rm -rf target/
     rm -f lcov.info
 
 # Full local CI gate.
-ci: check test msrv package-smoke
+ci: check test msrv package-smoke npm-package-smoke
 
 # Run pre-commit on all files
 pre-commit:
