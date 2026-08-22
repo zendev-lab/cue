@@ -29,9 +29,8 @@ use cue_core::spawn_adapter::{SpawnAdapterRequest, SpawnResult};
 use cue_core::{EventChannel, JobId, StepId};
 
 use super::{
-    ActorSystem, ForegroundRoleUpdate, OutputSnapshot, ProcessJobOptions, ProcessMgrMsg,
-    ProcessSpawnAdapter, SchedulerMsg, ScopeStoreMsg, StderrSnapshot,
-    publish_session_event as publish_actor_session_event,
+    ActorSystem, ForegroundRoleUpdate, ProcessJobOptions, ProcessMgrMsg, ProcessSpawnAdapter,
+    ScopeStoreMsg, publish_session_event as publish_actor_session_event,
     publish_session_event_except as publish_actor_session_event_except,
     send_gateway_event as send_actor_gateway_event,
 };
@@ -54,8 +53,6 @@ struct ProcessEntry {
     kill_tx: mpsc::Sender<()>,
     /// Shared ring buffer holding the latest output bytes for live-tail queries.
     ring_buffer: Arc<Mutex<RingBuffer>>,
-    /// Separate stderr ring buffer.  `None` in PTY mode (streams are merged).
-    stderr_ring: Option<Arc<Mutex<RingBuffer>>>,
     /// Job stdin, either the PTY master or a pipe to the first process.
     input: Option<JobInput>,
     /// PTY master fd used for resize ioctls.
@@ -520,26 +517,6 @@ fn record_pty_output(
     }
 }
 
-fn client_may_write_job_input(
-    input: &JobInput,
-    foreground: &Arc<Mutex<ForegroundState>>,
-    client_id: u64,
-) -> bool {
-    job_input_kind_allows_client(
-        matches!(input, JobInput::Pty(_)),
-        foreground.lock().unwrap().controller,
-        client_id,
-    )
-}
-
-fn job_input_kind_allows_client(
-    requires_controller: bool,
-    controller: Option<u64>,
-    client_id: u64,
-) -> bool {
-    !requires_controller || controller == Some(client_id)
-}
-
 /// Spawn the ProcessManager actor task.
 pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
     tokio::spawn(async move {
@@ -762,62 +739,6 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         };
                         let _ = reply.send(result);
                     });
-                }
-
-                // Expose ring-buffer contents for live-tail queries.
-                ProcessMgrMsg::GetOutput { job_id, tail_bytes, reply } => {
-                    let result = children.get(&job_id.0).map(|entry| {
-                        let (data, truncated) = entry
-                            .ring_buffer
-                            .lock()
-                            .unwrap()
-                            .tail_with_truncation(tail_bytes);
-                        OutputSnapshot { data, truncated }
-                    });
-                    let _ = reply.send(result);
-                }
-
-                ProcessMgrMsg::GetStderr { job_id, tail_bytes, reply } => {
-                    let result = children.get(&job_id.0).map(|entry| match &entry.stderr_ring {
-                        Some(ring) => {
-                            let (data, truncated) =
-                                ring.lock().unwrap().tail_with_truncation(tail_bytes);
-                            StderrSnapshot {
-                                pty_merged: false,
-                                data,
-                                truncated,
-                            }
-                        }
-                        None => StderrSnapshot {
-                            pty_merged: true,
-                            data: Vec::new(),
-                            truncated: false,
-                        },
-                    });
-                    let _ = reply.send(result);
-                }
-
-                ProcessMgrMsg::SendJobInput { client_id, job_id, data, reply } => {
-                    let input = children.get(&job_id.0).and_then(|entry| {
-                        let input = entry.input.clone()?;
-                        if client_may_write_job_input(&input, &entry.foreground, client_id) {
-                            Some(input)
-                        } else {
-                            None
-                        }
-                    });
-                    let handled = match input {
-                        Some(input) => write_job_input(&input, &data)
-                            .await
-                            .map_err(|error| format!("failed to write job input: {error}")),
-                        None if children.get(&job_id.0).is_some_and(|entry| {
-                            matches!(&entry.input, Some(JobInput::Pty(_)))
-                        }) => Err(format!(
-                            "client does not control foreground job {job_id}"
-                        )),
-                        None => Err(format!("job {job_id} does not accept stdin")),
-                    };
-                    let _ = reply.send(handled);
                 }
 
                 ProcessMgrMsg::AttachFg {
@@ -1240,6 +1161,20 @@ async fn prepare_spawn(
 ) -> Result<PreparedSpawn, crate::spawn_adapter::SpawnAdapterError> {
     let mut program = segment.program.clone();
     let mut args = segment.args.clone();
+
+    match options
+        .sys
+        .config
+        .check_command_guardrail(&segment.command_line)
+    {
+        Some(crate::config::BlockDecision::Block(message)) => {
+            return Err(crate::spawn_adapter::SpawnAdapterError::Rejected(message));
+        }
+        Some(crate::config::BlockDecision::Warn(message)) => {
+            warn!(command = ?segment.command_line, %message, "process_mgr: command guardrail warning");
+        }
+        None => {}
+    }
 
     if options.wrapper_enabled {
         let wrapper = &options.sys.config.wrapper;
@@ -1756,7 +1691,6 @@ async fn spawn_single_pipe_job(
         reader_handle,
         kill_tx,
         ring_buffer,
-        stderr_ring: Some(stderr_ring),
         input: None,
         resize: None,
         foreground,
@@ -1928,7 +1862,6 @@ async fn spawn_single_pty_job(
         reader_handle,
         kill_tx,
         ring_buffer,
-        stderr_ring: None,
         input: Some(JobInput::Pty(input)),
         resize: Some(resize_file),
         foreground,
@@ -2009,7 +1942,6 @@ async fn spawn_native_pipeline_job(
         reader_handle,
         kill_tx,
         ring_buffer,
-        stderr_ring: Some(stderr_ring),
         input,
         resize: None,
         foreground,
@@ -2063,7 +1995,6 @@ async fn spawn_logical_job(
         reader_handle,
         kill_tx,
         ring_buffer,
-        stderr_ring: Some(stderr_ring),
         input: None,
         resize: None,
         foreground,
@@ -3616,13 +3547,8 @@ async fn emit_job_finished(
         {
             warn!(%step_id, exit_code, "process_mgr: execution coordinator channel closed while reporting step completion");
         }
-    } else if sys
-        .scheduler
-        .send(SchedulerMsg::JobFinished { job_id, exit_code })
-        .await
-        .is_err()
-    {
-        warn!(%job_id, exit_code, "process_mgr: scheduler channel closed while reporting job completion");
+    } else {
+        warn!(%job_id, exit_code, "process_mgr: process completed without an owning execution step");
     }
 }
 
@@ -3994,7 +3920,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
@@ -4067,7 +3993,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
@@ -4116,7 +4042,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
@@ -4163,7 +4089,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
@@ -4225,7 +4151,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
@@ -4275,7 +4201,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,
@@ -4382,7 +4308,6 @@ mod tests {
             reader_handle: tokio::spawn(async {}),
             kill_tx,
             ring_buffer: ring_buffer.clone(),
-            stderr_ring: None,
             input: None,
             resize: Some(Arc::new(std::fs::File::open("/dev/null").unwrap())),
             foreground: foreground.clone(),
@@ -4477,15 +4402,6 @@ mod tests {
             .expect("first legacy controller attach");
         assert_eq!(first_controller.attachment_id, 1);
         assert_eq!(first_controller.control_recipients, Some(Vec::new()));
-    }
-
-    #[test]
-    fn pty_input_requires_controller_but_pipe_input_remains_compatible() {
-        assert!(job_input_kind_allows_client(false, None, 42));
-        assert!(job_input_kind_allows_client(false, Some(7), 42));
-        assert!(!job_input_kind_allows_client(true, None, 42));
-        assert!(!job_input_kind_allows_client(true, Some(7), 42));
-        assert!(job_input_kind_allows_client(true, Some(42), 42));
     }
 
     #[test]
@@ -4591,14 +4507,15 @@ mod tests {
     #[tokio::test]
     async fn spawn_job_rejects_scope_without_snapshot() {
         let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (session_tx, _session_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (execution_tx, mut execution_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (process_tx, process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (scope_tx, mut scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
-            execution: mpsc::channel(1).0,
+            sessions: session_tx,
+            execution: execution_tx,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
@@ -4623,6 +4540,10 @@ mod tests {
         });
 
         let job_id = JobId(77);
+        let step_id = StepId {
+            execution: cue_core::ExecutionId(77),
+            index: 1,
+        };
         process_tx
             .send(ProcessMgrMsg::SpawnJob {
                 job_id,
@@ -4642,25 +4563,25 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
-                    execution_step: None,
+                    execution_step: Some(step_id),
                 }),
             })
             .await
             .expect("send spawn job");
 
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), scheduler_rx.recv())
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), execution_rx.recv())
             .await
             .expect("job failure should be reported")
-            .expect("scheduler channel should stay open");
+            .expect("execution channel should stay open");
         match msg {
-            SchedulerMsg::JobFinished {
-                job_id: finished,
+            super::super::ExecutionCoordinatorMsg::StepFinished {
+                step_id: finished,
                 exit_code,
             } => {
-                assert_eq!(finished, job_id);
+                assert_eq!(finished, step_id);
                 assert_eq!(exit_code, EXIT_CODE_UNAVAILABLE);
             }
-            _ => panic!("expected JobFinished"),
+            _ => panic!("expected StepFinished"),
         }
     }
 
@@ -4668,14 +4589,15 @@ mod tests {
     async fn kill_single_pipe_job_stops_child_and_reports_finished() {
         let cwd = make_temp_dir();
         let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (session_tx, _session_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (execution_tx, mut execution_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (process_tx, process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (scope_tx, mut scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
-            execution: mpsc::channel(1).0,
+            sessions: session_tx,
+            execution: execution_tx,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
@@ -4712,6 +4634,10 @@ mod tests {
         });
 
         let job_id = JobId(78);
+        let step_id = StepId {
+            execution: cue_core::ExecutionId(78),
+            index: 1,
+        };
         process_tx
             .send(ProcessMgrMsg::SpawnJob {
                 job_id,
@@ -4731,7 +4657,7 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
-                    execution_step: None,
+                    execution_step: Some(step_id),
                 }),
             })
             .await
@@ -4751,19 +4677,19 @@ mod tests {
             .expect("kill reply sender");
         assert_eq!(kill_result, Ok(()));
 
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), scheduler_rx.recv())
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), execution_rx.recv())
             .await
             .expect("job finished after kill")
-            .expect("scheduler channel should stay open");
+            .expect("execution channel should stay open");
         match msg {
-            SchedulerMsg::JobFinished {
-                job_id: finished,
+            super::super::ExecutionCoordinatorMsg::StepFinished {
+                step_id: finished,
                 exit_code,
             } => {
-                assert_eq!(finished, job_id);
+                assert_eq!(finished, step_id);
                 assert_eq!(exit_code, EXIT_CODE_UNAVAILABLE);
             }
-            _ => panic!("expected JobFinished"),
+            _ => panic!("expected StepFinished"),
         }
 
         process_tx
@@ -4905,14 +4831,15 @@ mod tests {
             .expect("write tail descendant fixture");
         }
         let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
-        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (session_tx, _session_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (execution_tx, mut execution_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (process_tx, process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (scope_tx, mut scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
-            execution: mpsc::channel(1).0,
+            sessions: session_tx,
+            execution: execution_tx,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx.clone(),
             scope_store: scope_tx,
@@ -4975,7 +4902,10 @@ mod tests {
                     direct_output_client: None,
                     session_id: None,
                     spawn_adapter: None,
-                    execution_step: None,
+                    execution_step: Some(StepId {
+                        execution: cue_core::ExecutionId(u64::from(job_id.0)),
+                        index: 1,
+                    }),
                 }),
             })
             .await
@@ -5029,16 +4959,16 @@ mod tests {
                 .expect("kill reply sender")
                 .expect("kill job");
         }
-        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), scheduler_rx.recv())
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), execution_rx.recv())
             .await
             .expect("job finished after process-group cleanup")
-            .expect("scheduler channel should stay open");
+            .expect("execution channel should stay open");
         assert!(matches!(
             finished,
-            SchedulerMsg::JobFinished {
-                job_id: finished_job,
+            super::super::ExecutionCoordinatorMsg::StepFinished {
+                step_id: StepId { execution, .. },
                 ..
-            } if finished_job == job_id
+            } if execution == cue_core::ExecutionId(u64::from(job_id.0))
         ));
 
         assert_processes_gone(&groups).await;
@@ -5049,7 +4979,12 @@ mod tests {
                     payload: EventPayload::OutputChunk { id, data, .. },
                     ..
                 } = message
-                    && id == job_id.to_string()
+                    && id
+                        == (StepId {
+                            execution: cue_core::ExecutionId(u64::from(job_id.0)),
+                            index: 1,
+                        })
+                        .to_string()
                 {
                     output.push_str(&data);
                 }
@@ -5143,7 +5078,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
         let sys = ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,

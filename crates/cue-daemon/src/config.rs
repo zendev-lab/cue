@@ -10,7 +10,6 @@ use crate::dirs;
 
 const DAEMON_CONFIG_FILE: &str = "daemon.toml";
 const DAEMON_ROOT_SECTIONS: &[&str] = &[
-    "aliases",
     "block",
     "resources",
     "retention",
@@ -25,8 +24,6 @@ pub struct Config {
     #[serde(default)]
     pub warn: WarnConfig,
     #[serde(default)]
-    pub aliases: AliasConfig,
-    #[serde(default)]
     pub resources: ResourceConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -34,86 +31,6 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub wrapper: WrapperConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct AliasEntry {
-    pub from: String,
-    pub to: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AliasConfig {
-    pub entries: Vec<AliasEntry>,
-}
-
-impl<'de> Deserialize<'de> for AliasConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        let map = BTreeMap::<String, String>::deserialize(deserializer)?;
-        let mut entries: Vec<AliasEntry> = map
-            .into_iter()
-            .map(|(from, to)| AliasEntry { from, to })
-            .collect();
-        entries.sort_by(|a, b| {
-            b.from
-                .split_whitespace()
-                .count()
-                .cmp(&a.from.split_whitespace().count())
-        });
-        Ok(AliasConfig { entries })
-    }
-}
-
-impl AliasConfig {
-    pub fn apply(&self, input: &str) -> String {
-        if self.entries.is_empty() || input.starts_with(':') {
-            return input.to_string();
-        }
-        let input_tokens = token_spans(input);
-        for entry in &self.entries {
-            let from_tokens: Vec<&str> = entry.from.split_whitespace().collect();
-            let n = from_tokens.len();
-            if input_tokens.len() < n {
-                continue;
-            }
-            let matches = input_tokens[..n]
-                .iter()
-                .map(|(start, end)| &input[*start..*end])
-                .eq(from_tokens.iter().copied());
-            if matches {
-                let suffix_start = input_tokens[n - 1].1;
-                let suffix = &input[suffix_start..];
-                return if suffix.is_empty() {
-                    entry.to.clone()
-                } else {
-                    format!("{}{}", entry.to, suffix)
-                };
-            }
-        }
-        input.to_string()
-    }
-}
-
-fn token_spans(input: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut iter = input.char_indices().peekable();
-    while let Some((start, ch)) = iter.next() {
-        if ch.is_whitespace() {
-            continue;
-        }
-        let mut end = start + ch.len_utf8();
-        while let Some(&(idx, next)) = iter.peek() {
-            if next.is_whitespace() {
-                break;
-            }
-            end = idx + next.len_utf8();
-            iter.next();
-        }
-        spans.push((start, end));
-    }
-    spans
 }
 
 const DEFAULT_GIT_NO_VERIFY_HINT: &str = "Run the commit normally; if hooks fail, inspect and fix the hook/check or ask before any alternative.";
@@ -613,6 +530,36 @@ impl Config {
             .check(command_line)
             .or_else(|| self.warn.check(command_line))
     }
+
+    /// Render the daemon-owned runtime settings exposed by typed IPC.
+    pub(crate) fn display_text(&self) -> String {
+        [
+            format!(
+                "retention.max_job_history = {}",
+                self.retention.max_job_history
+            ),
+            format!(
+                "retention.max_script_runs = {}",
+                self.retention.max_script_runs
+            ),
+            format!(
+                "resources.nvidia.enabled = {}",
+                self.resources.nvidia.enabled
+            ),
+            format!("wrapper.enabled = {}", self.wrapper.enabled),
+            format!("wrapper.binary = {:?}", self.wrapper.binary),
+            format!(
+                "wrapper.allowlist.commands = [{}]",
+                self.wrapper.allowlist.commands.join(", ")
+            ),
+            format!(
+                "sandbox.default_upper_root = {}",
+                self.sandbox.default_upper_root.display()
+            ),
+            format!("sandbox.min_free_ratio = {}", self.sandbox.min_free_ratio),
+        ]
+        .join("\n")
+    }
 }
 
 fn validate_root_config_shape(text: &str, path: &Path) -> Result<()> {
@@ -971,86 +918,6 @@ socket_path = "/tmp/typo.sock"
     }
 
     #[test]
-    fn alias_no_match_passthrough() {
-        let cfg = AliasConfig::default();
-        assert_eq!(cfg.apply("pip install foo"), "pip install foo");
-    }
-
-    #[test]
-    fn alias_single_word() {
-        let cfg: AliasConfig = toml::from_str(r#"pip = "uv pip""#).unwrap();
-        assert_eq!(cfg.apply("pip install foo"), "uv pip install foo");
-        assert_eq!(cfg.apply("pip"), "uv pip");
-    }
-
-    #[test]
-    fn alias_multi_word() {
-        let cfg: AliasConfig = toml::from_str(r#""git clone" = "ein clone""#).unwrap();
-        assert_eq!(
-            cfg.apply("git clone https://github.com/foo/bar"),
-            "ein clone https://github.com/foo/bar"
-        );
-    }
-
-    #[test]
-    fn alias_longer_match_takes_priority() {
-        let cfg: AliasConfig = toml::from_str(
-            r#"
-git = "alt-git"
-"git clone" = "ein clone"
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.apply("git clone https://github.com/foo/bar"),
-            "ein clone https://github.com/foo/bar"
-        );
-        assert_eq!(cfg.apply("git status"), "alt-git status");
-    }
-
-    #[test]
-    fn alias_no_match_in_middle() {
-        let cfg: AliasConfig = toml::from_str(r#"pip = "uv pip""#).unwrap();
-        assert_eq!(cfg.apply("run pip install foo"), "run pip install foo");
-    }
-
-    #[test]
-    fn alias_empty_input() {
-        let cfg: AliasConfig = toml::from_str(r#"pip = "uv pip""#).unwrap();
-        assert_eq!(cfg.apply(""), "");
-    }
-
-    #[test]
-    fn alias_preserves_multiline_suffix() {
-        let cfg: AliasConfig = toml::from_str(r#"pip = "uv pip""#).unwrap();
-        assert_eq!(
-            cfg.apply("pip install foo\ncargo test"),
-            "uv pip install foo\ncargo test"
-        );
-    }
-
-    #[test]
-    fn alias_parsed_from_daemon_toml() {
-        let config = Config::load_from_source(Some((
-            Path::new("daemon.toml"),
-            r#"
-[aliases]
-"git clone" = "ein clone"
-pip = "uv pip"
-"#,
-        )))
-        .expect("load config");
-        assert_eq!(
-            config.aliases.apply("git clone https://example.com"),
-            "ein clone https://example.com"
-        );
-        assert_eq!(
-            config.aliases.apply("pip install foo"),
-            "uv pip install foo"
-        );
-    }
-
-    #[test]
     fn resources_nvidia_provider_is_enabled_by_default() {
         let default_config = Config::default();
         assert!(default_config.resources.nvidia.enabled);
@@ -1295,14 +1162,8 @@ commands = ["git", "cargo"]
 
     #[test]
     fn wrapper_absent_config_is_default() {
-        let config = Config::load_from_source(Some((
-            Path::new("daemon.toml"),
-            r#"
-[aliases]
-pip = "uv pip"
-"#,
-        )))
-        .expect("load config");
+        let config =
+            Config::load_from_source(Some((Path::new("daemon.toml"), ""))).expect("load config");
         assert!(!config.wrapper.enabled);
     }
 

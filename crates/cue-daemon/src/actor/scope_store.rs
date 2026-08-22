@@ -1,10 +1,12 @@
 //! ScopeStore actor — immutable environment scope management.
 //!
 //! Maintains an in-memory cache backed by SQLite. Session cursors live in the
-//! scheduler; this actor stores scopes only and has no daemon-global HEAD.
+//! session coordinator; this actor stores scopes only and has no daemon-global HEAD.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::Connection;
 use tokio::sync::mpsc;
@@ -13,7 +15,9 @@ use tracing::{debug, error, info, warn};
 use cue_core::ScopeHash;
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 
-use super::{ScopeGcReport, ScopeStoreMsg};
+#[cfg(test)]
+use super::ScopeGcReport;
+use super::ScopeStoreMsg;
 use crate::storage;
 
 /// Spawn the ScopeStore actor task.
@@ -120,24 +124,6 @@ pub(super) async fn spawn(
                     let _ = reply.send(Ok(child_hash));
                 }
 
-                ScopeStoreMsg::GarbageCollect { roots, reply } => {
-                    let result = garbage_collect_scopes(&mut cache, &db, roots).await;
-                    match &result {
-                        Ok(report) => {
-                            debug!(
-                                retained = report.retained,
-                                removed_cached = report.removed_cached,
-                                removed_persisted = report.removed_persisted,
-                                "scope_store: completed mark-and-sweep"
-                            );
-                        }
-                        Err(error) => {
-                            error!("scope_store: garbage collection failed: {error}");
-                        }
-                    }
-                    let _ = reply.send(result);
-                }
-
                 ScopeStoreMsg::Shutdown => {
                     debug!("scope_store: shutting down");
                     break;
@@ -201,6 +187,7 @@ fn resolve_delta_cwd(parent: &EnvSnapshot, delta: &mut EnvDelta) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn garbage_collect_scopes(
     cache: &mut HashMap<ScopeHash, Scope>,
     db: &storage::SharedConnection,
@@ -297,7 +284,8 @@ async fn create_and_persist_root_scope(
 mod tests {
     use super::*;
     use crate::actor::{
-        ACTOR_CHANNEL_CAP, ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg,
+        ACTOR_CHANNEL_CAP, ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg,
+        SessionCoordinatorMsg,
     };
     use cue_core::scope::EnvSnapshot;
     use std::path::{Path, PathBuf};
@@ -344,12 +332,13 @@ mod tests {
 
     fn test_actor_system(scope_tx: mpsc::Sender<ScopeStoreMsg>) -> ActorSystem {
         let (gateway_tx, _gateway_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
-        let (scheduler_tx, _scheduler_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) =
+            mpsc::channel::<SessionCoordinatorMsg>(ACTOR_CHANNEL_CAP);
         let (process_tx, _process_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
         let (event_tx, _event_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
         ActorSystem {
             gateway: gateway_tx,
-            scheduler: scheduler_tx,
+            sessions: scheduler_tx,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr: process_tx,

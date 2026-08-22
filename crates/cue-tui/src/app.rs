@@ -1385,21 +1385,24 @@ impl AppState {
     }
 
     fn send_fg_detach(&self) {
-        self.send_foreground_request(RequestPayload::FgDetach {}, "foreground detach");
+        self.send_foreground_request(RequestPayload::StepDetach {}, "foreground detach");
     }
 
     fn send_fg_input(&self, data: Vec<u8>) {
         if !self.fg_is_controller() {
             return;
         }
-        self.send_foreground_request(RequestPayload::FgInput { data }, "foreground input");
+        self.send_foreground_request(RequestPayload::StepInput { data }, "foreground input");
     }
 
     fn send_fg_resize(&self, cols: u16, rows: u16) {
         if !self.fg_is_controller() {
             return;
         }
-        self.send_foreground_request(RequestPayload::FgResize { cols, rows }, "foreground resize");
+        self.send_foreground_request(
+            RequestPayload::StepResize { cols, rows },
+            "foreground resize",
+        );
     }
 
     fn toggle_fg_control(&mut self) {
@@ -1425,8 +1428,8 @@ impl AppState {
             }
         };
         let payload = match kind {
-            FgRoleRequestKind::Claim => RequestPayload::FgClaimControl {},
-            FgRoleRequestKind::Release => RequestPayload::FgReleaseControl {},
+            FgRoleRequestKind::Claim => RequestPayload::StepClaimControl {},
+            FgRoleRequestKind::Release => RequestPayload::StepReleaseControl {},
         };
         let Some(writer) = &self.writer else {
             if let Some(session) = self.fg_session.as_mut() {
@@ -3148,10 +3151,7 @@ mod tests {
     }
 
     fn attach_shared_foreground_test_writer(state: &mut AppState) -> tokio::io::DuplexStream {
-        attach_test_writer_with_capabilities(
-            state,
-            [cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS],
-        )
+        attach_test_writer_with_capabilities(state, [cue_core::ipc::IPC_CAPABILITY_EXECUTION_V3])
     }
 
     fn attach_test_writer_with_capabilities<'a>(
@@ -4996,7 +4996,7 @@ destination = "devbox"
         assert!(
             state
                 .fg_footer_text()
-                .contains(cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+                .contains(cue_core::ipc::IPC_CAPABILITY_EXECUTION_V3)
         );
         assert!(state.fg_footer_text().contains("upgrade/restart cued"));
         assert!(state.pending_fg_role_requests.is_empty());
@@ -5041,7 +5041,7 @@ destination = "devbox"
         let claim_id = match read_test_message(&mut server_stream).await {
             Message::Request {
                 id,
-                payload: RequestPayload::FgClaimControl {},
+                payload: RequestPayload::StepClaimControl {},
                 ..
             } => id,
             other => panic!("observer forwarded a request before claim: {other:?}"),
@@ -5061,7 +5061,7 @@ destination = "devbox"
         assert!(state.fg_title().contains("CONTROL"));
         match read_test_message(&mut server_stream).await {
             Message::Request {
-                payload: RequestPayload::FgResize { cols, rows },
+                payload: RequestPayload::StepResize { cols, rows },
                 ..
             } => {
                 assert_eq!(cols, 98);
@@ -5073,7 +5073,7 @@ destination = "devbox"
         state.update(AppMsg::Paste("owned".into()));
         match read_test_message(&mut server_stream).await {
             Message::Request {
-                payload: RequestPayload::FgInput { data },
+                payload: RequestPayload::StepInput { data },
                 ..
             } => assert_eq!(data, b"owned"),
             other => panic!("controller paste was not forwarded: {other:?}"),
@@ -5102,7 +5102,7 @@ destination = "devbox"
         let request_id = match read_test_message(&mut server_stream).await {
             Message::Request {
                 id,
-                payload: RequestPayload::FgClaimControl {},
+                payload: RequestPayload::StepClaimControl {},
                 ..
             } => id,
             other => panic!("unexpected request: {other:?}"),
@@ -5148,7 +5148,7 @@ destination = "devbox"
         let request_id = match read_test_message(&mut server_stream).await {
             Message::Request {
                 id,
-                payload: RequestPayload::FgReleaseControl {},
+                payload: RequestPayload::StepReleaseControl {},
                 ..
             } => id,
             other => panic!("unexpected request: {other:?}"),

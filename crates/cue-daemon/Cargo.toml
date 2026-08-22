@@ -23,7 +23,6 @@ blake3.workspace = true
 bpaf.workspace = true
 chrono.workspace = true
 cue-core = { path = "../cue-core" }
-cue-language = { path = "../cue-language" }
 libc.workspace = true
 nvml-wrapper = { version = "0.12", optional = true }
 rusqlite.workspace = true

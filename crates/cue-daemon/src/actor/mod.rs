@@ -1,13 +1,13 @@
 //! Actor system for cued.
 //!
-//! Five actors communicate via bounded `mpsc` channels:
+//! Runtime owners communicate via bounded `mpsc` channels:
 //!
 //! ```text
-//! Gateway  ──→  Scheduler  ──→  ProcessMgr
+//! Gateway ──→ SessionCoordinator ──→ ScopeStore
 //!    │              │
-//!    │         ScopeStore
-//!    │
-//!    └────────  EventBus  ←── (all actors publish)
+//!    ├──────→ ExecutionCoordinator ──→ ProcessMgr
+//!    ├──────→ TriggerService ──────────────┘
+//!    └────────────── EventBus ←── (all actors publish)
 //! ```
 
 mod cron_schedule;
@@ -16,13 +16,11 @@ mod execution_coordinator;
 pub(crate) mod gateway;
 mod operation_ledger;
 mod process_mgr;
-mod scheduler;
 mod scope_store;
-mod script_record;
+mod session_coordinator;
 mod trigger_service;
 
 use anyhow::Result;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -72,7 +70,6 @@ use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{EventChannel, ScopeHash};
 
 use crate::resource::ProviderRegistry;
-use cue_language::ResolvedCommand;
 
 /// Default bounded channel capacity for actor mailboxes.
 pub(crate) const ACTOR_CHANNEL_CAP: usize = 256;
@@ -175,17 +172,11 @@ pub(crate) enum GatewayMsg {
     Shutdown,
 }
 
-/// Messages handled by the Scheduler actor.
-pub(crate) enum SchedulerMsg {
-    /// Arm execution activation while leaving jobs and crons paused. The
-    /// scheduler observes the lifecycle's durable-completion signal before it
-    /// opens execution and publishes readiness.
+/// Messages handled by the sole session and scope-cursor owner.
+pub(crate) enum SessionCoordinatorMsg {
+    /// Arm the startup barrier for an exact restart successor.
     Activate {
         reply: tokio::sync::oneshot::Sender<Result<()>>,
-    },
-    /// Close scheduler admission and acknowledge after the gate is visible.
-    BeginDrain {
-        reply: tokio::sync::oneshot::Sender<()>,
     },
     /// Bind a transport client id to a stable logical session.
     Connect {
@@ -213,23 +204,6 @@ pub(crate) enum SchedulerMsg {
         base: Option<ScopeHash>,
         delta: EnvDelta,
         reply: tokio::sync::oneshot::Sender<ResponsePayload>,
-    },
-    /// Evaluate a resolved command on behalf of a client.
-    Eval {
-        client_id: u64,
-        request_id: u32,
-        command: Box<ResolvedCommand>,
-    },
-    /// Recover a daemon-lifetime script snapshot after a client reconnect.
-    ScriptInfo {
-        client_id: u64,
-        request_id: u32,
-        id: String,
-    },
-    /// A job has finished execution.
-    JobFinished {
-        job_id: cue_core::JobId,
-        exit_code: i32,
     },
     /// Graceful shutdown.
     Shutdown,
@@ -291,6 +265,13 @@ pub(crate) enum ExecutionCoordinatorMsg {
         step_id: cue_core::StepId,
         exit_code: i32,
     },
+    SessionArchiveBlocker {
+        session_id: String,
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
+    BeginDrain {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     Shutdown,
 }
 
@@ -329,6 +310,10 @@ pub(crate) enum TriggerServiceMsg {
     BeginDrain {
         reply: tokio::sync::oneshot::Sender<()>,
     },
+    SessionArchiveBlocker {
+        session_id: String,
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
     Shutdown,
 }
 
@@ -346,26 +331,6 @@ pub(crate) enum ProcessMgrMsg {
     /// Request cancellation of a running job.
     KillJob {
         job_id: cue_core::JobId,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-    /// Read the tail of a running job's output ring buffer.
-    GetOutput {
-        job_id: cue_core::JobId,
-        tail_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<Option<OutputSnapshot>>,
-    },
-    /// Read the stderr tail of a running job.
-    /// Returns `None` when the job is not in the live map (completed or unknown).
-    GetStderr {
-        job_id: cue_core::JobId,
-        tail_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<Option<StderrSnapshot>>,
-    },
-    /// Send raw input bytes to a specific running job.
-    SendJobInput {
-        client_id: u64,
-        job_id: cue_core::JobId,
-        data: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Attach a client to a job's live foreground stream.
@@ -420,24 +385,6 @@ pub(crate) struct ForegroundRoleUpdate {
     pub control_available: bool,
 }
 
-/// Snapshot of a job output stream, as returned by `ProcessMgrMsg::GetOutput`.
-pub(crate) struct OutputSnapshot {
-    /// Captured bytes (tail of the ring buffer, or empty).
-    pub data: Vec<u8>,
-    /// True when older bytes were omitted by ring-buffer overflow or tail limit.
-    pub truncated: bool,
-}
-
-/// Snapshot of a job's stderr, as returned by `ProcessMgrMsg::GetStderr`.
-pub(crate) struct StderrSnapshot {
-    /// True when the job used a PTY (stdout and stderr are merged).
-    pub pty_merged: bool,
-    /// Captured bytes (tail of the ring buffer, or empty).
-    pub data: Vec<u8>,
-    /// True when older bytes were omitted by ring-buffer overflow or tail limit.
-    pub truncated: bool,
-}
-
 /// Messages handled by the ScopeStore actor.
 pub(crate) enum ScopeStoreMsg {
     /// Insert a full scope snapshot if it is not already present.
@@ -456,12 +403,6 @@ pub(crate) enum ScopeStoreMsg {
         delta: EnvDelta,
         reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
-    /// Retain the supplied roots and every ancestor they reference, removing
-    /// all other persisted and process-local scopes.
-    GarbageCollect {
-        roots: HashSet<ScopeHash>,
-        reply: tokio::sync::oneshot::Sender<Result<ScopeGcReport>>,
-    },
     /// Graceful shutdown.
     Shutdown,
     /// List all known scopes.
@@ -470,7 +411,8 @@ pub(crate) enum ScopeStoreMsg {
     },
 }
 
-/// Result of one scope mark-and-sweep pass.
+/// Result of one scope mark-and-sweep pass used by storage compatibility tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScopeGcReport {
     pub retained: usize,
@@ -635,7 +577,7 @@ pub(crate) async fn send_gateway_event(
 #[derive(Clone)]
 pub(crate) struct ActorSystem {
     gateway: mpsc::Sender<GatewayMsg>,
-    scheduler: mpsc::Sender<SchedulerMsg>,
+    sessions: mpsc::Sender<SessionCoordinatorMsg>,
     execution: mpsc::Sender<ExecutionCoordinatorMsg>,
     triggers: mpsc::Sender<TriggerServiceMsg>,
     process_mgr: mpsc::Sender<ProcessMgrMsg>,
@@ -650,16 +592,16 @@ pub(crate) struct ActorSystem {
 }
 
 impl ActorSystem {
-    /// Prove the scheduler can activate, but keep execution paused until the
+    /// Prove the runtime can activate, but keep execution paused until the
     /// lifecycle publishes durable restart completion.
     pub(crate) async fn activate_restart_successor(&self) -> Result<()> {
         let (reply, activated) = tokio::sync::oneshot::channel();
-        self.scheduler
-            .send(SchedulerMsg::Activate { reply })
+        self.sessions
+            .send(SessionCoordinatorMsg::Activate { reply })
             .await
-            .map_err(|_| anyhow::anyhow!("scheduler stopped before successor activation"))?;
+            .map_err(|_| anyhow::anyhow!("session coordinator stopped before activation"))?;
         activated.await.map_err(|_| {
-            anyhow::anyhow!("scheduler dropped successor activation acknowledgement")
+            anyhow::anyhow!("session coordinator dropped activation acknowledgement")
         })?
     }
 
@@ -680,7 +622,12 @@ impl ActorSystem {
         )
         .await;
         send_shutdown("gateway", &self.gateway, GatewayMsg::Shutdown).await;
-        send_shutdown("scheduler", &self.scheduler, SchedulerMsg::Shutdown).await;
+        send_shutdown(
+            "session_coordinator",
+            &self.sessions,
+            SessionCoordinatorMsg::Shutdown,
+        )
+        .await;
         send_shutdown(
             "execution_coordinator",
             &self.execution,
@@ -709,13 +656,13 @@ async fn send_shutdown<T>(actor: &'static str, sender: &mpsc::Sender<T>, message
 pub(crate) async fn spawn_all(
     socket_path: std::path::PathBuf,
     scope_db: rusqlite::Connection,
-    scheduler_db: rusqlite::Connection,
+    runtime_db: rusqlite::Connection,
     config: crate::config::Config,
     lifecycle: std::sync::Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> Result<ActorSystem> {
     // Create channels.
     let (gw_tx, gw_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
-    let (sched_tx, sched_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+    let (session_tx, session_rx) = mpsc::channel::<SessionCoordinatorMsg>(ACTOR_CHANNEL_CAP);
     let (execution_tx, execution_rx) = mpsc::channel::<ExecutionCoordinatorMsg>(ACTOR_CHANNEL_CAP);
     let (trigger_tx, trigger_rx) = mpsc::channel::<TriggerServiceMsg>(ACTOR_CHANNEL_CAP);
     let (pm_tx, pm_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
@@ -723,11 +670,11 @@ pub(crate) async fn spawn_all(
     let (eb_tx, eb_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
 
     let resources = Arc::new(crate::resource::registry_from_config(&config.resources)?);
-    let runtime_db = crate::storage::shared_connection(scheduler_db);
+    let runtime_db = crate::storage::shared_connection(runtime_db);
 
     let sys = ActorSystem {
         gateway: gw_tx,
-        scheduler: sched_tx,
+        sessions: session_tx,
         execution: execution_tx,
         triggers: trigger_tx,
         process_mgr: pm_tx,
@@ -749,12 +696,13 @@ pub(crate) async fn spawn_all(
         lifecycle.clone(),
     )
     .await?;
-    if let Err(error) = scheduler::spawn(sched_rx, runtime_db, sys.clone(), lifecycle.clone()).await
+    if let Err(error) =
+        session_coordinator::spawn(session_rx, runtime_db, sys.clone(), lifecycle.clone()).await
     {
         send_shutdown("scope_store", &sys.scope_store, ScopeStoreMsg::Shutdown).await;
         send_shutdown("process_mgr", &sys.process_mgr, ProcessMgrMsg::Shutdown).await;
         send_shutdown("event_bus", &sys.event_bus, EventBusMsg::Shutdown).await;
-        return Err(anyhow::anyhow!("initialize scheduler: {error}"));
+        return Err(anyhow::anyhow!("initialize session coordinator: {error}"));
     }
     if let Err(error) = gateway::spawn(gw_rx, socket_path, sys.clone(), lifecycle).await {
         sys.shutdown().await;
@@ -778,13 +726,13 @@ mod tests {
     #[tokio::test]
     async fn shutdown_publishes_system_notice_before_stopping_event_bus() {
         let (gateway, mut gateway_rx) = mpsc::channel(1);
-        let (scheduler, _scheduler_rx) = mpsc::channel(1);
+        let (sessions, _session_rx) = mpsc::channel(1);
         let (process_mgr, _process_mgr_rx) = mpsc::channel(1);
         let (scope_store, _scope_store_rx) = mpsc::channel(1);
         let (event_bus, mut event_bus_rx) = mpsc::channel(2);
         let sys = ActorSystem {
             gateway,
-            scheduler,
+            sessions,
             execution: mpsc::channel(1).0,
             triggers: mpsc::channel(1).0,
             process_mgr,
@@ -844,12 +792,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_all_reports_scheduler_initialization_failure() {
+    async fn spawn_all_reports_session_initialization_failure() {
         let scope_db = in_memory_db();
         let scheduler_db = in_memory_db();
         scheduler_db
-            .execute_batch("DROP TABLE crons;")
-            .expect("drop crons table");
+            .execute_batch("DROP TABLE sessions;")
+            .expect("drop sessions table");
 
         let result = spawn_all(
             PathBuf::from("/tmp/cue-spawn-all-scheduler-init-fails.sock"),
@@ -863,20 +811,19 @@ mod tests {
         )
         .await;
         let Err(error) = result else {
-            panic!("scheduler initialization failure should stop daemon startup");
+            panic!("session initialization failure should stop daemon startup");
         };
 
         let message = error.to_string();
-        assert!(message.contains("initialize scheduler"));
-        assert!(message.contains("load persisted crons"));
+        assert!(message.contains("initialize session coordinator"));
+        assert!(message.contains("load persisted named sessions"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn starting_scheduler_rejects_direct_execution_message() {
+    async fn startup_activation_outranks_busy_session_queue() {
         let dir = PathBuf::from(format!("/tmp/csg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create scheduler gate test dir");
         let socket = dir.join("cued.sock");
-        let marker = dir.join("scheduler-bypass-ran");
         let startup = crate::lifecycle::RestartRecord {
             restart_id: "scheduler-gate".into(),
             daemon_instance_id: "predecessor".into(),
@@ -900,56 +847,15 @@ mod tests {
         .await
         .expect("spawn starting actor system");
 
-        let (reply, connected) = tokio::sync::oneshot::channel();
-        sys.scheduler
-            .send(SchedulerMsg::Connect {
-                client_id: 4242,
-                session_id: "scheduler-gate".into(),
-                snapshot: cue_core::scope::EnvSnapshot {
-                    env: std::collections::BTreeMap::from([(
-                        "PATH".into(),
-                        "/usr/bin:/bin".into(),
-                    )]),
-                    cwd: dir.clone(),
-                },
-                refresh: false,
-                reply,
-            })
-            .await
-            .expect("send direct scheduler connect");
-        connected
-            .await
-            .expect("receive scheduler connect response")
-            .expect("connect direct scheduler client");
-        let command = cue_language::parse_command(
-            &format!("/usr/bin/touch {}", marker.display()),
-            cue_core::mode::Mode::Job,
-        )
-        .expect("parse scheduler bypass command");
-        sys.scheduler
-            .send(SchedulerMsg::Eval {
-                client_id: 4242,
-                request_id: 1,
-                command: Box::new(command),
-            })
-            .await
-            .expect("send direct scheduler Eval");
-
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(
-            !marker.exists(),
-            "scheduler startup gate must reject execution even when gateway is bypassed"
-        );
-
         sys.activate_restart_successor()
             .await
             .expect("arm successor activation");
-        let flood_tx = sys.scheduler.clone();
+        let flood_tx = sys.sessions.clone();
         let flood = tokio::spawn(async move {
             let mut client_id = 10_000;
             loop {
                 if flood_tx
-                    .send(SchedulerMsg::Disconnect { client_id })
+                    .send(SessionCoordinatorMsg::Disconnect { client_id })
                     .await
                     .is_err()
                 {
