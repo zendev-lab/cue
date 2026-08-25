@@ -198,8 +198,9 @@ jobs:
     name: github-release
     runs-on: ubuntu-latest
     needs:
-      - publish
-      - publish-npm
+      - build-npm
+      - build-wheel
+      - build-sdist
     permissions:
       # The release job creates a GitHub Release and uploads its artifacts.
       contents: write
