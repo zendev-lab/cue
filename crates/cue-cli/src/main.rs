@@ -64,12 +64,6 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
             program: "cue-client".into(),
             args: args.collect(),
         }),
-        Some("session") => Ok(CueCommand::Forward {
-            program: "cue-client".into(),
-            args: std::iter::once(OsString::from("session"))
-                .chain(args)
-                .collect(),
-        }),
         Some("fg") => Ok(CueCommand::Forward {
             program: "cue-client".into(),
             args: std::iter::once(OsString::from("fg")).chain(args).collect(),
@@ -85,15 +79,8 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
         Some("run") => {
             let run_args = args.collect::<Vec<_>>();
             let mut path = None;
-            let mut session_refresh_seen = false;
             for arg in &run_args {
                 match arg.to_str() {
-                    Some("--session-refresh") if !session_refresh_seen => {
-                        session_refresh_seen = true;
-                    }
-                    Some("--session-refresh") => {
-                        bail!("`--session-refresh` may only be specified once");
-                    }
                     Some(value) if value.starts_with('-') => {
                         bail!("unknown `cue run` option `{value}`");
                     }
@@ -119,7 +106,7 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
         }
         Some("target") => {
             bail!(
-                "`cue target` is not supported; use `cue client target ...` or `cue-client target ...`"
+                "`cue target` is not part of the execution kernel; select the local endpoint with CUE_SOCKET or an external transport wrapper"
             )
         }
         Some(other) => Ok(CueCommand::Extension {
@@ -213,13 +200,13 @@ fn print_help() {
 
 fn help_text() -> String {
     format!(
-        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue> [--session-refresh]\n  cue fg watch <Eid/Sid> [--session <name-or-id>] [--session-refresh] [--jsonl]\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      Client-side commands: target profiles, run, IPC utilities\n  session     Named persistent session management\n  tui         Interactive terminal UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n  fg          Alias for `cue client fg`\n  session     Alias for `cue client session`\n\nExamples:\n  cue session create dev\n  cue session list\n  cue session archive old-dev\n  cue session list --archived\n  cue fg watch E1/S1 --session dev\n  cue client target resolve --json\n  cue run script.cue\n  cue tui --session dev\n  cue daemon status\n\nOptions:\n  --session-refresh  Explicitly recover a selected named session for `cue run` or `cue fg watch`\n  -h, --help          Print help\n  -V, --version       Print version information",
+        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue>\n  cue fg <Eid/Sid> [--observe]\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      IPC v4 execution, output, cancel, and PTY commands\n  tui         Interactive execution UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n  fg          Alias for `cue client fg`\n\nExamples:\n  cue run script.cue\n  cue client exec \"cargo test\"\n  cue client list\n  cue fg E1/S1\n  cue tui\n  cue daemon status\n\nSession, schedule, retry, resource, and approval policy are external owners.\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
         env!("CARGO_PKG_VERSION"),
     )
 }
 
 fn supported_subcommands() -> &'static str {
-    "client, session, fg, tui, daemon, run, help, version, <extension>"
+    "client, fg, tui, daemon, run, help, version, <extension>"
 }
 
 #[cfg(test)]
@@ -265,13 +252,12 @@ mod tests {
             parse_command([
                 OsString::from("cue"),
                 OsString::from("client"),
-                OsString::from("target"),
                 OsString::from("list"),
             ])
             .expect("parse command"),
             CueCommand::Forward {
                 program: "cue-client".into(),
-                args: vec![OsString::from("target"), OsString::from("list")],
+                args: vec![OsString::from("list")],
             }
         );
         assert_eq!(
@@ -310,27 +296,19 @@ mod tests {
             }
         );
 
-        assert_eq!(
+        assert!(
             parse_command([
                 OsString::from("cue"),
                 OsString::from("run"),
                 OsString::from("build.cue"),
                 OsString::from("--session-refresh"),
             ])
-            .expect("parse named-session recovery option"),
-            CueCommand::Forward {
-                program: "cue-client".into(),
-                args: vec![
-                    OsString::from("run"),
-                    OsString::from("build.cue"),
-                    OsString::from("--session-refresh"),
-                ],
-            }
+            .is_err()
         );
     }
 
     #[test]
-    fn parse_command_accepts_session_shortcut() {
+    fn session_is_not_a_builtin_namespace() {
         assert_eq!(
             parse_command([
                 OsString::from("cue"),
@@ -339,13 +317,9 @@ mod tests {
                 OsString::from("dev"),
             ])
             .expect("parse command"),
-            CueCommand::Forward {
-                program: "cue-client".into(),
-                args: vec![
-                    OsString::from("session"),
-                    OsString::from("attach"),
-                    OsString::from("dev"),
-                ],
+            CueCommand::Extension {
+                name: "session".into(),
+                args: vec![OsString::from("attach"), OsString::from("dev")],
             }
         );
     }
@@ -356,22 +330,16 @@ mod tests {
             parse_command([
                 OsString::from("cue"),
                 OsString::from("fg"),
-                OsString::from("watch"),
-                OsString::from("J3"),
-                OsString::from("--session"),
-                OsString::from("dev"),
-                OsString::from("--jsonl"),
+                OsString::from("E3/S1"),
+                OsString::from("--observe"),
             ])
             .expect("parse foreground shortcut"),
             CueCommand::Forward {
                 program: "cue-client".into(),
                 args: vec![
                     OsString::from("fg"),
-                    OsString::from("watch"),
-                    OsString::from("J3"),
-                    OsString::from("--session"),
-                    OsString::from("dev"),
-                    OsString::from("--jsonl"),
+                    OsString::from("E3/S1"),
+                    OsString::from("--observe"),
                 ],
             }
         );
@@ -410,7 +378,7 @@ mod tests {
         ])
         .expect_err("cue target should not be supported");
         assert!(format!("{error:#}").contains("`cue target` is not supported"));
-        assert!(format!("{error:#}").contains("cue client target"));
+        assert!(format!("{error:#}").contains("CUE_SOCKET"));
     }
 
     #[test]
@@ -435,12 +403,11 @@ mod tests {
         assert!(text.contains("cue <namespace> [args...]"));
         assert!(text.contains("cue <extension> [args...]"));
         assert!(text.contains("client"));
-        assert!(text.contains("session"));
         assert!(text.contains("tui"));
         assert!(text.contains("daemon"));
         assert!(text.contains("<extension>  Run a configured external command"));
         assert!(text.contains("Alias for `cue client run`"));
-        assert!(text.contains("Alias for `cue client session`"));
-        assert!(text.contains("cue client target resolve --json"));
+        assert!(text.contains("Session, schedule, retry, resource"));
+        assert!(text.contains("cue client list"));
     }
 }

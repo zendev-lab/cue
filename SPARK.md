@@ -131,6 +131,9 @@ process 的可观察性。
 
 ## 修订记录
 
+- 2026-08-31：CLI/TUI 完成 v4 hard cut；公开入口只使用 ExecutionId/StepId，CLI
+  提供 typed run/query/output/cancel/PTY passthrough，TUI 直接投影 ExecutionView/fact；
+  session/cron/resource/target 页面、J/CH/R 与旧 foreground epoch state machine 已删除。
 - 2026-08-31：完成 vNext client transport；frontend 显式 snapshot cwd/env/umask，按
   PutScope -> compile -> Submit 顺序提交，Hello/ClientId、RequestId/OperationId、strict
   v4 framing 与并发 response/event multiplexer 不再复用 v3 session cursor。
