@@ -25,6 +25,16 @@ fail_if_match \
     "${repo_root}/crates/cue-runtime/Cargo.toml"
 
 fail_if_match \
+    '^[[:space:]]*(cue-(client|daemon|language|runtime|store-sqlite)|rusqlite|tokio)[[:space:]]*=' \
+    'cue-protocol must depend only on Core data and transport serialization' \
+    "${repo_root}/crates/cue-protocol/Cargo.toml"
+
+fail_if_match \
+    '^[[:space:]]*(cue-(client|daemon|language|runtime)|tokio)[[:space:]]*=' \
+    'cue-store-sqlite must remain an independent Core/protocol store provider' \
+    "${repo_root}/crates/cue-store-sqlite/Cargo.toml"
+
+fail_if_match \
     'crate::(command|cron|ipc|launch|resource|scope|spawn_adapter|tui_debug)' \
     'cue_core::vnext must not depend on IPC v3 or policy modules' \
     "${repo_root}/crates/cue-core/src/vnext"

@@ -1,0 +1,16 @@
+[package]
+name = "cue-store-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SQLite execution and scope store provider for Cue vNext"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+cue-core = { path = "../cue-core" }
+cue-protocol = { path = "../cue-protocol" }
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
