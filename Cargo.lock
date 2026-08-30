@@ -357,13 +357,17 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "cue-core",
+ "cue-daemon",
  "cue-language",
+ "cue-protocol",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

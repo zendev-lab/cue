@@ -18,6 +18,8 @@ and code disagree.
   process-local assignments, per-Run PTY, and external-owner diagnostics.
 - [vNext daemon](vnext-daemon.md): runtime assembly, v4 serving, atomic
   commands, event replay, volatile secrets, and PTY attachment ownership.
+- [vNext client](vnext-client.md): explicit frontend Scope snapshots, operation
+  identities, typed dispatch, and concurrent response/event routing.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.

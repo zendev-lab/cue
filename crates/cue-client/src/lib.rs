@@ -15,6 +15,7 @@ mod transport_discovery;
 mod transport_schema;
 mod transport_settings;
 pub mod version_check;
+pub mod vnext;
 
 pub use client::{
     ClientReader, CuedClient, MultiplexedClient, WriterHandle, WriterSendError, default_socket_path,
@@ -41,3 +42,4 @@ pub use transport_settings::{
     load_transport_settings_snapshot_from_sources, parse_transport_snapshot,
     save_default_transport_profile,
 };
+pub use vnext::{SurfaceOutcome, VnextClient, VnextMultiplexedClient, process_scope};
