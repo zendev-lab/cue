@@ -162,6 +162,7 @@ The workspace is split by responsibility:
 - `cue-core`: IPC v3 and typed execution/scope/schedule state;
 - `cue-protocol`: strict vNext command/query, fact event, PTY, and framing contract;
 - `cue-store-sqlite`: fresh vNext Scope/Execution/fact/idempotency store provider;
+- `cue-runtime`: typed vNext Assembly, local captured/PTY runner, output and recovery contracts;
 - `cue-language`: tokenizer, parser, resolver, compiler, completion, highlighting;
 - `cue-daemon`: the single execution/session/resource/PTY/persistence owner;
 - `cue-client`: transport, reconnect, SSH, version checks, and daemon lifecycle;

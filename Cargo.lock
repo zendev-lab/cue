@@ -427,8 +427,11 @@ dependencies = [
 name = "cue-runtime"
 version = "0.1.2"
 dependencies = [
+ "cue-core",
+ "libc",
  "serde",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

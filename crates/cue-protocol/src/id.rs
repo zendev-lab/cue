@@ -27,7 +27,6 @@ macro_rules! numeric_id {
 }
 
 numeric_id!(RequestId, "request");
-numeric_id!(EventId, "event");
 numeric_id!(AttachmentId, "attachment");
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

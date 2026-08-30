@@ -1,5 +1,5 @@
 use cue_core::vnext::{
-    CancelMode, ExecutionSnapshot, ExecutionSpec, ExecutionState, Scope, StepState,
+    CancelMode, ExecutionSnapshot, ExecutionSpec, ExecutionState, FactEvent, OutputStream, Scope,
 };
 use cue_core::{ExecutionId, ScopeHash, StepId};
 use serde::{Deserialize, Serialize};
@@ -280,65 +280,6 @@ pub enum EventPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FactEvent {
-    pub id: EventId,
-    pub occurred_at_ms: i64,
-    pub fact: Fact,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "payload",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum Fact {
-    ExecutionCreated {
-        id: ExecutionId,
-        scope: ScopeHash,
-    },
-    StepStateChanged {
-        id: StepId,
-        previous: StepState,
-        next: StepState,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        input_scope: Option<ScopeHash>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        output_scope: Option<ScopeHash>,
-    },
-    ExecutionStateChanged {
-        id: ExecutionId,
-        previous: ExecutionState,
-        next: ExecutionState,
-    },
-    OutputAppended {
-        step: StepId,
-        stream: OutputStream,
-        start_offset: u64,
-        end_offset: u64,
-    },
-    ExecutionFinished {
-        id: ExecutionId,
-        state: ExecutionState,
-    },
-}
-
-impl Fact {
-    pub const fn execution_id(&self) -> ExecutionId {
-        match self {
-            Self::ExecutionCreated { id, .. }
-            | Self::ExecutionStateChanged { id, .. }
-            | Self::ExecutionFinished { id, .. } => *id,
-            Self::StepStateChanged { id, .. } | Self::OutputAppended { step: id, .. } => {
-                id.execution
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OutputChunk {
     pub step: StepId,
     pub stream: OutputStream,
@@ -346,14 +287,6 @@ pub struct OutputChunk {
     #[serde(with = "base64_bytes")]
     pub data: Vec<u8>,
     pub eof: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputStream {
-    Stdout,
-    Stderr,
-    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,7 +325,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cue_core::vnext::{
-        AbsolutePath, Argv, Execution, ExecutionPlan, FileModeMask, IoMode, Pipeline, Process,
+        AbsolutePath, Argv, Execution, ExecutionPlan, Fact, FileModeMask, IoMode, Pipeline, Process,
     };
 
     use super::*;
