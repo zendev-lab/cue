@@ -139,7 +139,7 @@ pub trait ExecutionObserver: Send + Sync {
 pub enum RunExit {
     Success,
     ExitCode(i32),
-    Signalled,
+    Signalled { signal: i32 },
     Cancelled,
     SpawnFailed(String),
     InfrastructureFailure(String),

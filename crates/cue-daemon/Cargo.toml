@@ -19,6 +19,9 @@ blake3.workspace = true
 bpaf.workspace = true
 chrono.workspace = true
 cue-core = { path = "../cue-core" }
+cue-protocol = { path = "../cue-protocol" }
+cue-runtime = { path = "../cue-runtime" }
+cue-store-sqlite = { path = "../cue-store-sqlite" }
 libc.workspace = true
 nvml-wrapper = { version = "0.12", optional = true }
 rusqlite.workspace = true

@@ -1,5 +1,6 @@
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::unix::process::ExitStatusExt as _;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -558,8 +559,10 @@ fn classify_exit(statuses: &[Option<ExitStatus>], cancelled: bool) -> RunExit {
         RunExit::Success
     } else if let Some(code) = status.code() {
         RunExit::ExitCode(code)
+    } else if let Some(signal) = status.signal() {
+        RunExit::Signalled { signal }
     } else {
-        RunExit::Signalled
+        RunExit::InfrastructureFailure("process exited without code or signal".into())
     }
 }
 

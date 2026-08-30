@@ -76,20 +76,20 @@ impl Store {
         scope: &Scope,
         created_at_ms: i64,
     ) -> Result<ScopePersistence, StoreError> {
-        if contains_sensitive_environment(scope) {
+        let persistence = Self::scope_persistence(scope);
+        if persistence == ScopePersistence::VolatileSensitiveEnvironment {
             return Ok(ScopePersistence::VolatileSensitiveEnvironment);
         }
-        let hash = scope.compute_hash();
-        self.connection.execute(
-            "INSERT OR IGNORE INTO scopes (hash, snapshot_json, created_at_ms)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                hash.0.as_slice(),
-                serde_json::to_string(scope)?,
-                created_at_ms
-            ],
-        )?;
-        Ok(ScopePersistence::Persisted)
+        put_scope_on(&self.connection, scope, created_at_ms)?;
+        Ok(persistence)
+    }
+
+    pub fn scope_persistence(scope: &Scope) -> ScopePersistence {
+        if contains_sensitive_environment(scope) {
+            ScopePersistence::VolatileSensitiveEnvironment
+        } else {
+            ScopePersistence::Persisted
+        }
     }
 
     pub fn get_scope(&self, hash: ScopeHash) -> Result<Option<Scope>, StoreError> {
@@ -146,6 +146,29 @@ impl Store {
             OperationRecord::Replay { response } => Ok(ExecutionCommandCommit::Replay { response }),
             OperationRecord::Conflict { stored_fingerprint } => {
                 Ok(ExecutionCommandCommit::Conflict { stored_fingerprint })
+            }
+        }
+    }
+
+    /// Atomically claim a command identity and store one durable Scope value.
+    pub fn commit_scope_command(
+        &self,
+        operation: OperationCommit<'_>,
+        scope: &Scope,
+    ) -> Result<ScopeCommandCommit, StoreError> {
+        if Self::scope_persistence(scope) != ScopePersistence::Persisted {
+            return Err(StoreError::VolatileScopeRequiresMemory);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        match record_operation_on(&transaction, operation)? {
+            OperationRecord::Inserted => {
+                put_scope_on(&transaction, scope, operation.completed_at_ms)?;
+                transaction.commit()?;
+                Ok(ScopeCommandCommit::Committed)
+            }
+            OperationRecord::Replay { response } => Ok(ScopeCommandCommit::Replay { response }),
+            OperationRecord::Conflict { stored_fingerprint } => {
+                Ok(ScopeCommandCommit::Conflict { stored_fingerprint })
             }
         }
     }
@@ -314,6 +337,13 @@ pub enum ExecutionCommandCommit {
     Conflict { stored_fingerprint: [u8; 32] },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeCommandCommit {
+    Committed,
+    Replay { response: Option<ResponsePayload> },
+    Conflict { stored_fingerprint: [u8; 32] },
+}
+
 pub fn command_fingerprint(command: &Command) -> Result<[u8; 32], StoreError> {
     let encoded = serde_json::to_vec(command)?;
     let mut hasher = blake3::Hasher::new();
@@ -361,6 +391,24 @@ fn validate_commit(
         }
     }
     validate_fact_projection(previous.as_ref(), execution, facts)?;
+    Ok(())
+}
+
+fn put_scope_on(
+    connection: &Connection,
+    scope: &Scope,
+    created_at_ms: i64,
+) -> Result<(), StoreError> {
+    let hash = scope.compute_hash();
+    connection.execute(
+        "INSERT OR IGNORE INTO scopes (hash, snapshot_json, created_at_ms)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            hash.0.as_slice(),
+            serde_json::to_string(scope)?,
+            created_at_ms
+        ],
+    )?;
     Ok(())
 }
 
@@ -881,6 +929,8 @@ pub enum StoreError {
     InvalidHashLength { kind: &'static str, actual: usize },
     #[error("operation uniqueness conflict was reported but the durable row disappeared")]
     OperationLostAfterConflict,
+    #[error("secret-bearing scopes require the daemon volatile store")]
+    VolatileScopeRequiresMemory,
 }
 
 #[cfg(test)]
@@ -1317,6 +1367,109 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(operation_count, 1, "failed effect must roll back its claim");
+    }
+
+    #[test]
+    fn scope_storage_and_operation_claim_share_one_transaction() {
+        let store = Store::in_memory().unwrap();
+        let first = scope(&[("PATH", "/bin"), ("MODE", "first")]);
+        let second = scope(&[("PATH", "/bin"), ("MODE", "second")]);
+        let client = ClientId::new("client-scope").unwrap();
+        let operation = OperationId::new("scope:1").unwrap();
+        let command = Command::PutScope {
+            scope: Box::new(first.clone()),
+        };
+        let response = ResponsePayload::Ok(cue_protocol::ResultPayload::ScopeStored {
+            hash: first.compute_hash(),
+            durable: true,
+        });
+
+        assert_eq!(
+            store
+                .commit_scope_command(
+                    OperationCommit {
+                        client: &client,
+                        operation: &operation,
+                        command: &command,
+                        response: Some(&response),
+                        completed_at_ms: 10,
+                    },
+                    &first,
+                )
+                .unwrap(),
+            ScopeCommandCommit::Committed
+        );
+        assert_eq!(store.get_scope(first.compute_hash()).unwrap(), Some(first));
+
+        assert_eq!(
+            store
+                .commit_scope_command(
+                    OperationCommit {
+                        client: &client,
+                        operation: &operation,
+                        command: &command,
+                        response: None,
+                        completed_at_ms: 11,
+                    },
+                    &second,
+                )
+                .unwrap(),
+            ScopeCommandCommit::Replay {
+                response: Some(response)
+            }
+        );
+        assert_eq!(store.get_scope(second.compute_hash()).unwrap(), None);
+
+        let conflicting = Command::PutScope {
+            scope: Box::new(second.clone()),
+        };
+        assert!(matches!(
+            store
+                .commit_scope_command(
+                    OperationCommit {
+                        client: &client,
+                        operation: &operation,
+                        command: &conflicting,
+                        response: None,
+                        completed_at_ms: 12,
+                    },
+                    &second,
+                )
+                .unwrap(),
+            ScopeCommandCommit::Conflict { .. }
+        ));
+        assert_eq!(store.get_scope(second.compute_hash()).unwrap(), None);
+    }
+
+    #[test]
+    fn scope_command_rejects_sensitive_values_without_claiming_operation() {
+        let store = Store::in_memory().unwrap();
+        let sensitive = scope(&[("PATH", "/bin"), ("ACCESS_TOKEN", "do-not-persist")]);
+        let client = ClientId::new("client-secret").unwrap();
+        let operation = OperationId::new("scope:secret").unwrap();
+        let command = Command::PutScope {
+            scope: Box::new(sensitive.clone()),
+        };
+
+        assert!(matches!(
+            store.commit_scope_command(
+                OperationCommit {
+                    client: &client,
+                    operation: &operation,
+                    command: &command,
+                    response: None,
+                    completed_at_ms: 10,
+                },
+                &sensitive,
+            ),
+            Err(StoreError::VolatileScopeRequiresMemory)
+        ));
+        let operation_count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert_eq!(store.get_scope(sensitive.compute_hash()).unwrap(), None);
     }
 
     #[test]
