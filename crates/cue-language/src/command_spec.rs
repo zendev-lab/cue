@@ -358,6 +358,14 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         documented: true,
     },
     CommandSpec {
+        name: "umask",
+        category: CommandCategory::Scope,
+        arg_kind: CommandArgKind::OptionalText,
+        usage: ":umask <octal-mask>",
+        detail: "Set the file-creation mask for this execution scope",
+        documented: true,
+    },
+    CommandSpec {
         name: "scope",
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,

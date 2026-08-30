@@ -17,7 +17,7 @@ use cue_core::scope::EnvDelta;
 use cue_core::{ExecutionId, ScheduleId, StepId};
 
 use crate::ast::{ChainNode, JobExpr, ParallelOp, Pipeline as AstPipeline, SerialOp};
-use crate::resolver::ResolvedCommand;
+use crate::resolver::{ResolvedCommand, ResolvedForegroundRole};
 use crate::{ParseError, parse_command, parse_file_script_command};
 
 #[derive(Debug, Clone)]
@@ -139,6 +139,11 @@ fn compile_resolved(
                 },
             }))
         }
+        ResolvedCommand::Umask { .. } => {
+            Ok(CompiledCommand::Frontend(FrontendAction::Unsupported {
+                message: "`:umask` requires the Cue vNext execution compiler".into(),
+            }))
+        }
         ResolvedCommand::Env { subcommand } => match compile_env_delta(subcommand.as_deref())? {
             Some(delta) => Ok(CompiledCommand::Daemon(RequestPayload::ApplyScopeDelta {
                 base: None,
@@ -217,8 +222,8 @@ fn compile_resolved(
                 ))
             })?;
             Ok(CompiledCommand::Daemon(match role {
-                cue_core::ipc::ForegroundRole::Controller => RequestPayload::StepAttach { id },
-                cue_core::ipc::ForegroundRole::Observer => RequestPayload::StepWatch { id },
+                ResolvedForegroundRole::Controller => RequestPayload::StepAttach { id },
+                ResolvedForegroundRole::Observer => RequestPayload::StepWatch { id },
             }))
         }
         ResolvedCommand::Wait { id } => {
@@ -373,6 +378,9 @@ fn compile_script_item(
                 },
             },
             LaunchContext::default(),
+        )),
+        ResolvedCommand::Umask { .. } => Err(CompileError::Invalid(
+            "`:umask` requires the Cue vNext execution compiler".into(),
         )),
         ResolvedCommand::Env { subcommand } => {
             let delta = compile_env_delta(subcommand.as_deref())?.ok_or_else(|| {
