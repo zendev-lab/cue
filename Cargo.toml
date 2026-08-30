@@ -6,6 +6,7 @@ members = [
   "crates/cue-core",
   "crates/cue-daemon",
   "crates/cue-language",
+  "crates/cue-runtime",
   "crates/cue-tui",
 ]
 

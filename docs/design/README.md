@@ -1,8 +1,13 @@
 # Cue design index
 
-These documents describe the IPC v3 execution runtime. Source types and strict
-wire validators remain authoritative when prose and code disagree.
+Cue vNext is being built as a hard cut from the current IPC v3 runtime. The
+vNext contract is frozen in the first document below; the remaining documents
+describe the implementation being replaced until their corresponding migration
+lands. Source types and strict wire validators remain authoritative when prose
+and code disagree.
 
+- [vNext foundation](vnext-foundation.md): target boundary, closed execution ADT,
+  explicit Scope, and bootstrap Composition.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.
