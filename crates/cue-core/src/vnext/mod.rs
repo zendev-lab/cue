@@ -5,11 +5,17 @@
 //! parser, scheduler, session, resource, or extension implementation types.
 
 mod env;
+mod execution;
 mod plan;
 mod process;
 mod scope;
 
 pub use env::{Env, EnvEdit, EnvKey, EnvPatch, EnvValue};
+pub use execution::{
+    BuiltinSuccess, CancelMode, Execution, ExecutionCancelReason, ExecutionError,
+    ExecutionSnapshot, ExecutionState, ExecutionTransition, ReadyStep, SkipReason, StepAction,
+    StepCancelReason, StepFailure, StepRecord, StepState,
+};
 pub use plan::{
     BuiltinCommand, CdPath, EnvMutation, ExecutionPlan, ExecutionSpec, IoMode, ParallelBranches,
     ParallelJoin, PlanValidationError, SequenceCondition, StepDescriptor, StepKind,

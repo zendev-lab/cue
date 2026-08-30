@@ -1,9 +1,10 @@
 # Cue vNext foundation
 
 This document freezes the target contract used to migrate the current IPC v3
-runtime. It is deliberately smaller than the complete delivery plan: later
+runtime. It is deliberately smaller than the complete delivery plan: dependent
 slices add the reducer, protocol, storage, runner, clients, and external
-producers without reopening these boundaries.
+producers without reopening these boundaries. The reducer contract is recorded
+in [vnext-reducer.md](vnext-reducer.md).
 
 ## Product boundary
 
