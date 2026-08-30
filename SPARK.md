@@ -21,7 +21,7 @@ SpawnAdapter。它已经能够可靠托管进程，但 daemon 同时承担 execu
 semantics、交互 session、触发策略和 host policy，导致一个本应稳定的小内核
 需要理解越来越多的上层概念。
 
-下一代 Cue 不再以“继续给 daemon 加能力”为演进方向，而是把已经验证过的
+当前 Cue 不再以“继续给 daemon 加能力”为演进方向，而是把已经验证过的
 Execution/Step/PTY/output/idempotency 提炼为持久本地执行内核。语言、session、
 schedule、resource policy 和 agent workflow 都成为内核的调用方或实现机制，
 不再成为 ExecutionPlan 的隐式输入。
@@ -71,7 +71,7 @@ process 的可观察性。
 - Execution：Builtin、Run、Sequence、Parallel 的 closed ADT 与纯 reducer。
 - Scope：显式完整快照、内容寻址、Builtin transition 和 client-owned cursor。
 - Process：typed argv、EnvPatch、native Pipeline、process group 和 signal control。
-- I/O：Captured stdout/stderr、单 terminal PTY、持久 output 与 attachment lease。
+- I/O：Captured stdout/stderr、单 terminal PTY、有界 output 与绝对 offset、attachment lease。
 - Durability：execution/step facts、operation idempotency、drain-first restart 和 crash reconciliation。
 - Composition：Port、Provider、Combine law、依赖解析、lifecycle 与 Assembly manifest。
 - Frontend：Cue surface 编译、argv 展开、completion/highlight、CLI/TUI projection。
@@ -115,22 +115,25 @@ process 的可观察性。
 - 继续扩展现有 IPC v3/daemon owner：迁移成本最低，但 session、schedule、resource
   和 execution 会继续互相牵制，因此放弃。
 - 仅重写 ExecutionPlan，保留直接 runtime 依赖：会在下一步 Composition 时再次
-  搬迁 owner 和构造路径，因此 Composition 从 vNext foundation 起就进入设计。
+  搬迁 owner 和构造路径，因此 Composition 从重构起点就进入设计。
 - 让 extension 增加 ExecutionPlan variant：这会使持久化、reducer 和客户端无法
   再证明静态语义，因此 extension 只扩 implementation。
 - 为 v3 数据逐项语义迁移：旧 Scope identity、session cursor 和 schedule contract
-  与 vNext 不等价，因此选择在硬切时整体只读归档。
+  与 IPC v4 不等价，因此选择在硬切时整体只读归档。
 - daemon 运行时展开 `$VAR`/`~`：会让 plain argv 携带隐藏语义，因此展开移到
   surface，并只读取提交时的初始 Scope。
 
-## 开放问题
+## 后续问题（不阻塞内核）
 
 - 静态 Rust provider 之外，哪些 sidecar provider protocol 值得成为稳定公共接口。
-- vNext 稳定后，是否把 client-owned named session 做成独立可共享组件。
+- 是否把 client-owned named session 做成独立可共享组件。
 - Scope archive 与长期 output retention 是否需要独立的管理工具和 GC policy。
 
 ## 修订记录
 
+- 2026-08-31：完成 IPC v4 hard cut；旧 Core/daemon/client/TUI 实现与兼容入口已物理
+  删除，`cue_core` 根 API 成为唯一 execution contract，默认 `cued-v4.db` 独立建库，
+  旧 `cued.db` 只读归档且不导入；公开文档、Skill、package smoke 和架构守卫同步收口。
 - 2026-08-31：CLI/TUI 完成 v4 hard cut；公开入口只使用 ExecutionId/StepId，CLI
   提供 typed run/query/output/cancel/PTY passthrough，TUI 直接投影 ExecutionView/fact；
   session/cron/resource/target 页面、J/CH/R 与旧 foreground epoch state machine 已删除。

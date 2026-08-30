@@ -1,4 +1,4 @@
-use cue_core::vnext::{
+use cue_core::{
     CancelMode, ExecutionSnapshot, ExecutionSpec, ExecutionState, FactEvent, OutputStream, Scope,
 };
 use cue_core::{ExecutionId, ScopeHash, StepId};
@@ -324,7 +324,7 @@ mod base64_bytes {
 mod tests {
     use std::collections::BTreeMap;
 
-    use cue_core::vnext::{
+    use cue_core::{
         AbsolutePath, Argv, Execution, ExecutionPlan, Fact, FileModeMask, IoMode, Pipeline, Process,
     };
 

@@ -5,7 +5,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cue_core::vnext::{CancelMode, IoMode, OutputStream, PipeLink, Process, Scope};
+use cue_core::{CancelMode, IoMode, OutputStream, PipeLink, Process, Scope};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -739,7 +739,7 @@ fn io_error(action: &'static str, error: impl std::fmt::Display) -> RuntimeError
 mod tests {
     use std::collections::BTreeMap;
 
-    use cue_core::vnext::{AbsolutePath, Argv, FileModeMask, PipeContinuation, Pipeline, Process};
+    use cue_core::{AbsolutePath, Argv, FileModeMask, PipeContinuation, Pipeline, Process};
     use cue_core::{ExecutionId, StepId};
 
     use super::*;

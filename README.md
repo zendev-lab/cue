@@ -1,176 +1,131 @@
 # Cue
 
-Cue is a persistent, observable local execution runtime for work shared by
-humans and agents. `cued` owns process, PTY, scope, resource, schedule, output,
-and recovery state; clients submit one typed `ExecutionSpec` and observe one
-`ExecutionId` (`E<n>`) with stable process-step IDs (`E<n>/S<n>`).
+Cue is a durable local execution kernel for work shared by people and agents.
+Clients submit a fully typed `ExecutionSpec`; `cued` owns process groups, PTYs,
+output, execution facts, idempotency, and restart recovery.
 
-> **Pre-1.0:** IPC v3 is an intentional hard cut. Older `Eval`, `RunScript`,
-> job, chain, and script-state clients are rejected during capability checks.
+Cue deliberately does not own session cursors, schedules, automatic retry,
+resource policy, approvals, remote fleets, or a general DAG. Those systems may
+submit ordinary executions, but cannot extend the closed execution algebra.
 
-Cue is not a general shell, workflow engine, fleet manager, or policy daemon.
-Its shell-like language remains a frontend convenience: `cue-language` compiles
-interactive input and `.cue` files locally into the same typed execution
-contract used by non-language clients.
+## Quick start
 
-## What Cue owns
-
-- durable executions, steps, named sessions, scopes, schedules, and idempotency facts;
-- process groups, resource admission, workspace views, wrappers, PTYs, output, and events;
-- multiple PTY observers with one explicit controller lease;
-- disconnect-safe background work and restart recovery;
-- a constrained per-spawn adapter seam for host policy enforcement.
-
-Higher layers own agent/workflow policy, approvals, secrets, remote-fleet
-coordination, and general DAG/retry semantics. In particular, `cued` has no DSH
-mode or DSH dependency: DSH confinement is supplied by `dsh-tool-cue` through a
-short-lived SpawnAdapter broker.
-
-## Agent skill
-
-[`skills/cue/SKILL.md`](skills/cue/SKILL.md) is the canonical agent-facing Cue
-Skill. Cue binaries do not load it. Node hosts install `@zendev-lab/cue` and
-mount the package's exported `cueSkillsRoot`; the published package contains
-this authority directly rather than a downstream source copy.
-
-## Install and commands
-
-The Python distribution is `cue-run`; the product and commands remain Cue:
+Install the Python distribution (the command names remain Cue):
 
 ```bash
 uv tool install cue-run
-
-cue --help
-cue tui
-cue run build.cue
-cue client session list --json
-cue daemon status
-cued --version
 ```
 
-The installed command set is `cue`, `cue-client`, `cue-tui`, and `cued`.
-`cue daemon ...` forwards to `cued`; there is no standalone `cue-daemon`
-command alias. Because Google CUE also installs a `cue` command, installation
-diagnostics detect a foreign binary rather than assuming it is this runtime.
-
-## Language frontend
-
-Commands are direct argv, not implicit `/bin/sh` strings:
-
-```cue
-cargo test
-RUST_LOG=debug cargo test
-MODE=release ./scripts/build
-printf hello |> wc -c
-cargo fmt -> cargo clippy
-cargo test ||| cargo test --doc
-```
-
-Leading `NAME=value` words apply only to that pipeline segment. They are typed
-environment overrides and never mutate the session scope. Assignment-shaped
-arguments after the executable remain ordinary argv.
-
-Composition maps directly to `ExecutionPlan`:
-
-| Language | Typed node | Meaning |
-| --- | --- | --- |
-| `A |> B` | one `Pipeline` | connect exact argv segments with a pipe |
-| `A && B`, `A -> B` | `OnSuccess` | run B only after A succeeds |
-| `A || B` | `OnFailure` | run B only after A fails |
-| `A ~> B` | `Always` | run B after either result |
-| `A ||| B` | `ParallelAll` | run all branches; all must succeed |
-| `A |?| B` | `AnySuccess` | succeed after the first successful branch |
-
-A `.cue` file is parsed and compiled by the client into one fail-fast execution
-with source metadata:
+Start the local daemon in one terminal, then use another terminal:
 
 ```bash
-cue run scripts/build.cue
+cued start
+
+cue client exec "printf hello"
+cue client list
+cue run examples/hello.cue
+cue tui
+cue daemon status
 ```
 
-Retry is deliberately a new submission with `retry_of`; an old execution is
-never revived or assigned a second lifecycle.
+The installed commands are `cue`, `cue-client`, `cue-tui`, and `cued`.
+`CUE_SOCKET` selects a non-default local Unix socket. Remote transport, named
+targets, and service management are external wrappers rather than daemon state.
 
-## Runtime contract
+## Execution semantics
 
-Execution state is exactly `queued | running | succeeded | failed | cancelled`.
-A forced stop is `cancelled` with a forced reason. Each actual pipeline segment
-has one stable `StepId`; PTY attach/watch/control and output address that step.
+`ExecutionPlan` has exactly four variants:
 
-IPC v3 uses length-prefixed strict JSON over a local Unix socket or the same
-framing through `cued gateway --stdio` for explicit SSH profiles. Core requests
-are:
+- `Builtin`: `cd`, `env set|unset`, or `umask`;
+- `Run`: one typed process pipeline and its captured-or-PTY I/O mode;
+- `Sequence`: run the second plan on success, failure, or always;
+- `Parallel`: join all branches or finish after any branch succeeds.
 
-- `SubmitExecution`, `GetExecution`, `ListExecutions`, `WaitExecution`;
-- `CancelExecution { graceful | force }`, `ReadExecutionOutput`;
-- typed scope/session and schedule operations;
-- typed step PTY attach/watch/control operations.
+Builtin and Run leaves receive stable `StepId` values such as `E7/S2`.
+Sequence threads the resulting Scope; Parallel forks one input Scope into every
+branch and never merges branch mutations.
 
-Execution events are `ExecutionCreated`, `ExecutionStateChanged`,
-`StepStateChanged`, `OutputChunk`, and `ExecutionFinished`. PTY attachment
-lifecycle events remain a separate typed control stream.
+The frontend language is direct argv, not an implicit shell:
 
-See [IPC protocol](docs/design/ipc-protocol.md), [core types](docs/design/core-types.md),
-and [daemon architecture](docs/design/daemon-architecture.md).
+```cue
+RUST_LOG=debug cargo test
+printf hello |> wc -c
+cargo fmt -> cargo clippy
+cargo test || cargo test --doc
+cargo test ||| cargo test --doc
+cd crates/cue-core -> cargo test
+env set MODE=release -> printenv MODE
+```
 
-## Spawn preparation and policy adapters
+`A=B command` patches only that process. In `A=B left |> right`, the right
+process does not inherit `A`. `command A=B` keeps `A=B` as a literal argument,
+and an assignment without an executable is rejected. Use the `env` builtin to
+change the Scope seen by later sequence steps.
 
-Every process segment passes through one preparation path, in this order:
+Operators map as follows:
 
-1. scope, environment, and resource admission;
-2. argv expansion;
-3. workspace view;
-4. configured wrapper;
-5. optional SpawnAdapter `PrepareSpawn`;
-6. `Command::new` and spawn.
+| Surface | Core meaning |
+| --- | --- |
+| `A \|> B` | stdout to the next process in one Pipeline |
+| `A \|&> B` | stdout and stderr to the next process |
+| `A \|!> B` | stderr to the next process |
+| `A && B`, `A -> B` | Sequence on success |
+| `A \|\| B` | Sequence on failure |
+| `A ~> B` | Sequence always |
+| `A \|\|\| B` | Parallel, all must succeed |
+| `A \|?\| B` | Parallel, any success wins |
 
-`SettleSpawn` receives the process result and a bounded diagnostic stderr/PTY
-tail. An unavailable adapter fails closed before spawn; an unavailable settle
-call preserves the process result but finishes the execution as an
-infrastructure failure. Adapter sockets must be private, same-UID Unix sockets
-inside Cue's runtime adapter directory. Opaque tokens are not placed in the
-environment, database, output, or events. Schedule templates cannot persist an
-ephemeral adapter.
+## IPC v4 and persistence
 
-## Files and migration
+IPC v4 uses strict length-prefixed JSON on a private Unix socket. Every
+connection begins with `Hello`; read-only Queries use `RequestId`, while every
+side-effecting Command also carries an idempotent `OperationId`. The protocol
+contains explicit Scope, Execution, output, PTY attachment, and daemon
+lifecycle operations—no raw source or ambient session handshake.
 
-Cue uses standard XDG roots under `cue`:
+The default database is `$XDG_DATA_HOME/cue/cued-v4.db` (or the corresponding
+XDG fallback). A legacy `cued.db` is renamed to a read-only
+`cued-v3-<timestamp>.db.archive` with its sidecars. Cue does not import or
+dual-read incompatible v3 semantics. Credential-shaped environments remain
+volatile and are not serialized to SQLite.
 
-- config: `$XDG_CONFIG_HOME/cue/`;
-- data/database/output: `$XDG_DATA_HOME/cue/`;
-- state/logs: `$XDG_STATE_HOME/cue/`;
-- runtime/socket/adapters: `$XDG_RUNTIME_DIR/cue/`.
+## CLI
 
-On first upgraded startup, the migration takes the instance lock, rejects
-symlinks, archives the legacy `cue-shell` v18 database and output read-only,
-and imports only safe session/scope/config context. Legacy J/CH/R history and
-cron records are not dual-read or imported. The migration is idempotent and
-leaves the old data untouched if publication or import fails.
+```text
+cue-client run FILE.cue
+cue-client exec SOURCE
+cue-client list
+cue-client show|wait E7
+cue-client out|err|terminal E7/S2
+cue-client cancel|kill E7
+cue-client fg E7/S2 [--observe]
+cue-client restart|shutdown
+```
 
-## Development
+`cue run` and `cue fg` are shortcuts. PTY control uses one controller and any
+number of observers; Ctrl-] detaches the controller CLI.
+
+## Repository structure
+
+- `cue-core`: root execution ADT, Scope, reducer, facts, and identities;
+- `cue-protocol`: strict IPC v4 messages and framing;
+- `cue-store-sqlite`: Scope/Execution/fact/operation persistence provider;
+- `cue-runtime`: bootstrap Composition, typed providers, runner, and recovery;
+- `cue-language`: surface tokenizer, parser, compiler, completion, highlighting;
+- `cue-daemon`: composition root, IPC service, lifecycle, and local host;
+- `cue-client`: explicit Scope submission and sequential/multiplexed clients;
+- `cue-tui`: small execution projection;
+- `cue-cli`: installed command aggregator and extension dispatch.
+
+Development gates:
 
 ```bash
 just check
 just test
 just msrv
 just package-smoke
-just pre-commit
+just npm-package-smoke
 ```
 
-The workspace is split by responsibility:
-
-- `cue-core`: IPC v3 and typed execution/scope/schedule state;
-- `cue-protocol`: strict vNext command/query, fact event, PTY, and framing contract;
-- `cue-store-sqlite`: fresh vNext Scope/Execution/fact/idempotency store provider;
-- `cue-runtime`: typed vNext Assembly, local captured/PTY runner, output and recovery contracts;
-- `cue-language`: tokenizer, parser, resolver, compiler, completion, highlighting;
-- `cue-daemon`: the single execution/session/resource/PTY/persistence owner;
-- `cue-client`: transport, reconnect, SSH, version checks, and daemon lifecycle;
-- `cue-tui`: an interactive client built on `cue-client` and `cue-language`;
-- `cue-cli`: the installed command aggregator and Maturin companion binaries.
-
-The vNext crates are intentionally isolated while the hard cut is in progress;
-the current binaries still speak IPC v3 until daemon and clients switch as one
-stacked migration.
-
-See [testing](docs/testing.md) and the [design index](docs/design/README.md).
+See [architecture](ARCHITECTURE.md), [design](docs/design/README.md),
+[testing](docs/testing.md), and the canonical [agent Skill](skills/cue/SKILL.md).

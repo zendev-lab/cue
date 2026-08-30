@@ -5,14 +5,16 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
-use cue_core::vnext::{CancelMode, Fact, OutputStream};
+use cue_core::{CancelMode, Fact, OutputStream};
 use cue_core::{ExecutionId, StepId};
 use cue_language::Mode;
 use cue_protocol::{Command, EventPayload, OutputRange, Query, ResultPayload};
 
 use crate::default_socket_path;
+use crate::execution::{
+    ExecutionClient, SurfaceOutcome, output_bytes, process_scope, wait_execution,
+};
 use crate::script_runner::{execution_exit_code, write_execution_output};
-use crate::vnext::{SurfaceOutcome, VnextClient, output_bytes, process_scope, wait_execution};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientCommand {
@@ -53,7 +55,7 @@ async fn run_connected(command: ClientCommand) -> Result<i32> {
     let socket = std::env::var_os("CUE_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
-    let mut client = VnextClient::connect(&socket).await?;
+    let mut client = ExecutionClient::connect(&socket).await?;
     match command {
         ClientCommand::Exec(source) => {
             match client
@@ -142,7 +144,7 @@ fn selected_range(selected: bool) -> OutputRange {
     }
 }
 
-async fn foreground(mut client: VnextClient, step: StepId, observe: bool) -> Result<i32> {
+async fn foreground(mut client: ExecutionClient, step: StepId, observe: bool) -> Result<i32> {
     client
         .command(Command::WatchExecution {
             id: step.execution,
@@ -351,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_exposes_only_vnext_kernel_commands() {
+    fn parser_exposes_only_kernel_commands() {
         assert_eq!(
             parse_command(args(&["cue-client", "show", "E7"])).unwrap(),
             ClientCommand::Show(ExecutionId(7))

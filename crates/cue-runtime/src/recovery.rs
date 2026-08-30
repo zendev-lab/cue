@@ -1,4 +1,4 @@
-use cue_core::vnext::{Execution, ExecutionProjection, Fact, FactDraft, StepState};
+use cue_core::{Execution, ExecutionProjection, Fact, FactDraft, StepState};
 
 use crate::{RuntimeError, RuntimeErrorKind};
 
@@ -95,7 +95,7 @@ pub fn recover_interrupted(
 mod tests {
     use std::collections::BTreeMap;
 
-    use cue_core::vnext::{
+    use cue_core::{
         AbsolutePath, Argv, ExecutionPlan, ExecutionSpec, FileModeMask, IoMode, Pipeline, Process,
         Scope, StepFailure,
     };
@@ -137,10 +137,7 @@ mod tests {
         let recovered = recover_interrupted(&running_projection(), 20, "daemon restarted")
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recovered.execution.state,
-            cue_core::vnext::ExecutionState::Failed
-        );
+        assert_eq!(recovered.execution.state, cue_core::ExecutionState::Failed);
         assert_eq!(recovered.facts.len(), 3);
         assert!(matches!(
             &recovered.execution.snapshot.steps[0].state(),

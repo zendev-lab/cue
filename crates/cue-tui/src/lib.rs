@@ -6,11 +6,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use cue_client::{VnextClient, VnextMultiplexedClient, process_scope};
-use cue_core::vnext::{CancelMode, Fact, OutputStream};
+use cue_client::{ExecutionClient, MultiplexedClient, process_scope};
+use cue_core::{CancelMode, Fact, OutputStream};
 use cue_core::{ExecutionId, StepId};
 use cue_language::{
-    Mode, OutputSelection, OutputTarget, VnextCommand, VnextFrontendAction, compile_vnext_command,
+    FrontendAction, Mode, OutputSelection, OutputTarget, SurfaceCommand, compile_command,
 };
 use cue_protocol::{Command, EventPayload, ExecutionView, OutputRange, Query, ResultPayload};
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -23,7 +23,7 @@ pub fn run_cli() -> Result<()> {
 }
 
 pub async fn run(socket: PathBuf) -> Result<()> {
-    let client = VnextClient::connect(&socket)
+    let client = ExecutionClient::connect(&socket)
         .await
         .with_context(|| format!("connect to {}", socket.display()))?
         .into_multiplexed();
@@ -81,11 +81,7 @@ struct State {
     notice: String,
 }
 
-async fn handle_event(
-    event: Event,
-    client: &VnextMultiplexedClient,
-    state: &mut State,
-) -> Result<bool> {
+async fn handle_event(event: Event, client: &MultiplexedClient, state: &mut State) -> Result<bool> {
     let Event::Key(key) = event else {
         return Ok(false);
     };
@@ -113,11 +109,7 @@ async fn handle_event(
     Ok(false)
 }
 
-async fn dispatch(
-    client: &VnextMultiplexedClient,
-    state: &mut State,
-    source: &str,
-) -> Result<bool> {
+async fn dispatch(client: &MultiplexedClient, state: &mut State, source: &str) -> Result<bool> {
     let scope = process_scope()?;
     let stored = client
         .command(Command::PutScope {
@@ -127,7 +119,7 @@ async fn dispatch(
     let ResultPayload::ScopeStored { hash, .. } = stored else {
         bail!("daemon returned an unexpected PutScope response")
     };
-    let command = match compile_vnext_command(source, Mode::Job, hash) {
+    let command = match compile_command(source, Mode::Job, hash) {
         Ok(command) => command,
         Err(error) => {
             state.log.push(error.to_string());
@@ -135,7 +127,7 @@ async fn dispatch(
         }
     };
     match command {
-        VnextCommand::Submit(spec) => {
+        SurfaceCommand::Submit(spec) => {
             let submitted = client
                 .command(Command::SubmitExecution {
                     spec: Box::new(spec),
@@ -155,20 +147,20 @@ async fn dispatch(
                 .push(format!("submitted {}", execution.snapshot.id));
             refresh(client, state).await?;
         }
-        VnextCommand::ListExecutions => refresh(client, state).await?,
-        VnextCommand::GetExecution { id } => {
+        SurfaceCommand::ListExecutions => refresh(client, state).await?,
+        SurfaceCommand::GetExecution { id } => {
             append_json(state, client.query(Query::GetExecution { id }).await?)?;
         }
-        VnextCommand::WaitExecution { id } => {
+        SurfaceCommand::WaitExecution { id } => {
             append_json(state, client.query(Query::WaitExecution { id }).await?)?;
             refresh(client, state).await?;
         }
-        VnextCommand::ReadOutput {
+        SurfaceCommand::ReadOutput {
             target,
             stream,
             tail_bytes,
         } => read_output(client, state, target, stream, tail_bytes).await?,
-        VnextCommand::CancelExecution { id, force } => {
+        SurfaceCommand::CancelExecution { id, force } => {
             client
                 .command(Command::CancelExecution {
                     id,
@@ -181,15 +173,15 @@ async fn dispatch(
                 .await?;
             refresh(client, state).await?;
         }
-        VnextCommand::AttachPty { step, .. } => state.log.push(format!(
+        SurfaceCommand::AttachPty { step, .. } => state.log.push(format!(
             "PTY {step} needs terminal passthrough; run `cue fg {step}`"
         )),
-        VnextCommand::Frontend(VnextFrontendAction::Clear) => state.log.clear(),
-        VnextCommand::Frontend(VnextFrontendAction::Quit) => return Ok(true),
-        VnextCommand::Frontend(VnextFrontendAction::Restart) => {
+        SurfaceCommand::Frontend(FrontendAction::Clear) => state.log.clear(),
+        SurfaceCommand::Frontend(FrontendAction::Quit) => return Ok(true),
+        SurfaceCommand::Frontend(FrontendAction::Restart) => {
             append_json(state, client.command(Command::Restart).await?)?;
         }
-        VnextCommand::Frontend(VnextFrontendAction::Help { .. }) => state.log.push(
+        SurfaceCommand::Frontend(FrontendAction::Help { .. }) => state.log.push(
             "run commands directly; :jobs, :log E1, :wait E1, :out E1/S1, :cancel E1, :fg E1/S1"
                 .into(),
         ),
@@ -197,7 +189,7 @@ async fn dispatch(
     Ok(false)
 }
 
-async fn refresh(client: &VnextMultiplexedClient, state: &mut State) -> Result<()> {
+async fn refresh(client: &MultiplexedClient, state: &mut State) -> Result<()> {
     let result = client
         .query(Query::ListExecutions {
             before: None,
@@ -212,7 +204,7 @@ async fn refresh(client: &VnextMultiplexedClient, state: &mut State) -> Result<(
 }
 
 async fn read_output(
-    client: &VnextMultiplexedClient,
+    client: &MultiplexedClient,
     state: &mut State,
     target: OutputTarget,
     stream: OutputSelection,
@@ -254,14 +246,14 @@ async fn read_output(
     } else {
         OutputStream::Stderr
     };
-    let bytes = cue_client::vnext::output_bytes(&chunks, selected);
+    let bytes = cue_client::execution::output_bytes(&chunks, selected);
     state
         .log
         .extend(String::from_utf8_lossy(&bytes).lines().map(str::to_owned));
     Ok(())
 }
 
-async fn last_step(client: &VnextMultiplexedClient, id: ExecutionId) -> Result<StepId> {
+async fn last_step(client: &MultiplexedClient, id: ExecutionId) -> Result<StepId> {
     let ResultPayload::Execution { execution } = client.query(Query::GetExecution { id }).await?
     else {
         bail!("daemon returned an unexpected GetExecution response")
@@ -365,11 +357,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fact_summary_uses_vnext_execution_identity() {
+    fn fact_summary_uses_execution_identity() {
         assert_eq!(
             fact_summary(&Fact::ExecutionFinished {
                 id: ExecutionId(7),
-                state: cue_core::vnext::ExecutionState::Succeeded,
+                state: cue_core::ExecutionState::Succeeded,
             }),
             "E7: Succeeded"
         );

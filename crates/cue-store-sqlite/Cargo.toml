@@ -3,7 +3,7 @@ name = "cue-store-sqlite"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "SQLite execution and scope store provider for Cue vNext"
+description = "SQLite execution and scope store provider for Cue"
 repository.workspace = true
 license.workspace = true
 

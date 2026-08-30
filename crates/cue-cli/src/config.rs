@@ -1,11 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use cue_client::{
-    ClientConfigPaths, optional_client_config_paths, read_client_config_sources,
-    validate_client_config_root_sections,
-};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -16,26 +12,24 @@ pub struct Config {
 
 impl Config {
     pub(crate) fn load_for_extension_dispatch() -> Result<Self> {
-        Self::load_for_extension_dispatch_from_paths(optional_client_config_paths())
-    }
-
-    fn load_for_extension_dispatch_from_paths(paths: Option<ClientConfigPaths>) -> Result<Self> {
-        let Some(paths) = paths else {
+        let Some(path) = extension_config_path() else {
             return Ok(Self::default());
         };
-        let sources = read_client_config_sources(&paths)?;
-        Self::load_for_extension_dispatch_from_sources(
-            sources
-                .primary()
-                .map(|source| (source.path(), source.text())),
-        )
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        Self::load_for_extension_dispatch_from_sources(Some((&path, &text)))
     }
 
     fn load_for_extension_dispatch_from_sources(source: Option<(&Path, &str)>) -> Result<Self> {
         let Some((path, text)) = source else {
             return Ok(Self::default());
         };
-        validate_client_config_root_sections(text, path)?;
+        validate_root_sections(text, path)?;
         let extension_config: ExtensionDispatchConfig =
             toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
         extension_config.extensions.validate()?;
@@ -43,6 +37,27 @@ impl Config {
             extensions: extension_config.extensions,
         })
     }
+}
+
+fn extension_config_path() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(root).join("cue/client.toml"));
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/cue/client.toml"))
+}
+
+fn validate_root_sections(text: &str, path: &Path) -> Result<()> {
+    let root = toml::from_str::<toml::Table>(text)
+        .with_context(|| format!("parse config {}", path.display()))?;
+    for key in root.keys() {
+        if key != "extensions" {
+            bail!("unknown top-level client config section `{key}`")
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -257,17 +272,8 @@ program = {program}
     }
 
     #[test]
-    fn extension_dispatch_config_defaults_when_config_root_is_absent() {
-        let config = Config::load_for_extension_dispatch_from_paths(None)
-            .expect("missing config root should not block extension dispatch");
-
-        assert!(!config.extensions.path_lookup);
-        assert!(config.extensions.commands.is_empty());
-    }
-
-    #[test]
-    fn extension_dispatch_config_ignores_transport_semantics() {
-        let config = Config::load_for_extension_dispatch_from_sources(Some((
+    fn extension_dispatch_config_rejects_removed_transport_section() {
+        let error = Config::load_for_extension_dispatch_from_sources(Some((
             Path::new("client.toml"),
             r#"
 [transport]
@@ -277,14 +283,9 @@ default_profile = " remote"
 program = "cue-foo"
 "#,
         )))
-        .expect("extension dispatch should not validate unrelated transport config");
-
-        assert_eq!(
-            config.extensions.commands.get("foo"),
-            Some(&ExtensionCommand {
-                program: "cue-foo".into(),
-                description: None,
-            })
+        .expect_err("removed transport config must not survive the hard cut");
+        assert!(
+            format!("{error:#}").contains("unknown top-level client config section `transport`")
         );
     }
 

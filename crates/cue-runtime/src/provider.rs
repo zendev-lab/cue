@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use cue_core::vnext::{ExecutionProjection, FactDraft, FactEvent, OutputStream, Pipeline, Scope};
 use cue_core::{EventId, ExecutionId, ScopeHash, StepId};
+use cue_core::{ExecutionProjection, FactDraft, FactEvent, OutputStream, Pipeline, Scope};
 use thiserror::Error;
 
 use crate::{Assembly, AssemblyManifest, ProviderId, RuntimePort};
@@ -111,7 +111,7 @@ pub trait OutputStore: Send + Sync {
 pub struct SpawnRequest {
     pub step: StepId,
     pub pipeline: Pipeline,
-    pub io: cue_core::vnext::IoMode,
+    pub io: cue_core::IoMode,
     pub scope: Scope,
 }
 
@@ -188,17 +188,17 @@ impl TerminalSize {
 
 #[derive(Clone)]
 pub struct RunControl {
-    pub(crate) mode: cue_core::vnext::IoMode,
+    pub(crate) mode: cue_core::IoMode,
     pub(crate) sender: tokio::sync::mpsc::Sender<RunControlCommand>,
 }
 
 impl RunControl {
-    pub async fn terminate(&self, mode: cue_core::vnext::CancelMode) -> Result<(), RuntimeError> {
+    pub async fn terminate(&self, mode: cue_core::CancelMode) -> Result<(), RuntimeError> {
         self.request(RunControlRequest::Terminate(mode)).await
     }
 
     pub async fn input(&self, data: Vec<u8>) -> Result<(), RuntimeError> {
-        if self.mode != cue_core::vnext::IoMode::Pty {
+        if self.mode != cue_core::IoMode::Pty {
             return Err(RuntimeError::new(
                 RuntimeErrorKind::Unsupported,
                 "captured runs do not accept terminal input",
@@ -208,7 +208,7 @@ impl RunControl {
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<(), RuntimeError> {
-        if self.mode != cue_core::vnext::IoMode::Pty {
+        if self.mode != cue_core::IoMode::Pty {
             return Err(RuntimeError::new(
                 RuntimeErrorKind::Unsupported,
                 "captured runs do not have a terminal size",
@@ -232,7 +232,7 @@ impl RunControl {
 }
 
 pub(crate) enum RunControlRequest {
-    Terminate(cue_core::vnext::CancelMode),
+    Terminate(cue_core::CancelMode),
     Input(Vec<u8>),
     Resize(TerminalSize),
 }
@@ -485,7 +485,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    use cue_core::vnext::{AbsolutePath, Argv, FileModeMask, IoMode, Pipeline, Process};
+    use cue_core::{AbsolutePath, Argv, FileModeMask, IoMode, Pipeline, Process};
 
     use super::*;
     use crate::{Composition, ProviderSpec, canonical_port_specs, runtime_root_ports};

@@ -377,7 +377,7 @@ mod tests {
             OsString::from("list"),
         ])
         .expect_err("cue target should not be supported");
-        assert!(format!("{error:#}").contains("`cue target` is not supported"));
+        assert!(format!("{error:#}").contains("not part of the execution kernel"));
         assert!(format!("{error:#}").contains("CUE_SOCKET"));
     }
 

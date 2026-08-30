@@ -1,11 +1,11 @@
-//! SQLite-backed vNext execution, scope, fact, and idempotency store.
+//! SQLite-backed execution, scope, fact, and idempotency store.
 //!
 //! This provider owns a fresh schema. It never opens, imports, or mutates the
-//! IPC v3 database; the daemon hard cut archives that database separately.
+//! IPC v3 database; the daemon archives that database separately.
 
-use cue_core::vnext::{Execution, ExecutionState, Fact, FactEvent, Scope, StepState};
-pub use cue_core::vnext::{ExecutionProjection as StoredExecution, FactDraft};
 use cue_core::{EventId, ExecutionId, ScopeHash};
+use cue_core::{Execution, ExecutionState, Fact, FactEvent, Scope, StepState};
+pub use cue_core::{ExecutionProjection as StoredExecution, FactDraft};
 use cue_protocol::{ClientId, Command, OperationId, ResponsePayload};
 use rusqlite::{Connection, OptionalExtension as _};
 use thiserror::Error;
@@ -46,9 +46,9 @@ CREATE TABLE operations (
 ) WITHOUT ROWID;
 "#;
 
-const CLIENT_HASH_DOMAIN: &[u8] = b"cue-vnext-client-id\0";
-const OPERATION_HASH_DOMAIN: &[u8] = b"cue-vnext-operation-id\0";
-const COMMAND_HASH_DOMAIN: &[u8] = b"cue-vnext-command\0";
+const CLIENT_HASH_DOMAIN: &[u8] = b"cue-v4-client-id\0";
+const OPERATION_HASH_DOMAIN: &[u8] = b"cue-v4-operation-id\0";
+const COMMAND_HASH_DOMAIN: &[u8] = b"cue-v4-command\0";
 
 pub struct Store {
     connection: Connection,
@@ -508,7 +508,7 @@ fn commit_projection(
                     value: raw_event_id,
                 }
             })?)
-            .expect("SQLite AUTOINCREMENT event ids are non-zero"),
+            .map_err(StoreError::InvalidCoreId)?,
             occurred_at_ms: draft.occurred_at_ms,
             fact: draft.fact.clone(),
         });
@@ -875,7 +875,7 @@ pub enum StoreError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    InvalidSnapshot(#[from] cue_core::vnext::ExecutionError),
+    InvalidSnapshot(#[from] cue_core::ExecutionError),
     #[error(transparent)]
     InvalidCoreId(#[from] cue_core::id::ParseIdError),
     #[error("database schema {actual} is newer than supported schema {supported}")]
@@ -938,7 +938,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cue_core::StepId;
-    use cue_core::vnext::{
+    use cue_core::{
         AbsolutePath, Argv, EnvKey, EnvValue, ExecutionPlan, ExecutionSpec, FileModeMask, IoMode,
         Pipeline, Process, StepFailure, StepState,
     };
