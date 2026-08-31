@@ -72,6 +72,14 @@ hooks = [{ id = "zendev-commit-msg", stages = ["commit-msg"] }]
 repo = "local"
 hooks = [
   {
+    id = "cue-fp",
+    name = "cue feature proposals",
+    entry = "just proposal-check",
+    language = "system",
+    pass_filenames = false,
+    stages = ["pre-commit"]
+  },
+  {
     id = "cargo-fmt",
     name = "cargo-fmt",
     entry = "cargo fmt --all --",

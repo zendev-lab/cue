@@ -149,7 +149,12 @@ leaves the old data untouched if publication or import fails.
 
 ## Development
 
+Changes to Cue's public contracts start with a numbered
+[Feature Proposal](fps/README.md). Candidate proposals live directly in `fps/`;
+there is no separate drafts directory.
+
 ```bash
+just proposal-check
 just check
 just test
 just msrv

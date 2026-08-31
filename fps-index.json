@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "fps": [
+    {
+      "fp": 0,
+      "id": "FP-0000",
+      "path": "fps/FP-0000-governance.md",
+      "title": "Cue 功能提案治理",
+      "type": "Governance",
+      "authors": [
+        "zrr1999"
+      ],
+      "created": "2026-08-31",
+      "supersedes": [],
+      "superseded_by": []
+    }
+  ]
+}

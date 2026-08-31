@@ -1,0 +1,64 @@
+version = 1
+
+[proposal]
+prefix = "FP"
+number_field = "fp"
+documents_dir = "fps"
+schema = "schemas/fp.schema.json"
+index = "fps-index.json"
+metadata_title = "plain"
+
+[templates]
+Feature = "templates/fp.md"
+Governance = "templates/fp.md"
+
+[graph]
+fields = ["supersedes"]
+
+[index]
+version = 1
+entries_key = "fps"
+include_drafts = false
+
+[[index.fields]]
+name = "fp"
+source = "metadata"
+key = "fp"
+
+[[index.fields]]
+name = "id"
+source = "identifier"
+
+[[index.fields]]
+name = "path"
+source = "path"
+
+[[index.fields]]
+name = "title"
+source = "metadata"
+key = "title"
+
+[[index.fields]]
+name = "type"
+source = "metadata"
+key = "type"
+
+[[index.fields]]
+name = "authors"
+source = "metadata"
+key = "authors"
+
+[[index.fields]]
+name = "created"
+source = "metadata"
+key = "created"
+
+[[index.fields]]
+name = "supersedes"
+source = "metadata"
+key = "supersedes"
+
+[[index.fields]]
+name = "superseded_by"
+source = "inverse"
+key = "supersedes"

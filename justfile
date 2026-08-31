@@ -2,6 +2,18 @@
 default:
     @just --list
 
+# Validate Feature Proposals and their committed index.
+proposal-check:
+    uvx --from 'git+https://github.com/zendev-lab/zendev.git@4690043b4253f044e98c0b4b7eeeece476929ed7' zendev-proposal check
+
+# Check that the committed Feature Proposal index is current.
+proposal-index-check:
+    uvx --from 'git+https://github.com/zendev-lab/zendev.git@4690043b4253f044e98c0b4b7eeeece476929ed7' zendev-proposal index --check
+
+# Regenerate the committed Feature Proposal index.
+proposal-index-write:
+    uvx --from 'git+https://github.com/zendev-lab/zendev.git@4690043b4253f044e98c0b4b7eeeece476929ed7' zendev-proposal index --write
+
 # Format all code
 format:
     just --fmt --unstable
