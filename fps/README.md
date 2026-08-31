@@ -12,9 +12,8 @@ FP pull request 复用仓库统一中文模板和 `zendev` title profile。title
 `docs(fp)` scope，并以 `propose`、`revise` 或 `supersede` 表达本次文档变更；这些
 动词是评审惯例，不是机器状态。
 
-提交的[索引](../fps-index.json)由提案 frontmatter 确定性生成，可用以下命令检查：
+提交的[索引](../fps-index.json)由提案 frontmatter 确定性生成，并通过 prek 统一检查：
 
-```console
-$ just proposal-check
-$ just proposal-index-check
+```shell
+just pre-commit
 ```

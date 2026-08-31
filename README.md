@@ -154,7 +154,6 @@ Changes to Cue's public contracts start with a numbered
 there is no separate drafts directory.
 
 ```bash
-just proposal-check
 just check
 just test
 just msrv
