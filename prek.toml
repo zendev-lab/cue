@@ -74,7 +74,7 @@ hooks = [
   {
     id = "cue-fp",
     name = "cue feature proposals",
-    entry = "just proposal-check",
+    entry = "uvx --from git+https://github.com/zendev-lab/zendev.git@4690043b4253f044e98c0b4b7eeeece476929ed7 zendev-proposal check",
     language = "system",
     pass_filenames = false,
     stages = ["pre-commit"]
