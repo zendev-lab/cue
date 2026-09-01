@@ -32,41 +32,176 @@ transport 和 UI 状态，导致同一执行在 Core、daemon actor、client 与
 
 ### Kernel ADT
 
-`Scope` 是 `cwd × env × umask` 的完整、不可变快照，并由内容哈希标识。它只包含可
-持久、可继承的 shell-like 状态；stdio、PTY、credentials、resource limits、sandbox
-与 workspace realization 不属于 Scope。
+Core 的完整值结构是以下乘积类型与和类型。`×` 表示所有字段必须同时存在，`+` 表示
+只能选择一个 variant：
 
-`ExecutionPlan` 只有四个封闭 variant：
+```text
+Env             = Map<EnvKey, EnvValue>
+EnvPatch        = Map<EnvKey, EnvEdit>
+EnvEdit         = Set(EnvValue) + Unset
 
-- `Builtin`：仅包含 `Cd`、`Env`、`Umask`，成功时产生新的 Scope。
-- `Run`：执行一个非空 Pipeline，成功或失败都保持输入 Scope。
-- `Sequence`：按 `OnSuccess`、`OnFailure` 或 `Always` 选择后继，并把前项输出 Scope
-  传给实际运行的后继。
-- `Parallel`：以 `All` 或 `AnySuccess` join 多个分支；每个分支获得相同输入 Scope，
-  分支 Scope 永不隐式合并。
+Scope           = AbsolutePath × Env × FileModeMask
+ExecutionSpec   = ScopeHash × ExecutionPlan
 
-每个 `Builtin` 与 `Run` leaf 按 plan preorder 获得稳定 `StepId`。Step 状态限制为
-`Pending`、`Running`、`Succeeded`、`Failed`、`Skipped`、`Cancelled`；reducer 是
-Execution 状态、持久 facts 和待执行 action 的唯一状态转换 owner。
+ExecutionPlan   = Builtin(BuiltinCommand)
+                + Run(Pipeline × IoMode)
+                + Sequence(ExecutionPlan × ExecutionPlan × SequenceCondition)
+                + Parallel(ParallelBranches × ParallelJoin)
 
-Pipeline 用 `first + rest(link, next)` 表示，使 process 与 pipe link 的数量关系无法
-构造错误。link 显式描述前一 process 的哪个输出连接到后一 process 的 stdin。
-`Run` 持有 `Captured | Pty` I/O 模式；一个 PTY Run/Pipeline 只有一个 terminal
-endpoint，builtin 不拥有 stdio 或 PTY。
+BuiltinCommand  = Cd(CdPath)
+                + Env(EnvMutation)
+                + Umask(FileModeMask)
+
+SequenceCondition = Success + Failure + Always
+ParallelJoin      = All + AnySuccess
+IoMode            = Captured + Pty
+
+ParallelBranches  = Vec>=2<ExecutionPlan>
+Pipeline          = Process × List<PipeContinuation>
+PipeContinuation  = PipeLink × Process
+PipeLink          = StdoutToStdin
+                  + StderrToStdin
+                  + StdoutAndStderrToStdin
+Process           = Argv × EnvPatch
+Argv              = NonEmpty<NulFreeString>
+
+AbsolutePath      = Path where is_absolute && !contains_nul
+CdPath            = Path where !is_empty && !contains_nul
+FileModeMask      = u16 where value & !0o777 == 0
+EnvKey            = String where !is_empty && !contains('=') && !contains_nul
+EnvValue          = String where !contains_nul
+```
+
+对应的执行树骨架是：
+
+```rust
+enum ExecutionPlan {
+    Builtin {
+        command: BuiltinCommand,
+    },
+    Run {
+        pipeline: Pipeline,
+        io: IoMode,
+    },
+    Sequence {
+        first: Box<ExecutionPlan>,
+        then: Box<ExecutionPlan>,
+        when: SequenceCondition,
+    },
+    Parallel {
+        branches: ParallelBranches,
+        join: ParallelJoin,
+    },
+}
+```
+
+这里有几项由结构直接保证的不变量：
+
+- `Scope` 是 `cwd × env × umask` 的完整、不可变快照，并由内容哈希标识；不存在
+  `parent`、`delta` 或未说明的环境来源。
+- `BuiltinCommand` 恰好三个 variant；`EnvMutation` 至少包含一项 edit。同一个 EnvKey
+  在 Map 中只能对应 `Set(value)` 或 `Unset` 之一，无法同时 set 与 unset。
+- `Argv` 至少包含一个非空 executable，所有 word 都不得含 NUL；`Pipeline` 总有 `first`
+  process，之后每增加一个 process 就必须同时增加一个 `(link, next)`，因此不存在悬空
+  link 或长度软约束。
+- `ParallelBranches` 至少有两个分支。extension 可以替换 leaf 的实现机制，但不能增加
+  `ExecutionPlan`、`BuiltinCommand`、`PipeLink` 或 `IoMode` variant。
+- stdio、PTY、credentials、resource limits、sandbox 与 workspace realization 不属于
+  Scope；`Run` 持有 I/O 模式，一个 PTY Run/Pipeline 只有一个 terminal endpoint，
+  builtin 不拥有 stdio 或 PTY。
+
+Scope 流向由 plan variant 唯一决定：
+
+| Plan | 子项输入 Scope | Plan 输出 Scope |
+|---|---|---|
+| `Builtin(command)` | 输入 `S` | 成功时为 `apply(command, S)`；失败时为 `S` |
+| `Run(pipeline, io)` | 输入 `S` | 始终为 `S` |
+| `Sequence(first, then, when)` | `first` 得到 `S`；被选择的 `then` 得到 `first` 的输出 | 实际执行路径的最终 Scope |
+| `Parallel(branches, join)` | 每个 branch 都得到同一个 `S` | `S`；分支 Scope 永不隐式合并 |
+
+`SequenceCondition::Success`、`Failure`、`Always` 分别在 first 成功、失败、任意非
+`Skipped` 终态后选择 then；未选择的 leaf 标记 `Skipped`。`ParallelJoin::All` 等待所有分支，
+`AnySuccess` 在首个成功分支出现后取消或跳过其余分支，但两种 join 都不合并 Scope。
+
+### Reducer ADT
+
+Plan 是静态结构；运行中的唯一持久状态由下列 ADT 表示：
+
+```text
+ExecutionSnapshot = ExecutionId
+                  × ExecutionSpec
+                  × Vec<StepRecord>
+                  × Option<ExecutionCancelReason>
+
+StepRecord       = StepId
+                 × StepState
+                 × Option<InputScopeHash>
+                 × Option<OutputScopeHash>
+
+StepState        = Pending
+                 + Running
+                 + Succeeded
+                 + Failed(StepFailure)
+                 + Skipped(SkipReason)
+                 + Cancelled(StepCancelReason)
+
+StepAction       = Builtin(BuiltinCommand)
+                 + Run(Pipeline × IoMode)
+
+ExecutionTransition = Vec<ReadyStep>
+                    × Vec<StepIdToCancel>
+                    × Vec<NewScope>
+```
+
+每个 `Builtin` 与 `Run` leaf 按 plan preorder 获得稳定 `StepId`；组合节点本身不是 Step。
+`input_scope` 只在 reducer 把 leaf 推进为 ready 时写入；完成的 `Builtin`/`Run` 才有
+`output_scope`，`Skipped`/`Cancelled` 保持为空。reducer 读取 Snapshot 和 typed completion，
+原子地产生新 Snapshot、facts 与 `ExecutionTransition`；runtime 只能实现 `StepAction` 并
+回报结果，不能自行决定分支、跳过规则或 Scope 流向。
 
 ### Surface language
 
 文本 DSL 在 `cue-language` 中编译为 Core ADT，Core 不保存 token、mode 或语法糖。
-环境前缀的定义是：
+环境前缀的语法与编译规则是：
 
 ```text
-A=B command arg
+assignment = [A-Za-z_][A-Za-z0-9_]* "=" value
+process    = assignment* command-word argument*
 ```
 
-只把 `A=B` 编译为该 process 的 `EnvPatch`。它不影响同一 pipeline 的其他 process，
-也不改变后续 Sequence 的 Scope；`command A=B` 是普通 argv，只有 assignment 而没有
-command 的输入非法。需要跨多项共享环境时，surface construct 必须显式表示 lexical
-scope，并在编译时展开，不能引入运行时的左到右环境继承。
+只连续识别 command 前的 assignment，并在第一个 `=` 处分隔 key/value；value 可以为空或
+包含 `=`，不做 `$VAR`、命令替换或其他 shell 展开。同一 key 重复出现时最后一项生效。
+所得 Map 编译为该 process 的 `EnvPatch`。它不影响同一 pipeline 的其他 process，也不
+改变后续 Sequence 的 Scope；command 后的 `A=B` 是普通 argv，只有 assignment 而没有
+command 的输入非法，assignment 也不能修饰 Cue builtin。需要跨多项共享环境时，surface
+construct 必须显式表示 lexical scope，并在编译时展开，不能引入运行时的左到右环境继承。
+
+例如：
+
+```text
+A=left printenv A |> grep left
+
+=> Run(
+     Pipeline(
+       Process(["printenv", "A"], {A: Set("left")}),
+       [(StdoutToStdin, Process(["grep", "left"], {}))]
+     ),
+     Captured
+   )
+```
+
+第二个 process 的 EnvPatch 为空；它只从执行输入 Scope 取环境，不从第一个 process
+继承 `A`。与此不同，显式 builtin 会产生新 Scope：
+
+```text
+env set A=left -> printenv A
+
+=> Sequence(
+     Builtin(Env({A: Set("left")})),
+     Run(Pipeline(Process(["printenv", "A"], {}), []), Captured),
+     Success
+   )
+```
 
 `cd`、`env set/unset` 与 `umask` 编译为三个 Core builtin。schedule、retry、resource、
 approval、session 与 remote target 命令可以由外部 producer 或 extension 提供，但不
