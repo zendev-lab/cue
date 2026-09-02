@@ -13,6 +13,19 @@
       "created": "2026-08-31",
       "supersedes": [],
       "superseded_by": []
+    },
+    {
+      "fp": 1,
+      "id": "FP-0001",
+      "path": "fps/FP-0001-structured-execution-kernel.md",
+      "title": "Cue 结构化执行内核与 IPC v4",
+      "type": "Feature",
+      "authors": [
+        "zrr1999"
+      ],
+      "created": "2026-09-01",
+      "supersedes": [],
+      "superseded_by": []
     }
   ]
 }
