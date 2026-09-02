@@ -67,6 +67,7 @@ hooks = [
 repo = "https://github.com/zendev-lab/zendev"
 rev = "v0.2.0"
 hooks = [
+  { id = "zendev-proposal-index" },
   { id = "zendev-proposal", stages = ["pre-commit"] },
   { id = "zendev-commit-msg", stages = ["commit-msg"] },
 ]
