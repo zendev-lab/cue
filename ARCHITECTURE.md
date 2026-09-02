@@ -14,6 +14,7 @@ ExecutionSpec + session scope + launch context
 
 Start with:
 
+- [Feature Proposal governance](fps/FP-0000-governance.md)
 - [Design index](docs/design/README.md)
 - [Core types](docs/design/core-types.md)
 - [Daemon architecture](docs/design/daemon-architecture.md)

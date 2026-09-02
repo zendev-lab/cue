@@ -2,6 +2,8 @@
 
 These documents describe the IPC v3 execution runtime. Source types and strict
 wire validators remain authoritative when prose and code disagree.
+Changes to the public contract are governed by
+[FP-0000](../../fps/FP-0000-governance.md).
 
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
