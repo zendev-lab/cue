@@ -14,41 +14,68 @@ supersedes: []
 
 Cue 收敛为持久、可观察的本地结构化进程执行内核。Core 使用封闭的
 `ExecutionPlan` 定义执行语义，以内容寻址的 `Scope` 在线性组合中传递状态；运行时
-通过启动时 Composition 连接可替换机制。daemon 只提供严格 IPC v4，不在 kernel
-内拥有 session、schedule、retry、resource、approval 或远程 target policy。
+通过启动时 Composition 连接可替换的实现机制。daemon 只提供严格 IPC v4，不在内核
+中拥有 session、schedule、retry、resource、approval 或远程 target policy。
 
-Core 的 reducer 只决定状态、事实与待实现的 effect intent；daemon 必须先把新的
-projection、facts 与 effect outbox 原子提交，再允许 runtime realization。外部副作用的
-“请求发生”与“结果已经发生”是两个不同事实，尤其 cancellation 不能在发出 signal 前
-提前写成 terminal `Cancelled`。
+本提案区分三类东西：
+
+1. **语义状态**：`ExecutionPlan`、`StepState`、`Scope` 等，由 Core 定义；
+2. **运行时动作**：Core 已决定、但尚未在操作系统中完成的动作，例如启动或取消 Step；
+3. **运行时结果**：动作实际完成后返回 Core 的结果，例如成功、失败或取消完成。
+
+状态变化与待执行动作必须先持久化，动作之后才能真正执行。运行时结果再次进入 reducer，
+成为下一次状态变化的输入。这样“请求发生”和“结果已经发生”不会被混为一个事实。
 
 ## 动机
 
 旧模型同时承载 surface DSL、进程启动、session 生命周期、调度、资源分配、远程
-transport 和 UI 状态，导致同一执行在 Core、daemon actor、client 与持久化层具有
-不同表示。环境变量是当前命令局部覆盖还是沿 pipeline 继承、pipe 属性属于哪一端、
-`cd` 是否改变后续命令、PTY 属于 process 还是 workflow 等问题都缺少唯一答案。
+transport 和 UI 状态，导致同一执行在 Core、daemon、client 与持久化层具有不同表示。
+环境变量是当前命令局部覆盖还是沿 pipeline 继承、pipe 属性属于哪一端、`cd` 是否改变
+后续命令、PTY 属于 process 还是 workflow 等问题都缺少唯一答案。
 
 公开执行语义必须足够小，才能由纯 reducer 决定状态变化并稳定持久化；实现机制必须
-保持开放，才能替换 process spawner、scope store、output store 等 provider。二者
-需要明确分层，而不是用兼容 variant、service locator 或双协议继续扩大 Core。
+保持开放，才能替换 process spawner、scope store、output store 等 provider。二者需要
+明确分层，而不是用兼容 variant、service locator 或双协议继续扩大 Core。
 
-持久化事实还必须与不可事务化的 OS 副作用划清边界。`spawn`、signal、PTY control
-不能和 SQLite commit 组成一个 ACID transaction，因此不能先把 effect 的预期结果写成
-事实再“尽力实现”。Cue 使用 durable effect outbox 保存已经提交的 realization intent，
-runtime completion 再作为新的 typed input 回到 reducer；这样 durable projection 永远只
-描述已经由 reducer 接受的事实，而不把未完成的副作用伪装成事实。
+另外，`spawn`、signal、PTY control 等操作系统动作不能与 SQLite 提交组成一个 ACID
+事务。如果先把预期结果写成事实，再“尽力执行”外部动作，就会出现持久状态已经终止、
+现实进程却仍在运行等错误。因此本提案把“状态转换”和“运行时动作”显式分开。
+
+## 术语与定义
+
+| 术语 | 定义 |
+|---|---|
+| **执行计划 `ExecutionPlan`** | Core 中封闭的执行树，只描述 Cue 允许的执行组合语义。 |
+| **执行范围 `Scope`** | `cwd × env × umask` 的完整不可变快照，由内容哈希标识。 |
+| **步骤 `Step`** | `Builtin` 或 `Run` 叶子。组合节点本身不是 Step。 |
+| **归约器 `reducer`** | 纯状态转换函数。读取当前快照和一个已确认输入，计算下一快照、事实及待执行动作。 |
+| **事实 `Fact`** | 已由 reducer 接受并持久化的状态变化记录；不能描述尚未完成的外部动作结果。 |
+| **运行时动作 `RuntimeAction`** | reducer 要求 runtime 实现的外部动作，例如 `RealizeStep`、`CancelStep`。它不是代数效应系统中的 effect handler。 |
+| **运行时结果 `RunCompletion`** | runtime 对一个已发生执行尝试的最终报告，例如成功、失败或取消完成。 |
+| **执行尝试 `attempt`** | 一个 Step 的一次物理实现，例如一组实际操作系统进程。当前 Execution 内不隐式 retry。 |
+| **实现机制 `realization`** | 把 Core 的语义动作落实为实际进程、PTY、workspace、resource 等物理行为。 |
+| **事务发件箱 `Transactional Outbox`** | 一种持久化实现方式：在同一数据库事务中写入状态和“之后要执行的动作”，提交后再由 dispatcher 执行动作。 |
+| **静止 `quiescent`** | 某个执行尝试已经确定不再运行，也不会再产生属于该尝试的活动进程。 |
+| **进程监护器 `guardian`** | 可选实现机制：独立于 daemon 持有子进程所有权，在 daemon 异常退出时负责终止并回收其进程。它不是 Core 概念。 |
+| **操作标识 `OperationId`** | 一个逻辑 IPC Command 的稳定身份，用于断线重连后的幂等重放。 |
+| **敏感值 `Sensitive`** | 不允许进入持久存储的环境值分类；安全性不能仅靠变量名猜测。 |
+| **易失执行 `Volatile Execution`** | 含敏感值的 Execution；其 Scope、projection、facts、operation outcome 等仅存在于内存。 |
+
+本文中的 `effect` 若用于一般说明，仅表示“对外部世界产生的副作用”。规范数据结构统一
+使用“运行时动作 `RuntimeAction`”，避免与程序语言中的**代数效应（algebraic effects）**
+混淆。代数效应是一种用 effect operation、handler、resumption 等结构描述和解释计算效应的
+语言机制；Cue 当前的 `RuntimeAction` 只是 reducer 与 runtime 之间的动作协议，并未引入
+这套语言级机制。
 
 ## 设计
 
 ### Kernel ADT
 
-Core 的完整值结构是以下乘积类型与和类型。`×` 表示所有字段必须同时存在，`+` 表示
-只能选择一个 variant：
+Core 的主要值结构如下。`×` 表示所有字段同时存在，`+` 表示和类型的不同 variant：
 
 ```text
-ValueClass      = Persistable + Sensitive
-EnvValue        = NulFreeString × ValueClass
+Sensitivity     = Normal + Sensitive
+EnvValue        = NulFreeString × Sensitivity
 Env             = Map<EnvKey, EnvValue>
 EnvPatch        = Map<EnvKey, EnvEdit>
 EnvEdit         = Set(EnvValue) + Unset
@@ -77,72 +104,40 @@ PipeLink          = StdoutToStdin
                   + StdoutAndStderrToStdin
 Process           = Argv × EnvPatch
 Argv              = NonEmpty<NulFreeString>
-
-AbsolutePath      = Path where is_absolute && !contains_nul
-CdPath            = Path where !is_empty && !contains_nul
-FileModeMask      = u16 where value & !0o777 == 0
-EnvKey            = String where !is_empty && !contains('=') && !contains_nul
 ```
 
-对应的执行树骨架是：
+结构本身保证以下不变量：
 
-```rust
-enum ExecutionPlan {
-    Builtin {
-        command: BuiltinCommand,
-    },
-    Run {
-        pipeline: Pipeline,
-        io: IoMode,
-    },
-    Sequence {
-        first: Box<ExecutionPlan>,
-        then: Box<ExecutionPlan>,
-        when: SequenceCondition,
-    },
-    Parallel {
-        branches: ParallelBranches,
-        join: ParallelJoin,
-    },
-}
-```
+- `Scope` 是完整快照，不存在隐含 `parent`、`delta` 或 ambient environment；
+- Core builtin 恰好是 `Cd`、`Env`、`Umask`；
+- `Pipeline` 每增加一个 process 必须同时带一个 link，不存在 `processes + links` 长度软约束；
+- `ParallelBranches` 至少两个分支；
+- extension 可以替换实现机制，但不能增加 `ExecutionPlan`、`BuiltinCommand`、`PipeLink`
+  或 `IoMode` variant；
+- `Sensitive` 是值的显式分类。变量名 heuristic 可以辅助自动标注或警告，但不能作为
+  “不落盘”的安全边界。
 
-这里有几项由结构直接保证的不变量：
+### Scope 与组合语义
 
-- `Scope` 是 `cwd × env × umask` 的完整、不可变快照，并由内容哈希标识；不存在
-  `parent`、`delta` 或未说明的环境来源。
-- `BuiltinCommand` 恰好三个 variant；`EnvMutation` 至少包含一项 edit。同一个 EnvKey
-  在 Map 中只能对应 `Set(value)` 或 `Unset` 之一，无法同时 set 与 unset。
-- `Argv` 至少包含一个非空 executable，所有 word 都不得含 NUL；`Pipeline` 总有 `first`
-  process，之后每增加一个 process 就必须同时增加一个 `(link, next)`，因此不存在悬空
-  link 或长度软约束。
-- `ParallelBranches` 至少有两个分支。extension 可以替换 leaf 的实现机制，但不能增加
-  `ExecutionPlan`、`BuiltinCommand`、`PipeLink` 或 `IoMode` variant。
-- stdio、PTY、credentials、resource limits、sandbox 与 workspace realization 不属于
-  Scope；`Run` 持有 I/O 模式，一个 PTY Run/Pipeline 只有一个 terminal endpoint，
-  builtin 不拥有 stdio 或 PTY。
-- `Sensitive` 是显式数据分类，不由 store 根据变量名猜测。变量名 heuristic 可以作为
-  frontend 警告或自动标注辅助，但不能成为“不落盘”的安全边界。
-
-Scope 流向由 plan variant 唯一决定：
+Scope 流向只由 plan variant 决定：
 
 | Plan | 子项输入 Scope | Plan 输出 Scope |
 |---|---|---|
-| `Builtin(command)` | 输入 `S` | 成功时为 `apply(command, S)`；失败时为 `S` |
+| `Builtin(command)` | 输入 `S` | 成功为 `apply(command, S)`；失败为 `S` |
 | `Run(pipeline, io)` | 输入 `S` | 始终为 `S` |
-| `Sequence(first, then, when)` | `first` 得到 `S`；被选择的 `then` 得到 `first` 的输出 | 实际执行路径的最终 Scope |
-| `Parallel(branches, join)` | 每个 branch 都得到同一个 `S` | `S`；分支 Scope 永不隐式合并 |
+| `Sequence(first, then, when)` | `first` 得到 `S`；被选择的 `then` 得到 `first` 输出 | 实际执行路径的最终 Scope |
+| `Parallel(branches, join)` | 每个 branch 都得到同一个 `S` | `S`；分支 Scope 不隐式合并 |
 
 `SequenceCondition::Success`、`Failure`、`Always` 分别在 first 成功、失败、任意非
-`Skipped` 终态后选择 then；未选择的 leaf 标记 `Skipped`。`ParallelJoin::All` 等待所有分支，
-`AnySuccess` 在首个成功分支出现后请求取消或跳过其余分支，但两种 join 都不合并 Scope。
-`AnySuccess` 的逻辑 winner 可以先确定；整个 Parallel 只有在仍运行或取消中的 loser 都
-进入 terminal state 后才成为 terminal，structured scope 不允许留下仍归属于该执行的
-orphan work。
+`Skipped` 终态后选择 then。未选择的叶子标记 `Skipped`。
 
-### Reducer ADT
+`ParallelJoin::All` 等待所有分支。`AnySuccess` 在出现首个成功分支后，跳过尚未启动的
+loser，并请求取消仍在运行的 loser。逻辑 winner 可以先确定，但整个 Parallel 只有在所有
+已启动 loser 都进入终态后才成为终态，因此结构化执行不会遗留仍归属于该节点的活动进程。
 
-Plan 是静态结构；运行中的唯一持久状态由下列 ADT 表示：
+### Reducer 与取消语义
+
+运行中的主要状态为：
 
 ```text
 ExecutionSnapshot = ExecutionId
@@ -172,154 +167,124 @@ ExecutionState   = Pending
                  + Failed
                  + Cancelled(ExecutionCancelReason)
 
-StepAction       = Builtin(BuiltinCommand)
-                 + Run(Pipeline × IoMode)
-
-EffectIntent     = RealizeStep(ReadyStep)
+RuntimeAction    = RealizeStep(ReadyStep)
                  + CancelStep(StepId × StepCancelReason × CancelMode)
-
-ExecutionTransition = NextExecutionSnapshot
-                    × Vec<FactDraft>
-                    × Vec<NewScope>
-                    × Vec<EffectIntent>
 ```
 
-每个 `Builtin` 与 `Run` leaf 按 plan preorder 获得稳定 `StepId`；组合节点本身不是 Step。
-`input_scope` 只在 reducer 把 leaf 推进为 active realization 时写入；完成的
-`Builtin`/`Run` 才有 `output_scope`，`Skipped`/`Cancelled` 保持为空。
-
-`Running` 表示该 Step 已拥有一个已提交的 realization attempt；对应 OS process 可能仍在
-launch handshake 内。`Cancelling` 表示 reducer 已接受 cancellation intent，但 runtime
-尚未报告 terminal completion。`Cancelled` 只表示 runtime 已确认该 attempt 因 cancellation
-结束，或一个尚未 realization 的 Pending step 被取消而无需执行外部副作用。
+`Running` 表示一个物理执行尝试已经被提交为需要实现；它可以仍处于启动过程中。
+`Cancelling` 表示 reducer 已接受取消请求，但 runtime 尚未报告该 attempt 的最终结果。
+`Cancelled` 才表示该 attempt 已确认因取消而结束，或 Pending Step 在从未启动的情况下被
+用户取消。
 
 取消遵循以下规则：
 
-- Pending step 被 execution cancel 选中时可以直接进入 `Cancelled`；它没有需要清理的
-  realization。被条件或 `AnySuccess` 选出的 Pending loser 进入 `Skipped`。
-- Running step 收到用户 cancel 或 `AnySuccess` loser 决策时进入 `Cancelling`，并产生
-  `CancelStep` effect；不得提前进入 terminal `Cancelled`。
-- `Cancelling` 后 runtime 若报告正常成功，则进入 `Succeeded`；若报告正常失败，则进入
-  `Failed`；只有 runtime 报告 cancellation completion 时才进入 `Cancelled`。Cue 的
-  cancellation 是 best-effort intent，不要求 signal 一定抢赢进程的自然完成。
-- 同一状态下重复的同级 cancellation intent 是幂等的；`Force` 可以强化此前的
-  `Graceful` cancellation，并产生新的强化 effect。
-- race 只由 reducer 接受输入的顺序决定，不按墙钟时间猜测。若 terminal completion
-  先被 commit，之后的 cancel 是 no-op；若 cancel intent 先被 commit，则先进入
-  `Cancelling`，随后 reducer 接受的第一个 terminal completion 决定最终
-  `Succeeded`/`Failed`/`Cancelled`，后到的 stale completion 被拒绝或忽略。
+- Pending Step 被用户取消时可以直接进入 `Cancelled`；它没有需要清理的物理 attempt；
+- Pending 的 `AnySuccess` loser 进入 `Skipped`；
+- Running Step 收到取消请求后进入 `Cancelling`，并产生 `CancelStep`；
+- `Cancelling` 后如果进程仍自然成功，则进入 `Succeeded`；自然失败则进入 `Failed`；
+  只有 runtime 明确报告 cancellation completion 才进入 `Cancelled`；
+- cancellation 是 best-effort，不要求 signal 一定抢赢自然完成；
+- `Force` 可以强化先前的 `Graceful`；同等级重复请求幂等；
+- 并发 race 只由 reducer **接受并提交输入的顺序**决定，不按墙钟时间猜测；
+- 一个 Step 一旦已提交终态，之后到达的取消请求为 no-op；反之，先提交取消请求则进入
+  `Cancelling`，随后第一个被 reducer 接受的 terminal completion 决定最终状态。
 
-用户级 `ExecutionCancelRequest` 是“不要再启动新的工作”的持久 intent，不等价于 terminal
-`ExecutionState::Cancelled`。cancel 时 Pending work 被终止或选出，Running work 进入
-`Cancelling`；只要还有 active realization，Execution 对外显示 `Cancelling`。最终状态仍由
-实际 terminal Step 结果和 plan 代数决定，因此一个只有单个 Running step 的 Execution 在
-cancel signal 发出后仍自然成功时可以最终 `Succeeded`。
+用户级 `ExecutionCancelRequest` 的含义是“不要再启动新的工作”，不是“整个 Execution 已经
+取消完成”。只要还有 `Running` 或 `Cancelling` Step，对外状态就是 `Cancelling`。如果所有
+正在取消的进程最后都自然成功，Execution 可以最终 `Succeeded`。
 
-reducer 读取 Snapshot 和 typed input，纯计算出新的 Snapshot、facts、Scope 与
-`EffectIntent`；runtime 只能实现 effect 并回报 typed completion，不能自行决定分支、
-跳过规则、取消理由或 Scope 流向。
+### 状态与运行时动作的持久化边界
 
-### Durable effect outbox
-
-`spawn`、signal、PTY control 等 OS effect 无法和 SQLite projection 组成一个真正的 ACID
-transaction。Cue 因此采用 transactional outbox：**先持久化 intent，再 realization；
-realization 的结果永远通过下一次 reducer transition 成为事实。**
-
-一次 durable transition 的顺序固定为：
+reducer 在不可变快照上纯计算：
 
 ```text
-input event / command
+current snapshot + input
         |
         v
-pure reducer on an immutable snapshot
+      reducer
         |
         +--> next snapshot
         +--> facts
         +--> new scopes
-        `--> effect intents
-                 |
-                 v
-single store transaction
-  projection + facts + scopes + outbox
-  (+ OperationId claim/outcome when applicable)
-                 |
-          commit succeeds
-                 |
-        +--------+--------+
-        |                 |
-        v                 v
-publish facts       dispatch outbox effects
-                          |
-                          v
-                   runtime completion
-                          |
-                          `----> next reducer input
+        `--> RuntimeAction[]
 ```
 
-必须满足以下事务不变量：
-
-- reducer 在 immutable/clone snapshot 上计算。store commit 成功之前，不替换 daemon 的
-  live projection，不发布 facts，也不调用 runtime；commit 失败时 live state 保持原样。
-- 新 Scope 必须在任何引用其 hash 的 durable projection 同一个 transaction 中先变得可用，
-  或者整个 Execution 从提交开始就是 volatile；不能出现 durable snapshot 引用只存在于
-  memory 的 Scope。
-- command 导致状态变化时，`OperationId` claim、response outcome、projection、facts 与
-  outbox intent 属于同一个 store transaction。
-- outbox effect 只表示“应该 realization 什么”，effect 被 dispatch/ack 不会直接把 Step
-  改成成功、失败或取消；只有 typed runtime completion 能驱动 terminal reducer state。
-
-store 为每条 committed effect 分配稳定 `EffectId` 并保存 delivery 状态：
+所有持久实现都必须满足以下顺序：
 
 ```text
-EffectRecord = EffectId
-             × ExecutionId
-             × StepId
-             × EffectIntent
-             × EffectState
-
-EffectState  = Pending
-             + Dispatched(DaemonInstanceId)
-             + Completed
-             + Abandoned
+compute
+  -> atomic commit
+  -> publish committed state/facts
+  -> execute committed RuntimeAction
+  -> receive RunCompletion
+  -> next reducer input
 ```
 
-`RealizeStep` 的 `EffectId` 同时标识该 Step 的唯一 physical realization attempt；当前
-Execution 内没有隐式 retry，因此 successor 不得为同一 effect 自行制造第二个 attempt。
-dispatcher 在调用不可事务化副作用前，必须先把 `Pending` effect 原子 claim 为当前 daemon
-instance 的 `Dispatched`；同一 Step 的 effects 按 commit 顺序消费。
+因此：
 
-进程 effect 不宣称跨 daemon crash 的 exactly-once。恢复规则显式区分：
+- store commit 成功之前，不得修改 authoritative live projection；
+- store commit 成功之前，不得发布 fact；
+- store commit 成功之前，不得启动进程或发送取消 signal；
+- commit 失败时，本次 transition 对外完全不可见；
+- runtime action 被成功派发，只说明“动作已经开始实现”，不能直接产生 Step 终态；
+- 只有运行时结果才能驱动 `Succeeded`、`Failed` 或 `Cancelled`。
 
-- 尚未 claim 的 `Pending` effect 从未被允许执行，可以由 successor 继续消费；
-- 已由死亡 daemon claim、但没有 terminal completion 的 `Dispatched` process effect 处于
-  outcome unknown，successor **不得盲目 replay，也不得直接把 Step 写成 terminal failure**；
-  它必须先证明旧 realization 已经 quiescent；
-- quiescence 可以由 realization mechanism 的 crash fence/guardian 保证，也可以由稳定的
-  external attempt handle 让 successor adopt/query 后 terminate 并等待退出；只有确认旧
-  attempt 不再运行后，recovery 才能把旧 effect 标记 `Abandoned`，并向 reducer 注入结构化
-  restart interruption，由 Core 产生 infrastructure failure 与后续 Failure/Always 语义；
-- 如果 runtime 无法证明旧 attempt 已停止，daemon 必须 fail closed：该 Execution 保持
-  recovery unresolved，不发布 terminal projection，也不启动依赖它的新 work。这里不需要
-  给 Core 增加猜测性的 `Unknown` terminal state；host 在完成 effect reconciliation 前不向
-  reducer伪造 completion；
-- 未来若某类 effect 本身具有外部幂等 key，可以单独声明 replay-safe policy；不能把这一
-  假设泛化到本地 process spawn。
+#### 事务发件箱
 
-因此 outbox 保证的是 **durable intent + no-effect-before-commit + no-blind-replay**，不是凭空
-把 POSIX process 变成 exactly-once transaction。对于直接本地 spawn，runtime 必须同时提供
-crash fencing；否则 daemon crash 后可能留下失去 owner 的 process，任何“已恢复为 Failed”
-的事实都会再次领先于现实。
+满足上述不变量的一种推荐实现是**事务发件箱（Transactional Outbox）**。
 
-live daemon 为每个 active Step 建立 `RunSlot`，并在真正调用 spawner 前成为 cancel 的
-序列化点。`RunSlot` 至少能表示 launching/active/finished 与 pending cancel intent。
-因此 `Running -> Cancelling` 发生在 process control 尚未建立的窗口时，cancel 不会丢失：
-若尚未 spawn 可以抑制 realization；若 spawn 正在进行，则 control 建立后立即应用已记录的
-cancel intent。Runtime 不得用“当前 HashMap 里暂时没有 RunControl”解释为取消成功。
+可以把它理解成：数据库事务除了写“新状态”，还同时往同一个数据库里放一封“待办信”：
+
+```text
+同一个 SQLite transaction
+
+  execution = Cancelling
+  fact      = Running -> Cancelling
+  outbox    = "请向 E1/S1 发出 Force cancel"
+```
+
+只有整个事务提交后，“邮递员”才读取 outbox 并真正发送 signal。这样不会出现：
+
+```text
+状态提交失败，但 signal 已经发出
+```
+
+也不会出现：
+
+```text
+状态已经提交，但取消动作在 crash 前完全丢失且没有任何 durable 记录
+```
+
+**事务发件箱是持久层实现模式，不是新的 Core 执行代数。** 如果未来有另一种实现能证明
+同样的原子性、提交前不执行动作、恢复时不重复物理 attempt 等不变量，可以替换它。
+因此 `EffectId`、`Pending/Dispatched/Completed` 等发件箱内部状态不属于 Core 公共 ADT。
+
+### 崩溃恢复与进程所有权
+
+daemon crash 后最大的风险不是“数据库里有没有动作”，而是：旧 daemon 启动的操作系统
+进程可能仍然活着。因此恢复必须满足：
+
+> 在旧 attempt 是否仍活动无法确定时，successor 既不能盲目再次 spawn，也不能提前把该
+> Step 宣布为 terminal failure。
+
+只有确认旧 attempt 已经静止（quiescent）后，才能向 reducer 注入 restart interruption。
+如何证明静止属于 runtime 实现机制，不属于 Core 语义。可用方案例如：
+
+- **进程监护器 `guardian`**：一个独立小进程持有子进程所有权；daemon 意外退出时，
+  guardian 自动终止并回收整组进程；
+- **稳定 attempt handle**：successor 能重新定位旧 attempt，查询、接管或终止它，并等待
+  它完全退出；
+- 其他能证明“旧 attempt 不再运行”的机制。
+
+如果 runtime 无法证明旧 attempt 已静止，则恢复必须 fail closed：不启动同一 Step 的第二个
+attempt，也不启动依赖它的新工作，更不能发布虚假的 terminal fact。
+
+`guardian` 因此只是一个**可选实现例子**，不是 Cue 必须新增的核心组件。
 
 ### Surface language
 
-文本 DSL 在 `cue-language` 中编译为 Core ADT，Core 不保存 token、mode 或语法糖。
-环境前缀的语法与编译规则是：
+文本 DSL 在 `cue-language` 中编译为 Core ADT。Core 不保存 token、mode 或语法糖。
+环境前缀：
 
 ```text
 assignment = [A-Za-z_][A-Za-z0-9_]* "=" value
@@ -327,144 +292,88 @@ process    = assignment* command-word argument*
 ```
 
 只连续识别 command 前的 assignment，并在第一个 `=` 处分隔 key/value；value 可以为空或
-包含 `=`，不做 `$VAR`、命令替换或其他 shell 展开。同一 key 重复出现时最后一项生效。
-所得 Map 编译为该 process 的 `EnvPatch`。它不影响同一 pipeline 的其他 process，也不
-改变后续 Sequence 的 Scope；command 后的 `A=B` 是普通 argv，只有 assignment 而没有
-command 的输入非法，assignment 也不能修饰 Cue builtin。需要跨多项共享环境时，surface
-construct 必须显式表示 lexical scope，并在编译时展开，不能引入运行时的左到右环境继承。
+包含 `=`，不做 `$VAR`、命令替换或其他 shell 展开。同一 key 重复时最后一项生效。
 
-例如：
+`A=B command` 只产生该 Process 的 `EnvPatch`，不影响 pipeline 的其他 process，也不改变
+后续 Sequence 的 Scope。command 后的 `A=B` 是普通 argv；只有 assignment 而没有 command
+的输入非法；assignment 不能修饰 Cue builtin。
 
-```text
-A=left printenv A |> grep left
-
-=> Run(
-     Pipeline(
-       Process(["printenv", "A"], {A: Set("left")}),
-       [(StdoutToStdin, Process(["grep", "left"], {}))]
-     ),
-     Captured
-   )
-```
-
-第二个 process 的 EnvPatch 为空；它只从执行输入 Scope 取环境，不从第一个 process
-继承 `A`。与此不同，显式 builtin 会产生新 Scope：
+需要跨 Step 修改环境时必须显式使用 `Env` builtin，例如：
 
 ```text
 env set A=left -> printenv A
-
-=> Sequence(
-     Builtin(Env({A: Set("left")})),
-     Run(Pipeline(Process(["printenv", "A"], {}), []), Captured),
-     Success
-   )
 ```
 
-`cd`、`env set/unset` 与 `umask` 编译为三个 Core builtin。schedule、retry、resource、
-approval、session 与 remote target 命令可以由外部 producer 或 extension 提供，但不
-得增加 `ExecutionPlan` variant。
+### 敏感数据与持久性
 
-环境值的 sensitivity 必须随值进入 typed ADT，而不是在 store 层根据 EnvKey 反推。
-process-local `A=B` 与 `env set A=B` 和初始 Scope 使用同一种 `EnvValue` 分类。若 surface
-没有显式 secret syntax，frontend 可以提供 policy/config 决定分类；任何 heuristic 只能
-用于保守自动标注或警告，不能覆盖显式 `Sensitive`。
+初始 Scope、Process EnvPatch、Env builtin mutation 中的环境值都使用同一种 sensitivity
+分类。任意位置出现 `Sensitive`，整个 Execution 从提交开始就是 `Volatile`。
 
-### Durability 与敏感数据
+`Volatile Execution` 的 Scope、projection、facts、operation outcome 以及持久化动作记录都
+只能存在于内存，且生命周期内不能升级为 Durable。这样避免两类问题：
 
-`ExecutionDurability = Durable + Volatile` 在 submission 时由完整输入确定：初始 Scope 或
-ExecutionPlan 中任意 `Sensitive` EnvValue（包括 Process EnvPatch 与 Env builtin mutation）
-都会使整个 Execution 为 `Volatile`。该分类在 Execution 生命周期内单调不升级：volatile
-Execution 后续产生的 Scope、projection、facts、operation response 与 outbox payload 都只
-进入 memory store，即使某个后续 Scope 已不再携带 sensitive value。
+- `SECRET=x command` 的 secret 藏在 Process EnvPatch 中而被错误落盘；
+- `env set SECRET=x -> command` 在 durable execution 中途生成 SQLite 无法引用的 volatile
+  Scope。
 
-这样 `env set SECRET=... -> command` 不会先创建 durable execution 再在中途产生一个
-SQLite 无法引用的 volatile Scope；`SECRET=... command` 也不会因为 secret 位于
-Process EnvPatch 而被遗漏。durable Execution 的 reducer 产生的新 Scope 只能包含已经在
-submission 时被证明 persistable 的环境数据。
-
-真正的 credential provider 更推荐使用 opaque `SecretRef`：ref 可以进入 semantic plan，
-secret bytes 只在 realization overlay 中解析并注入，不进入 Scope、ExecutionSpec、facts、
-outbox 或 output metadata。`Sensitive EnvValue` 是需要直接传递原始环境值时的安全后备，
-不是秘密管理系统。
+变量名 heuristic 只能辅助分类，不能替代显式 sensitivity。长期更推荐 credential provider
+在 realization 阶段根据 opaque reference 注入 secret bytes，使秘密值本身不进入 semantic
+plan、Scope 或 facts。
 
 ### Composition 与运行时
 
-Execution ADT 是 closed semantics；Composition 是 open implementation graph。provider
-在 daemon bootstrap 时声明 capability、依赖和顺序，经校验后一次性绑定为 typed
-runtime ports。运行中不得按字符串查找服务，也不得让 extension 注入新的 Core
-variant。
+Execution ADT 是封闭语义；Composition 是开放实现图。provider 在 daemon bootstrap 时声明
+capability、依赖与顺序，经校验后绑定为 typed runtime ports。运行时不得按字符串 service
+locator 动态决定 Core 语义。
 
-runtime 只实现 reducer 产生的 effect：应用 builtin、启动 captured pipeline 或 PTY
-process group、写入绝对 offset output、传播 control/cancel，以及把结果回送 reducer。
-policy owner 可以生成和提交 `ExecutionSpec`，但不能接管已有 Execution 的状态转换。
-
-open realization 不等于 provider 可以重写 semantic request。Runtime boundary 分成只读的
-semantic input 与可变的 realization overlay：
+provider 可以改变**如何实现**一个 Step，但不能改变**这个 Step 的语义身份**。因此以下
+内容视为只读语义输入：
 
 ```text
-SemanticSpawn     = StepId × Pipeline × IoMode × Scope
-RealizationOverlay = PhysicalWorkspace
-                   × ResolvedExecutable
-                   × WrapperChain
-                   × ResourceHandles
-                   × SandboxHandles
-                   × RuntimeEnvInjection
-                   × ...
+StepId × Pipeline × IoMode × Scope
 ```
 
-workspace/transform provider 可以构造或修改 `RealizationOverlay`，guard 可以读取两者，但
-provider 不能修改 `StepId`、logical Pipeline/argv/EnvPatch、`IoMode` 或 logical Scope。
-需要 wrapper、workspace 映射、资源句柄或 secret injection 时，它们作为 realization
-mechanism 可观察地附加，而不是悄悄改写 Core 已持久化的 execution meaning。
+workspace、wrapper、resource handle、sandbox、secret injection 等属于物理实现上下文，可以
+由 provider 构造或修改，但 provider 不能悄悄替换 StepId、logical argv/EnvPatch、IoMode 或
+logical Scope。
 
 ### IPC、client 与 daemon
 
 IPC v4 使用严格长度前缀消息和封闭 schema。修改状态的 Command 必须携带稳定
-`OperationId` 以支持幂等重放；Query 只读。协议暴露 Scope、Execution/Step projection、
-facts、绝对 output ranges、cancel/control 和显式 PTY attachment，不暴露 session、
-schedule 或 resource request。
+`OperationId`；Query 只读。
 
-`RequestId` 是 connection-local correlation；`ClientId + OperationId` 是 logical command
-identity。自动 reconnect/retry 同一 Command 时，client 必须复用原 `ClientId` 与
-`OperationId`，可以分配新的 `RequestId`。官方 client 必须允许 caller 保留/重放 operation
-identity；“每次 connect 生成新 identity”不能被称为 end-to-end reconnect idempotency。
-client process 自身崩溃后若没有持久保存 operation identity，则不能声称自动 exactly-once。
+`RequestId` 只用于一条连接内的请求响应关联；`ClientId + OperationId` 才表示逻辑 Command
+身份。自动断线重试同一 Command 时必须复用原 `ClientId + OperationId`，可以分配新的
+`RequestId`。
 
-Query 的 read-only 是端到端属性：解析 `list/show/wait/output/help` 等命令不得为了获得
-ScopeHash 先执行 `PutScope`。frontend 应先解析 intent，只有真正提交 Execution 的路径才做
-`PutScope -> compile with ScopeHash -> SubmitExecution`。
-
-protocol 的 output range 使用绝对 offset；surface/client 的 `tail N` 必须返回当前 retained
-output 的最后 N bytes，而不是把 `N` 翻译成 `offset = 0, max_bytes = N`。实现可以先查询
-retained range 或使用 typed tail query，但语义必须保持 suffix。
-
-daemon 持久化 Durable Execution 的 Scope、projection、facts、operation outcome 与 effect
-outbox；Volatile Execution 的这些对象全部留在 memory。重启恢复时，死亡 instance 已
-claim 的 active process effects 必须先按前述 outbox recovery + crash-fencing 规则证明
-旧 realization 已 quiescent，之后才能向 reducer 注入结构化 interruption，并由同一个
-reducer 决定 Failure/Always 等后续语义。
-
-本地 host 使用单一 Unix socket 和独立 IPC v4 数据库。lifecycle command 的“ack 先于
-Draining”是 flush ordering，不是 timing assumption：daemon 必须先 durable commit command
-outcome，connection writer 写出并 flush `RestartAccepted`/shutdown ack，随后才发布 deferred
-lifecycle intent 让 host 停止 accept 和 drain。固定 sleep 不能替代该 happens-before。
-restart 只在旧 listener 排空并释放 socket/instance lock 后启动 successor。
-
-### Commit、publish 与 observation 顺序
-
-对于所有 reducer transition，权威顺序是：
+Query 的 read-only 是端到端属性：`list/show/wait/output/help` 等查询不得为了获得 ScopeHash
+先执行 `PutScope`。frontend 应先解析 intent，只有真正提交 Execution 时才执行：
 
 ```text
-compute next state
-    -> atomic store commit
-    -> swap live projection
-    -> publish durable facts
-    -> dispatch committed effects
+PutScope -> compile with ScopeHash -> SubmitExecution
 ```
 
-store error 必须使本次 transition 对 live state、fact subscribers 与 runtime 完全不可见；
-不得先 mutate `state.execution` 再在 commit error 后继续持有该内存状态。observer 看到的
-FactEvent 必须来自已经 commit 的 projection，而不是 speculative transition。
+protocol output range 使用绝对 offset。surface/client 的 `tail N` 必须返回最后 N bytes，不能
+简单翻译成 `offset = 0, max_bytes = N`。
+
+lifecycle command 的“ack 先于 draining”必须由真实 happens-before 保证：先提交 command
+outcome，connection writer 写出并 flush ack，然后才通知 host 停止 accept 和 drain。固定
+sleep 不能替代这个顺序。
+
+### 权威顺序
+
+所有 reducer transition 最终遵守一个统一顺序：
+
+```text
+计算下一状态
+  -> 原子持久化状态、事实和待执行动作
+  -> 更新内存中的权威 projection
+  -> 发布已提交 facts
+  -> 执行已提交 RuntimeAction
+```
+
+observer 只能看到已经持久化的 FactEvent。任何 store error 都不能留下“内存已经前进、SQLite
+没有前进”的分叉状态。
 
 ## 兼容性
 
@@ -473,33 +382,27 @@ FactEvent 必须来自已经 commit 的 projection，而不是 speculative trans
 旧客户端不能连接 v4 daemon，删除的 session/schedule/resource/target 命令没有 kernel
 兼容入口。
 
-回滚边界是停止 v4 daemon、恢复旧二进制，并从只读 archive 的副本显式恢复旧数据；
-v3 与 v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把既有工作流编译为
-`ExecutionSpec`，通过 IPC v4 观察 Execution/Step/fact，而不是要求 daemon 恢复旧状态机。
+回滚边界是停止 v4 daemon、恢复旧二进制，并从只读 archive 的副本显式恢复旧数据；v3 与
+v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把既有工作流编译为
+`ExecutionSpec`，通过 IPC v4 观察 Execution/Step/Fact，而不是要求 daemon 恢复旧状态机。
 
 ## 验证
 
-- Core serialization 测试证明 `ExecutionPlan` 只有四个 variant，非法 pipeline、空并行
-  和冲突 env edit 无法通过构造或反序列化。
+- Core serialization 测试证明 `ExecutionPlan` 只有四个 variant，非法 pipeline、空并行和
+  冲突 env edit 无法通过构造或反序列化；
 - reducer 测试覆盖稳定 StepId、Sequence Scope threading、Parallel fork/no-merge、
-  `All`/`AnySuccess`、`Running -> Cancelling -> terminal`、cancel/completion race、
-  cancellation escalation、snapshot restore 与 restart interruption。
-- effect/outbox 测试证明 projection/facts/scopes/effects 原子提交；commit failure 不修改 live
-  state且不 dispatch；Pending effect 可恢复消费；dead-instance Dispatched process effect
-  不会盲目 replay，且 recovery 在 crash fence/adopt-and-terminate 证明旧 attempt quiescent
-  之前不会发布 terminal interruption fact。
-- RunSlot 并发测试覆盖 cancel 发生在 spawn 前、spawn 中和 control 建立后，保证 intent
-  不丢失且不会出现 durable `Cancelled` 而新 process 随后启动。
-- Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link
-  和每个 Run 的 captured/PTY 选择，并覆盖 EnvValue sensitivity 保留。
-- Runtime 测试以真实 process group 验证 pipeline wiring、captured output、PTY 单 terminal、
-  control/cancel、writer failure 与 daemon-crash fencing，并证明 realization provider 无法
-  修改 semantic spawn。
-- Protocol/store 测试覆盖 strict framing、unknown field 拒绝、稳定 reconnect OperationId、
-  原子 operation/transition/outbox commit、绝对 output offset，以及 Sensitive data 不落盘。
-- client 测试覆盖 query 不触发 `PutScope`、同一 command 断线重试复用 operation identity、
-  `tail N` 返回 suffix。
-- daemon 与安装产物 smoke 覆盖 Unix socket lifecycle、ack flush-before-drain、restart
-  successor、旧数据库归档、CLI/TUI submission、output 读取和 wheel/sdist 命令面。
-- 架构检查拒绝恢复 IPC v3 模块、兼容 import、daemon 内 surface parser，以及 Core 对
-  runtime、transport、storage 或 frontend 的依赖。
+  `Running -> Cancelling -> terminal`、cancel/completion race、Force escalation 与 restart
+  interruption；
+- 持久化测试证明 projection/facts/new scopes/RuntimeAction 原子记录，commit failure 不修改
+  live state且不执行动作；
+- 崩溃恢复测试证明无法确认旧 attempt 已静止时不会重复 spawn，也不会发布虚假终态；
+- Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link 和
+  per-Run captured/PTY；
+- Runtime 测试验证 pipeline wiring、captured output、PTY、control/cancel，并验证 provider
+  无法修改 semantic Step 输入；
+- Protocol/store/client 测试覆盖 strict framing、OperationId 重放、query 不触发 `PutScope`、
+  `tail N` suffix，以及 Sensitive data 不落盘；
+- daemon smoke 覆盖 Unix socket lifecycle、ack flush-before-drain、restart successor 与旧
+  database archive；
+- 架构检查拒绝恢复 IPC v3 模块、daemon 内 surface parser，以及 Core 反向依赖 runtime、
+  transport、storage 或 frontend。
