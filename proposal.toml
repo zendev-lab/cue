@@ -14,6 +14,12 @@ Governance = "templates/fp.md"
 
 [graph]
 fields = ["supersedes"]
+supersedes_field = "supersedes"
+
+[defines]
+field = "defines"
+anchor_prefix = "term-"
+id_pattern = "[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
 
 [index]
 version = 1
