@@ -192,7 +192,6 @@ fn validate_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cue_core::{ExecutionId, SecretToken, StepId};
