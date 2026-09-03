@@ -1,8 +1,9 @@
 //! Pure reducer for Cue vNext execution plans.
 //!
 //! The reducer owns orchestration decisions and durable leaf state. Runtime
-//! code realizes ready leaves and reports typed completions; it does not decide
-//! which branch runs next or how scope flows through the plan.
+//! code realizes ready work and reports typed completions; it does not decide
+//! which branch runs next, how scope flows through the plan, or when a cancel
+//! request becomes a terminal fact.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +20,10 @@ use super::{
 pub enum StepState {
     Pending,
     Running,
+    Cancelling {
+        reason: StepCancelReason,
+        mode: CancelMode,
+    },
     Succeeded,
     Failed { failure: StepFailure },
     Skipped { reason: SkipReason },
@@ -31,6 +36,10 @@ impl StepState {
             self,
             Self::Succeeded | Self::Failed { .. } | Self::Skipped { .. } | Self::Cancelled { .. }
         )
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling { .. })
     }
 }
 
@@ -66,10 +75,31 @@ pub enum ExecutionCancelReason {
     Forced,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CancelMode {
     Graceful,
     Force,
+}
+
+impl CancelMode {
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Graceful => 0,
+            Self::Force => 1,
+        }
+    }
+
+    const fn stronger_than(self, other: Self) -> bool {
+        self.strength() > other.strength()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCancelRequest {
+    pub reason: ExecutionCancelReason,
+    pub mode: CancelMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +107,7 @@ pub enum CancelMode {
 pub enum ExecutionState {
     Pending,
     Running,
+    Cancelling { reason: ExecutionCancelReason },
     Succeeded,
     Failed,
     Cancelled { reason: ExecutionCancelReason },
@@ -136,6 +167,25 @@ pub enum StepAction {
     Run { pipeline: Pipeline, io: IoMode },
 }
 
+/// A typed cancellation effect intent. The reducer owns the reason and mode;
+/// runtime only realizes it and reports what actually happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelStep {
+    pub id: StepId,
+    pub reason: StepCancelReason,
+    pub mode: CancelMode,
+}
+
+/// Completion of a process Run. Cancellation is distinct from a signal or
+/// other failure because only an accepted cancellation intent may terminate a
+/// Step as `Cancelled`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunCompletion {
+    Succeeded,
+    Failed(StepFailure),
+    Cancelled,
+}
+
 /// A successful builtin report. The runtime resolves only the filesystem
 /// dependent result of `cd`; Env and Umask are applied by this reducer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,11 +196,12 @@ pub enum BuiltinSuccess {
 }
 
 /// Work and content-addressed scopes produced by one state transition.
-/// Consumers must persist `new_scopes` before starting `ready` leaves.
+/// Consumers must persist `new_scopes` and the transition before dispatching
+/// `ready` or `cancel` effects.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionTransition {
     pub ready: Vec<ReadyStep>,
-    pub to_cancel: Vec<StepId>,
+    pub cancel: Vec<CancelStep>,
     pub new_scopes: Vec<Scope>,
 }
 
@@ -161,7 +212,7 @@ pub struct ExecutionSnapshot {
     pub spec: ExecutionSpec,
     pub steps: Vec<StepRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancelled: Option<ExecutionCancelReason>,
+    pub cancel_requested: Option<ExecutionCancelRequest>,
 }
 
 /// The sole mutable lifecycle state for one vNext plan.
@@ -170,7 +221,7 @@ pub struct Execution {
     id: ExecutionId,
     spec: ExecutionSpec,
     steps: Vec<StepRecord>,
-    cancelled: Option<ExecutionCancelReason>,
+    cancel_requested: Option<ExecutionCancelRequest>,
 }
 
 impl Execution {
@@ -190,7 +241,7 @@ impl Execution {
             id,
             spec,
             steps,
-            cancelled: None,
+            cancel_requested: None,
         }
     }
 
@@ -204,6 +255,10 @@ impl Execution {
 
     pub fn steps(&self) -> &[StepRecord] {
         &self.steps
+    }
+
+    pub const fn cancel_requested(&self) -> Option<ExecutionCancelRequest> {
+        self.cancel_requested
     }
 
     pub fn step(&self, id: StepId) -> Option<&StepRecord> {
@@ -220,7 +275,7 @@ impl Execution {
             id: self.id,
             spec: self.spec.clone(),
             steps: self.steps.clone(),
-            cancelled: self.cancelled,
+            cancel_requested: self.cancel_requested,
         }
     }
 
@@ -230,29 +285,35 @@ impl Execution {
             id: snapshot.id,
             spec: snapshot.spec,
             steps: snapshot.steps,
-            cancelled: snapshot.cancelled,
+            cancel_requested: snapshot.cancel_requested,
         })
     }
 
     pub fn state(&self) -> ExecutionState {
-        if let Some(reason) = self.cancelled {
-            return ExecutionState::Cancelled { reason };
-        }
-
-        match evaluate(self.spec.plan(), 0, self.spec.scope(), &self.steps)
-            .1
-            .status
-        {
+        let result = evaluate(self.spec.plan(), 0, self.spec.scope(), &self.steps).1;
+        match result.status {
             SubtreeStatus::Succeeded => ExecutionState::Succeeded,
             SubtreeStatus::Failed => ExecutionState::Failed,
             SubtreeStatus::Cancelled => ExecutionState::Cancelled {
-                reason: ExecutionCancelReason::User,
+                reason: self
+                    .cancel_requested
+                    .map(|request| request.reason)
+                    .unwrap_or(ExecutionCancelReason::User),
             },
             SubtreeStatus::Waiting | SubtreeStatus::Skipped => {
+                if let Some(request) = self.cancel_requested {
+                    return ExecutionState::Cancelling {
+                        reason: request.reason,
+                    };
+                }
                 if self.steps.iter().any(|step| {
                     matches!(
                         step.state,
-                        StepState::Running | StepState::Succeeded | StepState::Failed { .. }
+                        StepState::Running
+                            | StepState::Cancelling { .. }
+                            | StepState::Succeeded
+                            | StepState::Failed { .. }
+                            | StepState::Cancelled { .. }
                     )
                 }) {
                     ExecutionState::Running
@@ -265,7 +326,7 @@ impl Execution {
 
     /// Compute ready work and apply deterministic condition/race decisions.
     pub fn advance(&mut self) -> Result<ExecutionTransition, ExecutionError> {
-        if self.cancelled.is_some() {
+        if self.cancel_requested.is_some() {
             return Ok(ExecutionTransition::default());
         }
 
@@ -286,8 +347,8 @@ impl Execution {
         });
         transition.ready.sort_by_key(|ready| ready.id);
         transition.ready.dedup_by_key(|ready| ready.id);
-        transition.to_cancel.sort_unstable();
-        transition.to_cancel.dedup();
+        transition.cancel.sort_by_key(|cancel| cancel.id);
+        transition.cancel.dedup();
         self.steps = steps;
         Ok(transition)
     }
@@ -305,7 +366,7 @@ impl Execution {
     pub fn complete_run(
         &mut self,
         id: StepId,
-        result: Result<(), StepFailure>,
+        completion: RunCompletion,
     ) -> Result<ExecutionTransition, ExecutionError> {
         if !matches!(self.action(id), Some(StepAction::Run { .. })) {
             return Err(ExecutionError::WrongStepAction {
@@ -313,16 +374,31 @@ impl Execution {
                 expected: "run",
             });
         }
-        let index = self.running_step_index(id)?;
+        let index = self.active_step_index(id)?;
         let input_scope = self.steps[index]
             .input_scope
             .ok_or(ExecutionError::MissingInputScope(id))?;
         let previous = self.steps[index].clone();
-        self.steps[index].output_scope = Some(input_scope);
-        self.steps[index].state = match result {
-            Ok(()) => StepState::Succeeded,
-            Err(failure) => StepState::Failed { failure },
+        let cancel_reason = match self.steps[index].state {
+            StepState::Cancelling { reason, .. } => Some(reason),
+            StepState::Running => None,
+            _ => unreachable!("active_step_index checked state"),
         };
+        match completion {
+            RunCompletion::Succeeded => {
+                self.steps[index].state = StepState::Succeeded;
+                self.steps[index].output_scope = Some(input_scope);
+            }
+            RunCompletion::Failed(failure) => {
+                self.steps[index].state = StepState::Failed { failure };
+                self.steps[index].output_scope = Some(input_scope);
+            }
+            RunCompletion::Cancelled => {
+                let reason = cancel_reason.ok_or(ExecutionError::UnexpectedRunCancellation(id))?;
+                self.steps[index].state = StepState::Cancelled { reason };
+                self.steps[index].output_scope = None;
+            }
+        }
         match self.advance() {
             Ok(transition) => Ok(transition),
             Err(error) => {
@@ -344,7 +420,7 @@ impl Execution {
                 expected: "builtin",
             });
         };
-        let index = self.running_step_index(id)?;
+        let index = self.active_step_index(id)?;
         let expected_scope = self.steps[index]
             .input_scope
             .ok_or(ExecutionError::MissingInputScope(id))?;
@@ -382,12 +458,12 @@ impl Execution {
         Ok(transition)
     }
 
-    /// Mark all running work interrupted by a daemon restart as failed. Pending
+    /// Mark all active work interrupted by a daemon restart as failed. Pending
     /// conditional branches remain eligible to advance from those failures.
     pub fn interrupt_running(&mut self, message: impl Into<String>) {
         let message = message.into();
         for step in &mut self.steps {
-            if matches!(step.state, StepState::Running) {
+            if step.state.is_active() {
                 step.state = StepState::Failed {
                     failure: StepFailure::Infrastructure {
                         message: message.clone(),
@@ -403,23 +479,33 @@ impl Execution {
             return ExecutionTransition::default();
         }
 
-        let (execution_reason, step_reason) = match mode {
-            CancelMode::Graceful => (ExecutionCancelReason::User, StepCancelReason::User),
-            CancelMode::Force => (ExecutionCancelReason::Forced, StepCancelReason::Forced),
+        let request = execution_cancel_request(mode);
+        if self
+            .cancel_requested
+            .is_some_and(|existing| !request.mode.stronger_than(existing.mode))
+        {
+            return ExecutionTransition::default();
+        }
+        self.cancel_requested = Some(request);
+
+        let step_reason = match mode {
+            CancelMode::Graceful => StepCancelReason::User,
+            CancelMode::Force => StepCancelReason::Forced,
         };
         let mut transition = ExecutionTransition::default();
-        for step in &mut self.steps {
-            if matches!(step.state, StepState::Running) {
-                transition.to_cancel.push(step.id);
-            }
-            if !step.state.is_terminal() {
-                step.state = StepState::Cancelled {
-                    reason: step_reason,
-                };
-                step.output_scope = None;
-            }
+        for index in 0..self.steps.len() {
+            let action = action_at(self.spec.plan(), index)
+                .expect("every durable Step has one authoritative leaf action");
+            request_step_cancel(
+                &mut self.steps[index],
+                &action,
+                step_reason,
+                mode,
+                &mut transition,
+            );
         }
-        self.cancelled = Some(execution_reason);
+        transition.cancel.sort_by_key(|cancel| cancel.id);
+        transition.cancel.dedup();
         transition
     }
 
@@ -434,12 +520,66 @@ impl Execution {
         Ok(index)
     }
 
-    fn running_step_index(&self, id: StepId) -> Result<usize, ExecutionError> {
+    fn active_step_index(&self, id: StepId) -> Result<usize, ExecutionError> {
         let index = self.step_index(id)?;
-        if !matches!(self.steps[index].state, StepState::Running) {
-            return Err(ExecutionError::StepNotRunning(id));
+        if !self.steps[index].state.is_active() {
+            return Err(ExecutionError::StepNotActive(id));
         }
         Ok(index)
+    }
+}
+
+fn execution_cancel_request(mode: CancelMode) -> ExecutionCancelRequest {
+    ExecutionCancelRequest {
+        reason: match mode {
+            CancelMode::Graceful => ExecutionCancelReason::User,
+            CancelMode::Force => ExecutionCancelReason::Forced,
+        },
+        mode,
+    }
+}
+
+fn request_step_cancel(
+    step: &mut StepRecord,
+    action: &StepAction,
+    reason: StepCancelReason,
+    mode: CancelMode,
+    transition: &mut ExecutionTransition,
+) {
+    match step.state {
+        StepState::Pending => {
+            step.state = StepState::Cancelled { reason };
+            step.output_scope = None;
+        }
+        StepState::Running => {
+            step.state = StepState::Cancelling { reason, mode };
+            step.output_scope = None;
+            push_cancel_effect(step.id, action, reason, mode, transition);
+        }
+        StepState::Cancelling {
+            mode: existing_mode,
+            ..
+        } if mode.stronger_than(existing_mode) => {
+            step.state = StepState::Cancelling { reason, mode };
+            push_cancel_effect(step.id, action, reason, mode, transition);
+        }
+        StepState::Cancelling { .. }
+        | StepState::Succeeded
+        | StepState::Failed { .. }
+        | StepState::Skipped { .. }
+        | StepState::Cancelled { .. } => {}
+    }
+}
+
+fn push_cancel_effect(
+    id: StepId,
+    action: &StepAction,
+    reason: StepCancelReason,
+    mode: CancelMode,
+    transition: &mut ExecutionTransition,
+) {
+    if matches!(action, StepAction::Run { .. }) {
+        transition.cancel.push(CancelStep { id, reason, mode });
     }
 }
 
@@ -499,7 +639,7 @@ fn validate_snapshot(snapshot: &ExecutionSnapshot) -> Result<(), ExecutionError>
             });
         }
         match step.state {
-            StepState::Running if step.input_scope.is_none() => {
+            StepState::Running | StepState::Cancelling { .. } if step.input_scope.is_none() => {
                 return Err(ExecutionError::MissingInputScope(step.id));
             }
             StepState::Succeeded | StepState::Failed { .. }
@@ -507,12 +647,13 @@ fn validate_snapshot(snapshot: &ExecutionSnapshot) -> Result<(), ExecutionError>
             {
                 return Err(ExecutionError::MissingTerminalScope(step.id));
             }
-            StepState::Pending | StepState::Running | StepState::Skipped { .. }
+            StepState::Pending
+            | StepState::Running
+            | StepState::Cancelling { .. }
+            | StepState::Skipped { .. }
+            | StepState::Cancelled { .. }
                 if step.output_scope.is_some() =>
             {
-                return Err(ExecutionError::UnexpectedOutputScope(step.id));
-            }
-            StepState::Cancelled { .. } if step.output_scope.is_some() => {
                 return Err(ExecutionError::UnexpectedOutputScope(step.id));
             }
             _ => {}
@@ -645,15 +786,26 @@ fn drive(
                         .iter()
                         .any(|result| result.status == SubtreeStatus::Succeeded)
                     {
+                        let mut waiting_for_losers = false;
                         for ((branch_offset, branch), result) in ranges.into_iter().zip(&results) {
-                            if result.status != SubtreeStatus::Succeeded {
-                                cancel_any_success_loser(branch, branch_offset, steps, transition);
+                            if result.status == SubtreeStatus::Succeeded {
+                                continue;
                             }
+                            cancel_any_success_loser(branch, branch_offset, steps, transition);
+                            let (_, after) = evaluate(branch, branch_offset, input_scope, steps);
+                            waiting_for_losers |= after.status == SubtreeStatus::Waiting;
                         }
-                        Ok((
-                            next,
-                            SubtreeResult::terminal(SubtreeStatus::Succeeded, Some(input_scope)),
-                        ))
+                        if waiting_for_losers {
+                            Ok((next, SubtreeResult::waiting()))
+                        } else {
+                            Ok((
+                                next,
+                                SubtreeResult::terminal(
+                                    SubtreeStatus::Succeeded,
+                                    Some(input_scope),
+                                ),
+                            ))
+                        }
                     } else if results
                         .iter()
                         .any(|result| result.status == SubtreeStatus::Waiting)
@@ -711,7 +863,9 @@ fn drive_leaf(
 
 fn leaf_result(step: &StepRecord, input_scope: ScopeHash) -> SubtreeResult {
     match step.state {
-        StepState::Pending | StepState::Running => SubtreeResult::waiting(),
+        StepState::Pending | StepState::Running | StepState::Cancelling { .. } => {
+            SubtreeResult::waiting()
+        }
         StepState::Succeeded => SubtreeResult::terminal(
             SubtreeStatus::Succeeded,
             step.output_scope.or(Some(input_scope)),
@@ -801,8 +955,8 @@ fn skip_condition_subtree(
                 };
                 step.output_scope = None;
             }
-            StepState::Running => {
-                return Err(ExecutionError::UnexpectedRunningConditionStep(step.id));
+            StepState::Running | StepState::Cancelling { .. } => {
+                return Err(ExecutionError::UnexpectedActiveConditionStep(step.id));
             }
             _ => {}
         }
@@ -816,7 +970,9 @@ fn cancel_any_success_loser(
     steps: &mut [StepRecord],
     transition: &mut ExecutionTransition,
 ) {
-    for step in &mut steps[offset..offset + plan_leaf_count(plan)] {
+    let count = plan_leaf_count(plan);
+    for relative in 0..count {
+        let step = &mut steps[offset + relative];
         match step.state {
             StepState::Pending => {
                 step.state = StepState::Skipped {
@@ -825,11 +981,29 @@ fn cancel_any_success_loser(
                 step.output_scope = None;
             }
             StepState::Running => {
-                transition.to_cancel.push(step.id);
-                step.state = StepState::Cancelled {
-                    reason: StepCancelReason::AnySuccessSatisfied,
-                };
-                step.output_scope = None;
+                let action = action_at(plan, relative)
+                    .expect("every AnySuccess loser Step has one authoritative action");
+                request_step_cancel(
+                    step,
+                    &action,
+                    StepCancelReason::AnySuccessSatisfied,
+                    CancelMode::Force,
+                    transition,
+                );
+            }
+            StepState::Cancelling {
+                mode: existing_mode,
+                ..
+            } if CancelMode::Force.stronger_than(existing_mode) => {
+                let action = action_at(plan, relative)
+                    .expect("every AnySuccess loser Step has one authoritative action");
+                request_step_cancel(
+                    step,
+                    &action,
+                    StepCancelReason::AnySuccessSatisfied,
+                    CancelMode::Force,
+                    transition,
+                );
             }
             _ => {}
         }
@@ -873,15 +1047,15 @@ fn evaluate(
             let result = match join {
                 ParallelJoin::All => parallel_all_result(&results, input_scope),
                 ParallelJoin::AnySuccess => {
-                    if results
+                    let has_success = results
                         .iter()
-                        .any(|result| result.status == SubtreeStatus::Succeeded)
-                    {
+                        .any(|result| result.status == SubtreeStatus::Succeeded);
+                    let has_waiting = results
+                        .iter()
+                        .any(|result| result.status == SubtreeStatus::Waiting);
+                    if has_success && !has_waiting {
                         SubtreeResult::terminal(SubtreeStatus::Succeeded, Some(input_scope))
-                    } else if results
-                        .iter()
-                        .any(|result| result.status == SubtreeStatus::Waiting)
-                    {
+                    } else if has_waiting {
                         SubtreeResult::waiting()
                     } else if results
                         .iter()
@@ -916,10 +1090,12 @@ pub enum ExecutionError {
     UnknownStep(StepId),
     #[error("step {0} is not ready")]
     StepNotReady(StepId),
-    #[error("step {0} is not running")]
-    StepNotRunning(StepId),
-    #[error("condition-selected-out step {0} was already running")]
-    UnexpectedRunningConditionStep(StepId),
+    #[error("step {0} is not active")]
+    StepNotActive(StepId),
+    #[error("run step {0} reported cancellation without a committed cancellation intent")]
+    UnexpectedRunCancellation(StepId),
+    #[error("condition-selected-out step {0} was already active")]
+    UnexpectedActiveConditionStep(StepId),
     #[error("step {step} is not a {expected} leaf")]
     WrongStepAction {
         step: StepId,
@@ -1015,6 +1191,10 @@ mod tests {
         transition.ready.iter().map(|ready| ready.id).collect()
     }
 
+    fn cancel_ids(transition: &ExecutionTransition) -> Vec<StepId> {
+        transition.cancel.iter().map(|cancel| cancel.id).collect()
+    }
+
     fn start(execution: &mut Execution, id: StepId) {
         execution.mark_running(id).unwrap();
     }
@@ -1025,7 +1205,15 @@ mod tests {
         result: Result<(), StepFailure>,
     ) -> ExecutionTransition {
         start(execution, id);
-        execution.complete_run(id, result).unwrap()
+        execution
+            .complete_run(
+                id,
+                match result {
+                    Ok(()) => RunCompletion::Succeeded,
+                    Err(failure) => RunCompletion::Failed(failure),
+                },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1282,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn any_success_cancels_running_losers_and_skips_unstarted_loser_leaves() {
+    fn any_success_waits_for_running_loser_cancellation_before_becoming_terminal() {
         let initial = scope("/workspace");
         let slow = ExecutionPlan::sequence(
             run("slow-first"),
@@ -1299,13 +1487,24 @@ mod tests {
         );
         start(&mut execution, step(1));
         start(&mut execution, step(2));
-        let transition = execution.complete_run(step(1), Ok(())).unwrap();
+        let transition = execution
+            .complete_run(step(1), RunCompletion::Succeeded)
+            .unwrap();
 
-        assert_eq!(transition.to_cancel, vec![step(2)]);
+        assert_eq!(cancel_ids(&transition), vec![step(2)]);
+        assert_eq!(
+            transition.cancel[0],
+            CancelStep {
+                id: step(2),
+                reason: StepCancelReason::AnySuccessSatisfied,
+                mode: CancelMode::Force,
+            }
+        );
         assert_eq!(
             execution.step(step(2)).unwrap().state(),
-            &StepState::Cancelled {
-                reason: StepCancelReason::AnySuccessSatisfied
+            &StepState::Cancelling {
+                reason: StepCancelReason::AnySuccessSatisfied,
+                mode: CancelMode::Force,
             }
         );
         assert_eq!(
@@ -1314,6 +1513,45 @@ mod tests {
                 reason: SkipReason::AnySuccessSatisfied
             }
         );
+        assert_eq!(execution.state(), ExecutionState::Running);
+
+        execution
+            .complete_run(step(2), RunCompletion::Cancelled)
+            .unwrap();
+        assert_eq!(
+            execution.step(step(2)).unwrap().state(),
+            &StepState::Cancelled {
+                reason: StepCancelReason::AnySuccessSatisfied
+            }
+        );
+        assert_eq!(execution.state(), ExecutionState::Succeeded);
+    }
+
+    #[test]
+    fn any_success_cancel_is_best_effort_and_loser_may_still_succeed() {
+        let initial = scope("/workspace");
+        let plan = ExecutionPlan::parallel(
+            vec![run("winner"), run("racing-loser")],
+            ParallelJoin::AnySuccess,
+        )
+        .unwrap();
+        let mut execution = execution(plan, &initial);
+        execution.advance().unwrap();
+        start(&mut execution, step(1));
+        start(&mut execution, step(2));
+
+        execution
+            .complete_run(step(1), RunCompletion::Succeeded)
+            .unwrap();
+        assert!(matches!(
+            execution.step(step(2)).unwrap().state(),
+            StepState::Cancelling { .. }
+        ));
+
+        execution
+            .complete_run(step(2), RunCompletion::Succeeded)
+            .unwrap();
+        assert_eq!(execution.step(step(2)).unwrap().state(), &StepState::Succeeded);
         assert_eq!(execution.state(), ExecutionState::Succeeded);
     }
 
@@ -1328,17 +1566,23 @@ mod tests {
         start(&mut execution, step(2));
 
         execution
-            .complete_run(step(1), Err(StepFailure::Exit { code: 1 }))
+            .complete_run(
+                step(1),
+                RunCompletion::Failed(StepFailure::Exit { code: 1 }),
+            )
             .unwrap();
         assert_eq!(execution.state(), ExecutionState::Running);
         execution
-            .complete_run(step(2), Err(StepFailure::Exit { code: 2 }))
+            .complete_run(
+                step(2),
+                RunCompletion::Failed(StepFailure::Exit { code: 2 }),
+            )
             .unwrap();
         assert_eq!(execution.state(), ExecutionState::Failed);
     }
 
     #[test]
-    fn user_cancel_marks_all_unfinished_steps_cancelled_but_terminates_only_running_work() {
+    fn user_cancel_marks_pending_terminal_but_running_work_cancelling_until_completion() {
         let initial = scope("/workspace");
         let plan = ExecutionPlan::parallel(
             vec![run("one"), sequence(vec![run("two"), run("three")])],
@@ -1351,19 +1595,132 @@ mod tests {
 
         let transition = execution.cancel(CancelMode::Graceful);
 
-        assert_eq!(transition.to_cancel, vec![step(1)]);
-        assert!(execution.steps().iter().all(|record| {
-            record.state()
-                == &StepState::Cancelled {
+        assert_eq!(cancel_ids(&transition), vec![step(1)]);
+        assert_eq!(
+            execution.step(step(1)).unwrap().state(),
+            &StepState::Cancelling {
+                reason: StepCancelReason::User,
+                mode: CancelMode::Graceful,
+            }
+        );
+        for id in [step(2), step(3)] {
+            assert_eq!(
+                execution.step(id).unwrap().state(),
+                &StepState::Cancelled {
                     reason: StepCancelReason::User,
                 }
-        }));
+            );
+        }
+        assert_eq!(
+            execution.state(),
+            ExecutionState::Cancelling {
+                reason: ExecutionCancelReason::User
+            }
+        );
+
+        execution
+            .complete_run(step(1), RunCompletion::Cancelled)
+            .unwrap();
         assert_eq!(
             execution.state(),
             ExecutionState::Cancelled {
                 reason: ExecutionCancelReason::User
             }
         );
+    }
+
+    #[test]
+    fn cancelled_single_run_can_still_finish_successfully() {
+        let initial = scope("/workspace");
+        let mut execution = execution(run("fast"), &initial);
+        execution.advance().unwrap();
+        start(&mut execution, step(1));
+
+        let transition = execution.cancel(CancelMode::Graceful);
+        assert_eq!(cancel_ids(&transition), vec![step(1)]);
+        assert!(matches!(
+            execution.state(),
+            ExecutionState::Cancelling {
+                reason: ExecutionCancelReason::User
+            }
+        ));
+
+        execution
+            .complete_run(step(1), RunCompletion::Succeeded)
+            .unwrap();
+        assert_eq!(execution.state(), ExecutionState::Succeeded);
+        assert_eq!(execution.step(step(1)).unwrap().state(), &StepState::Succeeded);
+    }
+
+    #[test]
+    fn cancellation_escalation_is_idempotent_and_force_strengthens_graceful() {
+        let initial = scope("/workspace");
+        let mut execution = execution(run("slow"), &initial);
+        execution.advance().unwrap();
+        start(&mut execution, step(1));
+
+        let graceful = execution.cancel(CancelMode::Graceful);
+        assert_eq!(graceful.cancel.len(), 1);
+        assert!(execution.cancel(CancelMode::Graceful).cancel.is_empty());
+
+        let force = execution.cancel(CancelMode::Force);
+        assert_eq!(
+            force.cancel,
+            vec![CancelStep {
+                id: step(1),
+                reason: StepCancelReason::Forced,
+                mode: CancelMode::Force,
+            }]
+        );
+        assert_eq!(
+            execution.step(step(1)).unwrap().state(),
+            &StepState::Cancelling {
+                reason: StepCancelReason::Forced,
+                mode: CancelMode::Force,
+            }
+        );
+        assert_eq!(
+            execution.state(),
+            ExecutionState::Cancelling {
+                reason: ExecutionCancelReason::Forced
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_input_order_is_deterministic_around_cancel_and_completion() {
+        let initial = scope("/workspace");
+        let mut completion_first = execution(run("fast"), &initial);
+        completion_first.advance().unwrap();
+        start(&mut completion_first, step(1));
+        completion_first
+            .complete_run(step(1), RunCompletion::Succeeded)
+            .unwrap();
+        assert!(completion_first.cancel(CancelMode::Graceful).cancel.is_empty());
+        assert_eq!(completion_first.state(), ExecutionState::Succeeded);
+
+        let mut cancel_first = execution(run("fast"), &initial);
+        cancel_first.advance().unwrap();
+        start(&mut cancel_first, step(1));
+        cancel_first.cancel(CancelMode::Graceful);
+        cancel_first
+            .complete_run(step(1), RunCompletion::Succeeded)
+            .unwrap();
+        assert_eq!(cancel_first.state(), ExecutionState::Succeeded);
+    }
+
+    #[test]
+    fn runtime_cannot_report_cancelled_without_committed_cancel_intent() {
+        let initial = scope("/workspace");
+        let mut execution = execution(run("one"), &initial);
+        execution.advance().unwrap();
+        start(&mut execution, step(1));
+
+        assert!(matches!(
+            execution.complete_run(step(1), RunCompletion::Cancelled),
+            Err(ExecutionError::UnexpectedRunCancellation(id)) if id == step(1)
+        ));
+        assert_eq!(execution.step(step(1)).unwrap().state(), &StepState::Running);
     }
 
     #[test]
@@ -1378,10 +1735,7 @@ mod tests {
             execution.complete_builtin(step(1), &other, Ok(BuiltinSuccess::Env)),
             Err(ExecutionError::InputScopeMismatch { .. })
         ));
-        assert_eq!(
-            execution.step(step(1)).unwrap().state(),
-            &StepState::Running
-        );
+        assert_eq!(execution.step(step(1)).unwrap().state(), &StepState::Running);
         assert!(matches!(
             execution.complete_builtin(
                 step(1),
@@ -1392,14 +1746,38 @@ mod tests {
             ),
             Err(ExecutionError::WrongBuiltinSuccess { .. })
         ));
-        assert_eq!(
-            execution.step(step(1)).unwrap().state(),
-            &StepState::Running
-        );
+        assert_eq!(execution.step(step(1)).unwrap().state(), &StepState::Running);
     }
 
     #[test]
     fn snapshot_restore_and_restart_interruption_preserve_reducer_semantics() {
+        let initial = scope("/workspace");
+        let plan =
+            ExecutionPlan::sequence(run("primary"), run("recover"), SequenceCondition::Failure);
+        let mut execution = execution(plan, &initial);
+        execution.advance().unwrap();
+        start(&mut execution, step(1));
+        execution.cancel(CancelMode::Graceful);
+
+        let mut restored = Execution::restore(execution.snapshot()).unwrap();
+        restored.interrupt_running("daemon restarted");
+        assert!(matches!(
+            restored.step(step(1)).unwrap().state(),
+            StepState::Failed {
+                failure: StepFailure::Infrastructure { .. }
+            }
+        ));
+        assert_eq!(
+            restored.state(),
+            ExecutionState::Cancelled {
+                reason: ExecutionCancelReason::User
+            },
+            "the pending recovery branch was cancelled by the user request before restart"
+        );
+    }
+
+    #[test]
+    fn restart_interruption_without_user_cancel_can_select_failure_recovery() {
         let initial = scope("/workspace");
         let plan =
             ExecutionPlan::sequence(run("primary"), run("recover"), SequenceCondition::Failure);
@@ -1413,12 +1791,6 @@ mod tests {
 
         assert_eq!(ready_ids(&transition), vec![step(2)]);
         assert_eq!(transition.ready[0].input_scope, initial.compute_hash());
-        assert!(matches!(
-            restored.step(step(1)).unwrap().state(),
-            StepState::Failed {
-                failure: StepFailure::Infrastructure { .. }
-            }
-        ));
     }
 
     #[test]
@@ -1437,6 +1809,16 @@ mod tests {
         assert!(matches!(
             Execution::restore(missing_scope),
             Err(ExecutionError::MissingTerminalScope(_))
+        ));
+
+        let mut cancelling_without_scope = execution.snapshot();
+        cancelling_without_scope.steps[0].state = StepState::Cancelling {
+            reason: StepCancelReason::User,
+            mode: CancelMode::Graceful,
+        };
+        assert!(matches!(
+            Execution::restore(cancelling_without_scope),
+            Err(ExecutionError::MissingInputScope(_))
         ));
     }
 
@@ -1465,7 +1847,7 @@ mod tests {
         let mut restored = Execution::restore(forged).unwrap();
 
         assert!(matches!(
-            restored.complete_run(step(1), Ok(())),
+            restored.complete_run(step(1), RunCompletion::Succeeded),
             Err(ExecutionError::InputScopeMismatch { step: id, .. }) if id == step(2)
         ));
         assert_eq!(restored.step(step(1)).unwrap().state(), &StepState::Running);
