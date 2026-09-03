@@ -12,9 +12,10 @@ mod scope;
 
 pub use env::{Env, EnvEdit, EnvKey, EnvPatch, EnvValue};
 pub use execution::{
-    BuiltinSuccess, CancelMode, Execution, ExecutionCancelReason, ExecutionError,
-    ExecutionSnapshot, ExecutionState, ExecutionTransition, ReadyStep, SkipReason, StepAction,
-    StepCancelReason, StepFailure, StepRecord, StepState,
+    BuiltinSuccess, CancelMode, CancelStep, Execution, ExecutionCancelReason,
+    ExecutionCancelRequest, ExecutionError, ExecutionSnapshot, ExecutionState, ExecutionTransition,
+    ReadyStep, RunCompletion, SkipReason, StepAction, StepCancelReason, StepFailure, StepRecord,
+    StepState,
 };
 pub use plan::{
     BuiltinCommand, CdPath, EnvMutation, ExecutionPlan, ExecutionSpec, IoMode, ParallelBranches,
