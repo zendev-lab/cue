@@ -268,19 +268,47 @@ publish facts       dispatch outbox effects
 - outbox effect 只表示“应该 realization 什么”，effect 被 dispatch/ack 不会直接把 Step
   改成成功、失败或取消；只有 typed runtime completion 能驱动 terminal reducer state。
 
-store 为每条 committed effect 分配稳定 `EffectId` 并保存 delivery 状态。dispatcher 在调用
-不可事务化副作用前，必须先把 `Pending` effect 原子 claim 为当前 daemon instance 的
-`Dispatched`；同一 Step 的 effects 按 commit 顺序消费。
+store 为每条 committed effect 分配稳定 `EffectId` 并保存 delivery 状态：
+
+```text
+EffectRecord = EffectId
+             × ExecutionId
+             × StepId
+             × EffectIntent
+             × EffectState
+
+EffectState  = Pending
+             + Dispatched(DaemonInstanceId)
+             + Completed
+             + Abandoned
+```
+
+`RealizeStep` 的 `EffectId` 同时标识该 Step 的唯一 physical realization attempt；当前
+Execution 内没有隐式 retry，因此 successor 不得为同一 effect 自行制造第二个 attempt。
+dispatcher 在调用不可事务化副作用前，必须先把 `Pending` effect 原子 claim 为当前 daemon
+instance 的 `Dispatched`；同一 Step 的 effects 按 commit 顺序消费。
 
 进程 effect 不宣称跨 daemon crash 的 exactly-once。恢复规则显式区分：
 
 - 尚未 claim 的 `Pending` effect 从未被允许执行，可以由 successor 继续消费；
 - 已由死亡 daemon claim、但没有 terminal completion 的 `Dispatched` process effect 处于
-  outcome unknown，successor 不盲目重复 spawn/signal，而把对应 `Running`/`Cancelling`
-  attempt 按结构化 restart interruption 归并为 infrastructure failure，并把旧 effect
-  标记为 abandoned；
+  outcome unknown，successor **不得盲目 replay，也不得直接把 Step 写成 terminal failure**；
+  它必须先证明旧 realization 已经 quiescent；
+- quiescence 可以由 realization mechanism 的 crash fence/guardian 保证，也可以由稳定的
+  external attempt handle 让 successor adopt/query 后 terminate 并等待退出；只有确认旧
+  attempt 不再运行后，recovery 才能把旧 effect 标记 `Abandoned`，并向 reducer 注入结构化
+  restart interruption，由 Core 产生 infrastructure failure 与后续 Failure/Always 语义；
+- 如果 runtime 无法证明旧 attempt 已停止，daemon 必须 fail closed：该 Execution 保持
+  recovery unresolved，不发布 terminal projection，也不启动依赖它的新 work。这里不需要
+  给 Core 增加猜测性的 `Unknown` terminal state；host 在完成 effect reconciliation 前不向
+  reducer伪造 completion；
 - 未来若某类 effect 本身具有外部幂等 key，可以单独声明 replay-safe policy；不能把这一
   假设泛化到本地 process spawn。
+
+因此 outbox 保证的是 **durable intent + no-effect-before-commit + no-blind-replay**，不是凭空
+把 POSIX process 变成 exactly-once transaction。对于直接本地 spawn，runtime 必须同时提供
+crash fencing；否则 daemon crash 后可能留下失去 owner 的 process，任何“已恢复为 Failed”
+的事实都会再次领先于现实。
 
 live daemon 为每个 active Step 建立 `RunSlot`，并在真正调用 spawner 前成为 cancel 的
 序列化点。`RunSlot` 至少能表示 launching/active/finished 与 pending cancel intent。
@@ -412,8 +440,9 @@ retained range 或使用 typed tail query，但语义必须保持 suffix。
 
 daemon 持久化 Durable Execution 的 Scope、projection、facts、operation outcome 与 effect
 outbox；Volatile Execution 的这些对象全部留在 memory。重启恢复时，死亡 instance 已
-claim 的 active process effects按前述 outbox recovery 规则成为结构化 interruption，再由
-同一个 reducer 决定 Failure/Always 等后续语义。
+claim 的 active process effects 必须先按前述 outbox recovery + crash-fencing 规则证明
+旧 realization 已 quiescent，之后才能向 reducer 注入结构化 interruption，并由同一个
+reducer 决定 Failure/Always 等后续语义。
 
 本地 host 使用单一 Unix socket 和独立 IPC v4 数据库。lifecycle command 的“ack 先于
 Draining”是 flush ordering，不是 timing assumption：daemon 必须先 durable commit command
@@ -456,14 +485,16 @@ v3 与 v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式�
   `All`/`AnySuccess`、`Running -> Cancelling -> terminal`、cancel/completion race、
   cancellation escalation、snapshot restore 与 restart interruption。
 - effect/outbox 测试证明 projection/facts/scopes/effects 原子提交；commit failure 不修改 live
-  state且不 dispatch；Pending effect 可恢复消费，dead-instance Dispatched process effect
-  不会盲目 replay，并由 restart reconciliation 收敛。
+  state且不 dispatch；Pending effect 可恢复消费；dead-instance Dispatched process effect
+  不会盲目 replay，且 recovery 在 crash fence/adopt-and-terminate 证明旧 attempt quiescent
+  之前不会发布 terminal interruption fact。
 - RunSlot 并发测试覆盖 cancel 发生在 spawn 前、spawn 中和 control 建立后，保证 intent
   不丢失且不会出现 durable `Cancelled` 而新 process 随后启动。
 - Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link
   和每个 Run 的 captured/PTY 选择，并覆盖 EnvValue sensitivity 保留。
 - Runtime 测试以真实 process group 验证 pipeline wiring、captured output、PTY 单 terminal、
-  control/cancel 与 writer failure，并证明 realization provider 无法修改 semantic spawn。
+  control/cancel、writer failure 与 daemon-crash fencing，并证明 realization provider 无法
+  修改 semantic spawn。
 - Protocol/store 测试覆盖 strict framing、unknown field 拒绝、稳定 reconnect OperationId、
   原子 operation/transition/outbox commit、绝对 output offset，以及 Sensitive data 不落盘。
 - client 测试覆盖 query 不触发 `PutScope`、同一 command 断线重试复用 operation identity、
