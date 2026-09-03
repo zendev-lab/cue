@@ -6,6 +6,20 @@ authors:
   - "zrr1999"
 created: 2026-09-01
 supersedes: []
+defines:
+  - execution-plan
+  - scope
+  - step
+  - reducer
+  - fact
+  - cancelling
+  - runtime-action
+  - run-completion
+  - attempt
+  - quiescent
+  - operation-id
+  - sensitive
+  - volatile-execution
 ---
 
 # FP-0001: Cue 结构化执行内核与 IPC v4
@@ -43,23 +57,28 @@ transport 和 UI 状态，导致同一执行在 Core、daemon、client 与持久
 
 ## 术语与定义
 
+`defines` frontmatter 与下列 `term-*` 锚点组成 zendev 的定义所有权契约。只有需要由
+FP-0001 长期拥有的稳定领域概念才注册 ownership；事务发件箱、进程监护器等参考实现仍可
+在表中解释，但不取得定义所有权。
+
 | 术语 | 定义 |
 |---|---|
-| **执行计划 `ExecutionPlan`** | Core 中封闭的执行树，只描述 Cue 允许的执行组合语义。 |
-| **执行范围 `Scope`** | `cwd × env × umask` 的完整不可变快照，由内容哈希标识。 |
-| **步骤 `Step`** | `Builtin` 或 `Run` 叶子。组合节点本身不是 Step。 |
-| **归约器 `reducer`** | 纯状态转换函数。读取当前快照和一个已确认输入，计算下一快照、事实及待执行动作。 |
-| **事实 `Fact`** | 已由 reducer 接受并持久化的状态变化记录；不能描述尚未完成的外部动作结果。 |
-| **运行时动作 `RuntimeAction`** | reducer 要求 runtime 实现的外部动作，例如 `RealizeStep`、`CancelStep`。它不是代数效应系统中的 effect handler。 |
-| **运行时结果 `RunCompletion`** | runtime 对一个已发生执行尝试的最终报告，例如成功、失败或取消完成。 |
-| **执行尝试 `attempt`** | 一个 Step 的一次物理实现，例如一组实际操作系统进程。当前 Execution 内不隐式 retry。 |
+| <a id="term-execution-plan"></a>**执行计划 `ExecutionPlan`** | Core 中封闭的执行树，只描述 Cue 允许的执行组合语义。 |
+| <a id="term-scope"></a>**执行范围 `Scope`** | `cwd × env × umask` 的完整不可变快照，由内容哈希标识。 |
+| <a id="term-step"></a>**步骤 `Step`** | `Builtin` 或 `Run` 叶子。组合节点本身不是 Step。 |
+| <a id="term-reducer"></a>**归约器 `reducer`** | 纯状态转换函数。读取当前快照和一个已确认输入，计算下一快照、事实及待执行动作。 |
+| <a id="term-fact"></a>**事实 `Fact`** | 已由 reducer 接受并持久化的状态变化记录；不能描述尚未完成的外部动作结果。 |
+| <a id="term-cancelling"></a>**取消中 `Cancelling`** | reducer 已接受对活动 Step 或 Execution 的取消请求，但对应运行时尝试尚未报告最终结果的非终态。 |
+| <a id="term-runtime-action"></a>**运行时动作 `RuntimeAction`** | reducer 要求 runtime 实现的外部动作，例如 `RealizeStep`、`CancelStep`。它不是代数效应系统中的 effect handler。 |
+| <a id="term-run-completion"></a>**运行时结果 `RunCompletion`** | runtime 对一个已发生执行尝试的最终报告，例如成功、失败或取消完成。 |
+| <a id="term-attempt"></a>**执行尝试 `attempt`** | 一个 Step 的一次物理实现，例如一组实际操作系统进程。当前 Execution 内不隐式 retry。 |
 | **实现机制 `realization`** | 把 Core 的语义动作落实为实际进程、PTY、workspace、resource 等物理行为。 |
 | **事务发件箱 `Transactional Outbox`** | 一种持久化实现方式：在同一数据库事务中写入状态和“之后要执行的动作”，提交后再由 dispatcher 执行动作。 |
-| **静止 `quiescent`** | 某个执行尝试已经确定不再运行，也不会再产生属于该尝试的活动进程。 |
+| <a id="term-quiescent"></a>**静止 `quiescent`** | 某个执行尝试已经确定不再运行，也不会再产生属于该尝试的活动进程。 |
 | **进程监护器 `guardian`** | 可选实现机制：独立于 daemon 持有子进程所有权，在 daemon 异常退出时负责终止并回收其进程。它不是 Core 概念。 |
-| **操作标识 `OperationId`** | 一个逻辑 IPC Command 的稳定身份，用于断线重连后的幂等重放。 |
-| **敏感值 `Sensitive`** | 不允许进入持久存储的环境值分类；安全性不能仅靠变量名猜测。 |
-| **易失执行 `Volatile Execution`** | 含敏感值的 Execution；其 Scope、projection、facts、operation outcome 等仅存在于内存。 |
+| <a id="term-operation-id"></a>**操作标识 `OperationId`** | 一个逻辑 IPC Command 的稳定身份，用于断线重连后的幂等重放。 |
+| <a id="term-sensitive"></a>**敏感值 `Sensitive`** | 不允许进入持久存储的环境值分类；安全性不能仅靠变量名猜测。 |
+| <a id="term-volatile-execution"></a>**易失执行 `Volatile Execution`** | 含敏感值的 Execution；其 Scope、projection、facts、operation outcome 等仅存在于内存。 |
 
 本文中的 `effect` 若用于一般说明，仅表示“对外部世界产生的副作用”。规范数据结构统一
 使用“运行时动作 `RuntimeAction`”，避免与程序语言中的**代数效应（algebraic effects）**
