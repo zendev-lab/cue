@@ -23,14 +23,15 @@ defines:
 ## 摘要
 
 Cue 收敛为持久、可观察的本地结构化进程执行内核。Core 用封闭的 `ExecutionPlan`
-定义执行语义，用不可变 `Scope` 表达执行上下文，用纯归约器决定状态变化；运行时只负责把
-已经提交的 Step 状态落实为真实进程状态。守护进程只提供严格 IPC v4，不在内核中拥有会话、
+定义执行语义，用不可变 `Scope` 表达执行上下文，用纯归约器决定状态变化；运行时负责把
+已经提交的 Step 状态落实为真实运行时状态。守护进程只提供严格 IPC v4，不在内核中拥有会话、
 调度、重试、资源、审批或远程目标策略。
 
 本提案坚持两个边界：**决定与事实分离，语义与交付分离**。Core 只提交“某个 Step 现在应该
 处于什么状态”，并用 `StepId` 标记哪些 Step 需要运行时重新跟进；运行时每次都读取最新已提交
 快照，把现实状态向该语义状态收敛。`StepId` 工作项不复制 action、输入 Scope 或取消模式。
-只有运行时返回的实际结果才能证明进程成功、失败或被取消。
+已经进入 `Running` 的 Step 只有在运行时回报 completion 后才能成为终态；Core 负责解释该
+completion 对状态和 Scope 的语义影响。
 
 状态、事实、新 Scope 和运行时跟进必须先原子提交，外部动作只能发生在提交之后。
 
@@ -160,8 +161,9 @@ StepState  = Pending
            + Cancelled(StepCancelCause)
 ```
 
-`Running` 的精确定义是：**该 Step 已经被归约器接纳为活动工作，并且同一次已提交状态转换已经
-把该 `StepId` 标记为需要运行时跟进。** 它不要求操作系统进程已经完成 `spawn`。
+Builtin 和 Run 使用同一套 Step 生命周期。`Running` 的精确定义是：**该 Step 已经被归约器接纳为
+活动工作，并且同一次已提交状态转换已经把该 `StepId` 标记为需要运行时跟进。** 它表示存在待
+完成的 realization，不要求存在操作系统进程。
 
 因此 ready 决策不能拆成“先返回完整启动命令、再由调用者另行 `mark_running()`”两个阶段。
 归约器一旦决定 Step ready，就必须在同一个 transition 中完成：
@@ -172,8 +174,14 @@ Pending -> Running
 runtime_steps += StepId
 ```
 
-这里的 `StepId` 只是唤醒引用。Step 的 action 来自不可变 `ExecutionPlan`，输入 Scope 来自已
-提交 `StepRecord.input_scope`；运行时不得从另一份冻结 payload 重新获得这些语义。
+这里的 `StepId` 只是唤醒引用。运行时从最新 committed `ExecutionPlan` 找到该 Step 对应的叶子，
+从 `StepRecord.input_scope` 取得输入 Scope；不得从另一份冻结 payload 重新获得这些语义。
+
+Builtin 不形成另一套状态机或 action 代数。运行时对三种 builtin 使用同一个 Step realization
+入口：`Env` / `Umask` 的结果可由封闭语义确定，`Cd` 可以执行目录存在性、规范化或 workspace
+相关的必要观察；随后都只把 typed completion 回送归约器，由归约器计算成功后的输出 Scope。
+`Run` 则通过进程运行时落实 Pipeline。实现方式可以不同，但 Step 生命周期、提交边界和完成协议
+不分叉。
 
 ### <a id="term-cancellation"></a>取消 `Cancellation`
 
@@ -191,12 +199,15 @@ StepCancelCause  = ExecutionRequested + AnySuccessSatisfied
 取消状态遵守：
 
 - Pending Step 被 execution cancel 选中时可直接进入 `Cancelled(ExecutionRequested)`，因为没有
-  需要清理的运行尝试；
+  需要清理的 realization；
 - Pending 的 `AnySuccess` loser 进入 `Skipped(AnySuccessSatisfied)`；
 - Running Step 被取消时进入 `Cancelling(cause, mode)`，并把该 `StepId` 加入运行时跟进集合；
 - `Cancelling` 是非终态，只表示取消请求已提交；
 - 若运行时随后报告正常成功，则进入 `Succeeded`；正常失败则进入 `Failed`；只有明确报告
   cancellation completion 才进入 `Cancelled(cause)`；
+- runtime 若能证明该 Step 尚未产生需要清理的物理运行尝试，则观察到 `Cancelling` 后不得再
+  开始 realization，并应直接回报 cancellation completion；Builtin 本身不拥有需要跨取消排空的
+  物理进程，因此也遵循这一规则；
 - `Force` 可以强化先前的 `Graceful`，强化时再次标记同一个 `StepId` 需要运行时跟进；
 - 同等级重复请求幂等；
 - 并发结果只按归约器接受并提交输入的顺序决定，不比较墙钟时间。
@@ -217,9 +228,10 @@ Parallel 必须等所有已启动 loser 进入终态后才能成为终态。由�
 
 ### <a id="term-fact"></a>事实 `Fact`
 
-`Fact` 是**已经由归约器接受并成功提交**的可观察状态变化。它不能描述尚未完成的操作系统结果。
-例如 `Running -> Cancelling` 可以成为事实，但“已发出 SIGTERM”或“进程已经退出”只有在相应
-运行时结果被接受后才能影响终态事实。
+归约器可以产生候选 facts；**只有与对应 next snapshot 一起成功提交后，它们才成为可观察的
+`Fact`**。Fact 描述已经发生的语义变化，不能把尚未完成的操作系统结果写成既成事实。例如
+`Running -> Cancelling` 可以在提交后成为 Fact，但“已发出 SIGTERM”或“进程已经退出”只有在
+相应运行时结果被接受后才能影响终态 Fact。
 
 一次归约产生：
 
@@ -237,8 +249,8 @@ transition.runtime_steps : Set<StepId>
 transition.new_scopes    : Vec<Scope>
 ```
 
-`runtime_steps` 只回答“哪些 Step 的物理实现需要重新检查”，不冻结“应该启动什么”或“应该以
-什么模式取消”。`ExecutionPlan`、`StepRecord.input_scope` 和 `StepState` 才是这些语义的唯一
+`runtime_steps` 只回答“哪些 Step 的 realization 需要重新检查”，不冻结“应该启动什么”或“应该
+以什么模式取消”。`ExecutionPlan`、`StepRecord.input_scope` 和 `StepState` 才是这些语义的唯一
 事实源。
 
 因此 Core 不再需要通用 `RuntimeAction`，也不需要把 `ReadyStep(action, scope)`、
@@ -261,16 +273,16 @@ transition 对外完全不可见。
 
 ### 运行时跟进与状态收敛
 
-运行时消费一个已提交 `StepId` 时，必须重新读取该 Step 的**最新已提交状态**，而不是执行
-产生该唤醒时冻结的历史命令：
+运行时消费一个已提交 `StepId` 时，必须重新读取该 Step 的**最新已提交状态、对应计划叶子和
+输入 Scope**，而不是执行产生该唤醒时冻结的历史命令。Builtin 与 Run 都遵循同一规则：
 
-| 最新 StepState | 运行时应满足的物理状态 |
+| 最新 StepState | 运行时要求 |
 |---|---|
-| `Pending` | 不创建新的物理实现。 |
-| `Running` | 确保该 Step 的当前运行尝试被唯一持有并继续实现；不得盲目创建第二个尝试。 |
-| `Cancelling(cause, Graceful)` | 不再创建新尝试；若已有活动尝试则请求 Graceful 终止并等待结果；若尚未开始则直接收敛为“不运行”。 |
-| `Cancelling(cause, Force)` | 不再创建新尝试；若已有活动尝试则请求 Force 终止并等待结果；旧 Graceful 唤醒必须服从最新 Force 状态。 |
-| terminal state | 不得创建新尝试；只允许完成必要的运行时 ownership 清理。 |
+| `Pending` | 不开始 realization。 |
+| `Running` | 唯一持有并推进该 Step 当前 realization；Builtin 执行封闭 builtin 语义，Run 落实 Pipeline；不得盲目创建第二个物理运行尝试。 |
+| `Cancelling(cause, Graceful)` | 不开始新的 realization；若不存在需要排空的物理运行尝试则直接回报 cancellation completion，否则请求 Graceful 终止并等待结果。 |
+| `Cancelling(cause, Force)` | 不开始新的 realization；若不存在需要排空的物理运行尝试则直接回报 cancellation completion，否则请求 Force 终止并等待结果；旧 Graceful 唤醒必须服从最新 Force 状态。 |
+| terminal state | 不开始 realization；只允许完成必要的 runtime ownership 清理。 |
 
 这使以下过期工作天然安全：
 
@@ -283,8 +295,9 @@ Cancelling(Force) + runtime_steps={S}
 ```
 
 worker 最终即使由较早的 `Running` transition 被唤醒，也必须读取最新 `Cancelling(Force)`，因此
-不会先启动一个已经不再需要的进程再去取消它。同理，Graceful -> Force 不依赖两条取消命令的
-消费顺序，只依赖最新 committed StepState。
+不会先启动一个已经不再需要的进程再去取消它；如果还能证明尚未创建物理运行尝试，就直接回报
+取消完成。同理，Graceful -> Force 不依赖两条取消命令的消费顺序，只依赖最新 committed
+StepState。
 
 `StepId` 本身不能表达运行时工作的**交付进度**。持久实现仍必须保存无法从 snapshot 推导出的
 交付元数据，以防重复 worker、丢失唤醒或旧 worker 覆盖新状态。推荐实现是每个 Step 使用单调
@@ -351,7 +364,7 @@ env set A=left -> printenv A
 
 ### <a id="term-sensitivity"></a>敏感性 `Sensitivity`
 
-环境值显式携带敏感性：
+环境值可以显式携带敏感性分类：
 
 ```text
 Sensitivity = Normal + Sensitive
@@ -361,12 +374,13 @@ EnvPatch    = Map<EnvKey, EnvEdit>
 EnvEdit     = Set(EnvValue) + Unset
 ```
 
-变量名猜测只能辅助自动标注或警告，不能成为安全边界。初始 Scope、Process EnvPatch 或 Env
-builtin mutation 的任何位置出现 `Sensitive`，该 Execution 从提交开始就是易失执行：Scope、
-投影、事实、操作结果以及运行时跟进记录都只能存在于内存，并且生命周期中不能从易失升级为
-持久。
+`Sensitivity` 只表达数据分类，不在 Core 中引入第二套 Execution 或持久化状态。变量名猜测可以
+辅助自动标注或警告，但不能替代显式分类，也不能成为安全边界。
 
-“易失执行”因此是 `Sensitivity` 的派生性质，不再作为独立领域概念。
+该分类使实现能够提供 Sensitive Execution，例如采用易失存储或不透明凭证引用。**本 FP 不规定
+Sensitive Execution 的持久化、恢复、重连或崩溃处理协议，也不要求第一阶段实现必须提供这些
+能力。** 不支持 Sensitive Execution 的实现应显式拒绝，而不能静默把 `Sensitive` 降级为
+`Normal`。具体保护策略可以由后续 FP 单独定义。
 
 长期更推荐凭证提供者在运行时根据不透明引用注入秘密字节，使秘密值本身不进入语义计划、Scope
 或事实。
@@ -377,15 +391,20 @@ builtin mutation 的任何位置出现 `Sensitive`，该 Execution 从提交开�
 绑定为带类型的运行时端口。它负责**如何实现** ExecutionPlan，而不能扩展或改写
 ExecutionPlan 的语义。
 
-提供者收到的下列语义输入必须保持只读：
+运行时工作项本身只有 `StepId`。worker 从最新 committed 状态解析该 Step 的语义输入：
 
 ```text
-StepId × Pipeline × IoMode × Scope
+Builtin : StepId × BuiltinCommand × Scope
+Run     : StepId × Pipeline × IoMode × Scope
 ```
 
-这些语义输入从最新已提交 Execution/Step 状态解析；运行时工作项本身不携带另一份可变副本。
-工作目录材料、包装器、资源句柄、沙箱、秘密注入等属于物理实现上下文，可以被构造或调整；但
-StepId、逻辑 argv/EnvPatch、IoMode 和逻辑 Scope 不能在归约器决定之后被静默改写。
+这只是同一个 Step realization 在两种封闭计划叶子上的输入形状，不是第二份 action 状态或持久
+命令。Builtin 和 Run 的生命周期、交付与取消协议保持一致；Composition 可以替换实现机制，但
+不能改变 `BuiltinCommand` / Pipeline / IoMode / Scope 的逻辑含义。
+
+提供者收到的语义输入必须保持只读。工作目录材料、包装器、资源句柄、沙箱、秘密注入等属于物理
+实现上下文，可以被构造或调整；但 StepId、BuiltinCommand、逻辑 argv/EnvPatch、IoMode 和
+逻辑 Scope 不能在归约器决定之后被静默改写。
 
 Composition 的排序属于端口贡献关系，而不是提供者全局关系；一个提供者参与多个端口时，不能
 因为某个端口的排序声明要求目标也贡献其他无关端口。
@@ -431,13 +450,14 @@ v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把�
   定义所有权；
 - Core serialization 测试证明 `ExecutionPlan` 只有四个 variant，非法 pipeline、空并行和
   冲突 env edit 无法构造或反序列化；
-- reducer 测试证明 ready 决策与 `Pending -> Running`、`runtime_steps += StepId` 属于同一个
-  transition，并覆盖稳定 StepId、Sequence Scope threading、Parallel fork/no-merge；
-- cancellation 测试覆盖 `Running -> Cancelling -> terminal`、正常完成与取消竞争、
-  Graceful -> Force 强化、AnySuccess loser draining，并证明取消来源与模式互不重复编码；
+- reducer 测试证明 Builtin/Run ready 决策与 `Pending -> Running`、`runtime_steps += StepId`
+  属于同一个 transition，并覆盖稳定 StepId、Sequence Scope threading、Parallel fork/no-merge；
+- cancellation 测试覆盖 `Running -> Cancelling -> terminal`、未开始 realization 的直接取消
+  完成、正常完成与取消竞争、Graceful -> Force 强化、AnySuccess loser draining，并证明取消
+  来源与模式互不重复编码；
 - 持久化测试证明 snapshot/facts/new scopes/runtime follow-up 原子记录，commit failure 不修改
   live state且不执行外部动作；
-- 运行时收敛测试证明过期 Running 唤醒在最新状态为 Cancelling/terminal 时不会启动进程，
+- 运行时收敛测试证明过期 Running 唤醒在最新状态为 Cancelling/terminal 时不会开始 realization，
   Graceful 旧唤醒服从最新 Force 状态；
 - 交付测试证明同一 Step 在 worker 执行期间再次变化时不会丢失新一代 follow-up，旧 worker
   不能把更新后的 generation 标记为已完成；
@@ -445,10 +465,12 @@ v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把�
   终态；
 - Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link 和
   per-Run captured/PTY；
-- Runtime 测试验证 pipeline wiring、captured output、PTY、control/cancel，并验证 provider
-  无法修改 semantic Step 输入；
-- Protocol/store/client 测试覆盖 strict framing、OperationId 重放、query 不触发 `PutScope`、
-  `tail N` suffix，以及 Sensitive data 不落盘；
+- Runtime 测试验证 Builtin/Run 使用同一 Step realization contract，并覆盖 pipeline wiring、
+  captured output、PTY、control/cancel，以及 provider 无法修改 semantic Step 输入；
+- Core/protocol 测试证明 `Sensitivity` 分类可稳定往返；Sensitive Execution 的持久化与恢复能力
+  不属于本 FP 的必选验证项；
+- Protocol/store/client 测试覆盖 strict framing、OperationId 重放、query 不触发 `PutScope`
+  与 `tail N` suffix；
 - daemon smoke 覆盖 Unix socket lifecycle、ack flush-before-drain、restart successor 与旧
   database archive；
 - 架构检查拒绝恢复 IPC v3 模块、daemon 内 surface parser，以及 Core 反向依赖 runtime、
