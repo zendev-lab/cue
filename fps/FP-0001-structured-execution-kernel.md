@@ -370,7 +370,7 @@ v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把�
 ## 验证
 
 - 定义所有权检查证明 9 个 Cue 稳定概念与 `term-*` 小标题一一对应，参考实现术语不取得
-  ownership；
+  定义所有权；
 - Core serialization 测试证明 `ExecutionPlan` 只有四个 variant，非法 pipeline、空并行和
   冲突 env edit 无法构造或反序列化；
 - reducer 测试证明 ready 决策与 `Pending -> Running` 属于同一个 transition，并覆盖稳定
