@@ -183,6 +183,11 @@ Builtin 不形成另一套状态机或 action 代数。运行时对三种 builti
 `Run` 则通过进程运行时落实 Pipeline。实现方式可以不同，但 Step 生命周期、提交边界和完成协议
 不分叉。
 
+Builtin realization 可以观察运行时环境，但不能修改守护进程自己的 ambient cwd/env/umask，
+也不能留下独立的外部资源或物理 ownership；它唯一可提交的语义效果是归约器产生的新 Scope。
+因此未提交 completion 的 Builtin 可以在崩溃后从最新 committed 输入安全重试。需要留下外部
+资源或不可安全重放副作用的操作不应作为 Builtin 引入。
+
 ### <a id="term-cancellation"></a>取消 `Cancellation`
 
 取消只保留两个正交维度：**来源**和**模式**。
@@ -284,7 +289,7 @@ transition 对外完全不可见。
 | `Cancelling(cause, Force)` | 不开始新的 realization；若不存在需要排空的物理运行尝试则直接回报 cancellation completion，否则请求 Force 终止并等待结果；旧 Graceful 唤醒必须服从最新 Force 状态。 |
 | terminal state | 不开始 realization；只允许完成必要的 runtime ownership 清理。 |
 
-这使以下过期工作天然安全：
+这使**尚未开始处理的过期唤醒**天然安全：
 
 ```text
 Running + runtime_steps={S}
@@ -294,10 +299,10 @@ Running + runtime_steps={S}
 Cancelling(Force) + runtime_steps={S}
 ```
 
-worker 最终即使由较早的 `Running` transition 被唤醒，也必须读取最新 `Cancelling(Force)`，因此
-不会先启动一个已经不再需要的进程再去取消它；如果还能证明尚未创建物理运行尝试，就直接回报
-取消完成。同理，Graceful -> Force 不依赖两条取消命令的消费顺序，只依赖最新 committed
-StepState。
+worker 即使由较早的 `Running` transition 被唤醒，只要是在取消提交后才取得并处理该工作，也
+必须读取最新 `Cancelling(Force)`，不得再开始 realization；如果还能证明尚未创建物理运行尝试，
+就直接回报取消完成。如果 Run 已经在取消提交前跨过物理启动边界，则它是需要排空的活动 attempt，
+不能再按“尚未开始”处理。Graceful -> Force 同样只服从最新 committed StepState。
 
 `StepId` 本身不能表达运行时工作的**交付进度**。持久实现仍必须保存无法从 snapshot 推导出的
 交付元数据，以防重复 worker、丢失唤醒或旧 worker 覆盖新状态。推荐实现是每个 Step 使用单调
@@ -317,7 +322,7 @@ generation、claim、worker 状态都属于实现层，不进入 Core ADT、Fact
 
 ### 崩溃恢复与物理所有权
 
-状态收敛不会消除不可幂等的操作系统边界。例如：
+状态收敛不会消除 `Run` 的不可幂等操作系统边界。例如：
 
 ```text
 spawn 成功
@@ -327,7 +332,7 @@ spawn 成功
 此时新守护进程只看到 `StepState::Running`，无法据此判断旧进程是否已经存在。因此
 `StepId + generation` 只能解决可靠唤醒，不能证明物理 attempt 的唯一性。
 
-恢复必须遵守：
+对可能留下物理运行尝试的 realization，恢复必须遵守：
 
 > 在无法证明旧运行尝试已经静止，或无法重新取得其唯一控制权时，既不能再次启动同一个 Step，
 > 也不能把它提前宣布为终态。
@@ -336,8 +341,9 @@ spawn 成功
 或重新取得控制权。FP 不规定具体实现。若无法证明，则必须失败关闭：不重复启动、不启动依赖
 工作，也不发布虚假的终态事实。
 
-Core 可以提供“把活动 Step 解释为重启中断失败”的纯状态转换，但守护进程只有在上述静止条件
-已经成立后才能调用它。
+Builtin 不留下这种物理 ownership，因此不受上述重复 spawn 限制；若其 completion 尚未提交，
+恢复后可以从最新 committed Step 与 Scope 重新执行 realization。Core 也可以提供“把活动 Run
+解释为重启中断失败”的纯状态转换，但守护进程只有在旧运行尝试已经静止后才能调用它。
 
 ### 表面语言
 
@@ -461,8 +467,8 @@ v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把�
   Graceful 旧唤醒服从最新 Force 状态；
 - 交付测试证明同一 Step 在 worker 执行期间再次变化时不会丢失新一代 follow-up，旧 worker
   不能把更新后的 generation 标记为已完成；
-- 崩溃恢复测试证明无法确认旧运行尝试静止或重新取得控制权时不会重复 spawn，也不会发布虚假
-  终态；
+- 崩溃恢复测试证明 Builtin 可安全重放，同时无法确认旧 Run attempt 静止或重新取得控制权时不会
+  重复 spawn，也不会发布虚假终态；
 - Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link 和
   per-Run captured/PTY；
 - Runtime 测试验证 Builtin/Run 使用同一 Step realization contract，并覆盖 pipeline wiring、
