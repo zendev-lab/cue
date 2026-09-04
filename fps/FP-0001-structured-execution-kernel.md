@@ -184,9 +184,10 @@ Builtin 不形成另一套状态机或 action 代数。运行时对三种 builti
 不分叉。
 
 Builtin realization 可以观察运行时环境，但不能修改守护进程自己的 ambient cwd/env/umask，
-也不能留下独立的外部资源或物理 ownership；它唯一可提交的语义效果是归约器产生的新 Scope。
-因此未提交 completion 的 Builtin 可以在崩溃后从最新 committed 输入安全重试。需要留下外部
-资源或不可安全重放副作用的操作不应作为 Builtin 引入。
+也不能留下独立的外部资源或物理 ownership。除 Step completion 及其产生的状态/Fact 外，它对
+执行上下文的唯一语义输出是归约器产生的新 Scope。因此未提交 completion 的 Builtin 可以在
+崩溃后从最新 committed 输入安全重试。需要留下外部资源或不可安全重放副作用的操作不应作为
+Builtin 引入。
 
 ### <a id="term-cancellation"></a>取消 `Cancellation`
 
@@ -197,9 +198,9 @@ CancelMode       = Graceful + Force
 StepCancelCause  = ExecutionRequested + AnySuccessSatisfied
 ```
 
-执行级取消只有一个语义：“不要再启动新的工作”。因此 `ExecutionSnapshot` 只需要
-`Option<CancelMode>`，不再额外维护 `User / Forced` 之类与模式重复的 reason enum。
-`Force` 是取消模式，不是另一种取消原因。
+执行级取消只有一个来源：`ExecutionRequested`。它要求不再启动新的工作，并按请求的
+`CancelMode` 取消已有活动 Step。因此 `ExecutionSnapshot` 只需要 `Option<CancelMode>`，不再额外
+维护 `User / Forced` 之类与模式重复的 reason enum；`Force` 是模式，不是另一种取消原因。
 
 取消状态遵守：
 
@@ -397,7 +398,8 @@ Sensitive Execution 的持久化、恢复、重连或崩溃处理协议，也不
 绑定为带类型的运行时端口。它负责**如何实现** ExecutionPlan，而不能扩展或改写
 ExecutionPlan 的语义。
 
-运行时工作项本身只有 `StepId`。worker 从最新 committed 状态解析该 Step 的语义输入：
+运行时 follow-up 的**语义引用**只有 `StepId`；generation / claim 等只属于交付元数据，不是
+另一份执行语义。worker 从最新 committed 状态解析该 Step 的输入：
 
 ```text
 Builtin : StepId × BuiltinCommand × Scope
