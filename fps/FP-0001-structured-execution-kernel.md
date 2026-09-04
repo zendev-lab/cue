@@ -24,12 +24,15 @@ defines:
 
 Cue 收敛为持久、可观察的本地结构化进程执行内核。Core 用封闭的 `ExecutionPlan`
 定义执行语义，用不可变 `Scope` 表达执行上下文，用纯归约器决定状态变化；运行时只负责把
-已经确定的工作落实为真实进程。守护进程只提供严格 IPC v4，不在内核中拥有会话、调度、
-重试、资源、审批或远程目标策略。
+已经提交的 Step 状态落实为真实进程状态。守护进程只提供严格 IPC v4，不在内核中拥有会话、
+调度、重试、资源、审批或远程目标策略。
 
-本提案坚持一个边界：**决定与事实分离**。Core 可以决定“启动这个 Step”或“请求取消这个
-Step”，但只有运行时返回的实际结果才能证明进程成功、失败或被取消。状态、事实和待执行请求
-必须先原子提交，外部动作只能发生在提交之后。
+本提案坚持两个边界：**决定与事实分离，语义与交付分离**。Core 只提交“某个 Step 现在应该
+处于什么状态”，并用 `StepId` 标记哪些 Step 需要运行时重新跟进；运行时每次都读取最新已提交
+快照，把现实状态向该语义状态收敛。`StepId` 工作项不复制 action、输入 Scope 或取消模式。
+只有运行时返回的实际结果才能证明进程成功、失败或被取消。
+
+状态、事实、新 Scope 和运行时跟进必须先原子提交，外部动作只能发生在提交之后。
 
 ## 动机
 
@@ -43,7 +46,9 @@ Step”，但只有运行时返回的实际结果才能证明进程成功、失�
 
 另外，`spawn`、进程信号、PTY 控制等操作系统动作不能和 SQLite 提交组成一个 ACID
 事务。如果把“准备做什么”提前写成“已经发生什么”，就会产生持久状态与现实进程不一致的
-错误。因此持久状态只能记录已经确认的状态，以及仍待执行的请求。
+错误。如果再把 action、Scope、取消模式复制进待执行命令，又会产生第二份可能过期的语义
+事实源。因此持久状态负责表达“现在应该是什么”，运行时工作只负责可靠唤醒实现层去读取并
+落实最新状态。
 
 ## 设计
 
@@ -54,7 +59,8 @@ Step”，但只有运行时返回的实际结果才能证明进程成功、失�
 | 术语 | 本文用法 |
 |---|---|
 | **归约器（reducer）** | 纯状态转换函数；输入当前值与一个已确认事件，计算下一值及派生输出。 |
-| **事务发件箱（Transactional Outbox）** | 把业务状态与待执行外部动作记录在同一数据库事务中的常见持久化模式。 |
+| **状态收敛（reconciliation）** | 读取最新已提交状态，使运行时实体逐步符合该状态；过期唤醒本身不携带独立语义。 |
+| **事务发件箱（Transactional Outbox）** | 把业务状态与待执行外部工作记录在同一数据库事务中的常见持久化模式。 |
 | **静止（quiescent）** | 某个运行尝试已经确定不会继续运行，也不会再产生属于该尝试的活动进程。 |
 | **失败关闭（fail closed）** | 无法证明操作安全时拒绝继续，而不是按乐观假设推进。 |
 
@@ -154,20 +160,20 @@ StepState  = Pending
            + Cancelled(StepCancelCause)
 ```
 
-`Running` 的精确定义是：**该 Step 已经被归约器接纳为活动工作，并且对应启动请求属于同一次
-已提交状态转换。** 它不要求操作系统进程已经完成 `spawn`。
+`Running` 的精确定义是：**该 Step 已经被归约器接纳为活动工作，并且同一次已提交状态转换已经
+把该 `StepId` 标记为需要运行时跟进。** 它不要求操作系统进程已经完成 `spawn`。
 
-因此 ready 决策不能拆成“先返回 `ReadyStep`、再由调用者另行 `mark_running()`”两个阶段。
+因此 ready 决策不能拆成“先返回完整启动命令、再由调用者另行 `mark_running()`”两个阶段。
 归约器一旦决定 Step ready，就必须在同一个 transition 中完成：
 
 ```text
 Pending -> Running
 +
-ReadyStep
+runtime_steps += StepId
 ```
 
-这样持久层可以把新状态和启动请求原子提交，不存在“拿到了启动请求但 Step 仍是 Pending”的
-中间契约。
+这里的 `StepId` 只是唤醒引用。Step 的 action 来自不可变 `ExecutionPlan`，输入 Scope 来自已
+提交 `StepRecord.input_scope`；运行时不得从另一份冻结 payload 重新获得这些语义。
 
 ### <a id="term-cancellation"></a>取消 `Cancellation`
 
@@ -176,8 +182,6 @@ ReadyStep
 ```text
 CancelMode       = Graceful + Force
 StepCancelCause  = ExecutionRequested + AnySuccessSatisfied
-
-CancelStep       = StepId × StepCancelCause × CancelMode
 ```
 
 执行级取消只有一个语义：“不要再启动新的工作”。因此 `ExecutionSnapshot` 只需要
@@ -189,11 +193,12 @@ CancelStep       = StepId × StepCancelCause × CancelMode
 - Pending Step 被 execution cancel 选中时可直接进入 `Cancelled(ExecutionRequested)`，因为没有
   需要清理的运行尝试；
 - Pending 的 `AnySuccess` loser 进入 `Skipped(AnySuccessSatisfied)`；
-- Running Step 被取消时进入 `Cancelling(cause, mode)`，并产生 `CancelStep`；
+- Running Step 被取消时进入 `Cancelling(cause, mode)`，并把该 `StepId` 加入运行时跟进集合；
 - `Cancelling` 是非终态，只表示取消请求已提交；
 - 若运行时随后报告正常成功，则进入 `Succeeded`；正常失败则进入 `Failed`；只有明确报告
   cancellation completion 才进入 `Cancelled(cause)`；
-- `Force` 可以强化先前的 `Graceful`，同等级重复请求幂等；
+- `Force` 可以强化先前的 `Graceful`，强化时再次标记同一个 `StepId` 需要运行时跟进；
+- 同等级重复请求幂等；
 - 并发结果只按归约器接受并提交输入的顺序决定，不比较墙钟时间。
 
 执行级 `ExecutionState` 也是派生值：
@@ -228,42 +233,95 @@ current snapshot + input
         +--> facts
         `--> transition
 
-ExecutionTransition = Vec<ReadyStep>
-                    × Vec<CancelStep>
-                    × Vec<Scope>
+transition.runtime_steps : Set<StepId>
+transition.new_scopes    : Vec<Scope>
 ```
 
-这里没有额外的通用 `RuntimeAction` 代数。`ReadyStep` 和 `CancelStep` 已经足够表达 Core 当前
-唯一需要运行时落实的两类请求；未来若执行语义真的增加新的外部动作，应通过新的 FP 明确增加，
-而不是提前引入无限开放的 action 类型。
+`runtime_steps` 只回答“哪些 Step 的物理实现需要重新检查”，不冻结“应该启动什么”或“应该以
+什么模式取消”。`ExecutionPlan`、`StepRecord.input_scope` 和 `StepState` 才是这些语义的唯一
+事实源。
+
+因此 Core 不再需要通用 `RuntimeAction`，也不需要把 `ReadyStep(action, scope)`、
+`CancelStep(cause, mode)` 作为独立持久化语义。未来若执行语义真的增加新的状态维度，应通过
+新的 FP 修改 Step/Execution 模型，而不是先扩张一个开放 action 代数。
 
 所有持久实现必须保证：
 
 ```text
 计算下一状态
-  -> 原子提交 snapshot / facts / new scopes / ready-cancel requests
+  -> 原子提交 snapshot / facts / new scopes / runtime follow-up
   -> 更新内存中的权威投影
   -> 发布已提交 facts
-  -> 落实已提交请求
+  -> 按 StepId 读取最新 committed snapshot 并收敛运行时状态
   -> 将真实结果作为下一次 reducer input
 ```
 
 因此提交之前不得修改权威内存投影、发布 fact、启动进程或发送取消信号。提交失败时，本次
 transition 对外完全不可见。
 
-事务发件箱是一种适合 SQLite 的实现：把状态和待执行请求写进同一事务，提交后再派发请求。
-它是持久层技术，不属于 Core 执行代数；具体表结构、派发状态和内部 ID 不进入本提案的核心
-定义。
+### 运行时跟进与状态收敛
 
-### 崩溃恢复
+运行时消费一个已提交 `StepId` 时，必须重新读取该 Step 的**最新已提交状态**，而不是执行
+产生该唤醒时冻结的历史命令：
 
-守护进程崩溃后，旧进程可能仍然存活。恢复必须遵守：
+| 最新 StepState | 运行时应满足的物理状态 |
+|---|---|
+| `Pending` | 不创建新的物理实现。 |
+| `Running` | 确保该 Step 的当前运行尝试被唯一持有并继续实现；不得盲目创建第二个尝试。 |
+| `Cancelling(cause, Graceful)` | 不再创建新尝试；若已有活动尝试则请求 Graceful 终止并等待结果；若尚未开始则直接收敛为“不运行”。 |
+| `Cancelling(cause, Force)` | 不再创建新尝试；若已有活动尝试则请求 Force 终止并等待结果；旧 Graceful 唤醒必须服从最新 Force 状态。 |
+| terminal state | 不得创建新尝试；只允许完成必要的运行时 ownership 清理。 |
 
-> 在无法证明旧运行尝试已经静止时，既不能再次启动同一个 Step，也不能把它提前宣布为终态。
+这使以下过期工作天然安全：
 
-运行时可以通过独立进程监护器、可重新定位的稳定进程句柄或其他机制证明旧运行尝试已经静止。
-FP 不规定具体实现。若无法证明，则必须失败关闭：不重复启动、不启动依赖工作，也不发布虚假的
-终态事实。
+```text
+Running + runtime_steps={S}
+        |
+        | 尚未落实时收到取消
+        v
+Cancelling(Force) + runtime_steps={S}
+```
+
+worker 最终即使由较早的 `Running` transition 被唤醒，也必须读取最新 `Cancelling(Force)`，因此
+不会先启动一个已经不再需要的进程再去取消它。同理，Graceful -> Force 不依赖两条取消命令的
+消费顺序，只依赖最新 committed StepState。
+
+`StepId` 本身不能表达运行时工作的**交付进度**。持久实现仍必须保存无法从 snapshot 推导出的
+交付元数据，以防重复 worker、丢失唤醒或旧 worker 覆盖新状态。推荐实现是每个 Step 使用单调
+递增的 generation：
+
+```text
+runtime_work = StepId × desired_generation × applied_generation × claim?
+```
+
+归约器 transition 每次把 Step 加入 `runtime_steps`，持久层都在同一事务中推进
+`desired_generation`。worker 只能把自己已处理的 generation 推进到 `applied_generation`；若
+处理期间状态再次变化，新的 `desired_generation` 仍然大于 applied，不会被旧 worker 清掉。
+
+generation、claim、worker 状态都属于实现层，不进入 Core ADT、Fact 或定义所有权。事务发件箱
+仍可用于实现这个原子边界，但此时它更接近事务化工作队列：记录 `StepId` 与交付版本，而不是
+复制 action、Scope、cause 或 mode。
+
+### 崩溃恢复与物理所有权
+
+状态收敛不会消除不可幂等的操作系统边界。例如：
+
+```text
+spawn 成功
+  -> 守护进程在记录 process handle 前崩溃
+```
+
+此时新守护进程只看到 `StepState::Running`，无法据此判断旧进程是否已经存在。因此
+`StepId + generation` 只能解决可靠唤醒，不能证明物理 attempt 的唯一性。
+
+恢复必须遵守：
+
+> 在无法证明旧运行尝试已经静止，或无法重新取得其唯一控制权时，既不能再次启动同一个 Step，
+> 也不能把它提前宣布为终态。
+
+运行时可以通过独立进程监护器、可重新定位的稳定进程句柄或其他机制证明旧运行尝试已经静止，
+或重新取得控制权。FP 不规定具体实现。若无法证明，则必须失败关闭：不重复启动、不启动依赖
+工作，也不发布虚假的终态事实。
 
 Core 可以提供“把活动 Step 解释为重启中断失败”的纯状态转换，但守护进程只有在上述静止条件
 已经成立后才能调用它。
@@ -305,7 +363,7 @@ EnvEdit     = Set(EnvValue) + Unset
 
 变量名猜测只能辅助自动标注或警告，不能成为安全边界。初始 Scope、Process EnvPatch 或 Env
 builtin mutation 的任何位置出现 `Sensitive`，该 Execution 从提交开始就是易失执行：Scope、
-投影、事实、操作结果以及持久化请求记录都只能存在于内存，并且生命周期中不能从易失升级为
+投影、事实、操作结果以及运行时跟进记录都只能存在于内存，并且生命周期中不能从易失升级为
 持久。
 
 “易失执行”因此是 `Sensitivity` 的派生性质，不再作为独立领域概念。
@@ -325,6 +383,7 @@ ExecutionPlan 的语义。
 StepId × Pipeline × IoMode × Scope
 ```
 
+这些语义输入从最新已提交 Execution/Step 状态解析；运行时工作项本身不携带另一份可变副本。
 工作目录材料、包装器、资源句柄、沙箱、秘密注入等属于物理实现上下文，可以被构造或调整；但
 StepId、逻辑 argv/EnvPatch、IoMode 和逻辑 Scope 不能在归约器决定之后被静默改写。
 
@@ -372,13 +431,18 @@ v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把�
   定义所有权；
 - Core serialization 测试证明 `ExecutionPlan` 只有四个 variant，非法 pipeline、空并行和
   冲突 env edit 无法构造或反序列化；
-- reducer 测试证明 ready 决策与 `Pending -> Running` 属于同一个 transition，并覆盖稳定
-  StepId、Sequence Scope threading、Parallel fork/no-merge；
+- reducer 测试证明 ready 决策与 `Pending -> Running`、`runtime_steps += StepId` 属于同一个
+  transition，并覆盖稳定 StepId、Sequence Scope threading、Parallel fork/no-merge；
 - cancellation 测试覆盖 `Running -> Cancelling -> terminal`、正常完成与取消竞争、
   Graceful -> Force 强化、AnySuccess loser draining，并证明取消来源与模式互不重复编码；
-- 持久化测试证明 snapshot/facts/new scopes/ready-cancel requests 原子记录，commit failure
-  不修改 live state且不执行外部动作；
-- 崩溃恢复测试证明无法确认旧运行尝试静止时不会重复 spawn，也不会发布虚假终态；
+- 持久化测试证明 snapshot/facts/new scopes/runtime follow-up 原子记录，commit failure 不修改
+  live state且不执行外部动作；
+- 运行时收敛测试证明过期 Running 唤醒在最新状态为 Cancelling/terminal 时不会启动进程，
+  Graceful 旧唤醒服从最新 Force 状态；
+- 交付测试证明同一 Step 在 worker 执行期间再次变化时不会丢失新一代 follow-up，旧 worker
+  不能把更新后的 generation 标记为已完成；
+- 崩溃恢复测试证明无法确认旧运行尝试静止或重新取得控制权时不会重复 spawn，也不会发布虚假
+  终态；
 - Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link 和
   per-Run captured/PTY；
 - Runtime 测试验证 pipeline wiring、captured output、PTY、control/cancel，并验证 provider
