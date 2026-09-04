@@ -24,8 +24,8 @@ defines:
 
 Cue 收敛为持久、可观察的本地结构化进程执行内核。Core 用封闭的 `ExecutionPlan`
 定义执行语义，用不可变 `Scope` 表达执行上下文，用纯归约器决定状态变化；运行时只负责把
-已经确定的工作落实为真实进程。守护进程只提供严格 IPC v4，不在内核中拥有 session、
-schedule、retry、resource、approval 或远程 target policy。
+已经确定的工作落实为真实进程。守护进程只提供严格 IPC v4，不在内核中拥有会话、调度、
+重试、资源、审批或远程目标策略。
 
 本提案坚持一个边界：**决定与事实分离**。Core 可以决定“启动这个 Step”或“请求取消这个
 Step”，但只有运行时返回的实际结果才能证明进程成功、失败或被取消。状态、事实和待执行请求
@@ -33,10 +33,10 @@ Step”，但只有运行时返回的实际结果才能证明进程成功、失�
 
 ## 动机
 
-旧模型同时承载表面 DSL、进程启动、session 生命周期、调度、资源分配、远程传输和 UI
-状态，导致同一次执行在 Core、守护进程、客户端和持久层具有不同表示。环境变量是当前命令
-局部覆盖还是沿 pipeline 继承、pipe 属性属于哪一端、`cd` 是否改变后续命令、PTY 属于
-process 还是 workflow 等问题都缺少唯一答案。
+旧模型同时承载表面 DSL、进程启动、会话生命周期、调度、资源分配、远程传输和 UI 状态，
+导致同一次执行在 Core、守护进程、客户端和持久层具有不同表示。环境变量是当前命令局部覆盖
+还是沿 pipeline 继承、pipe 属性属于哪一端、`cd` 是否改变后续命令、PTY 属于进程还是工作流
+等问题都缺少唯一答案。
 
 公开执行语义必须足够小，才能由纯归约器决定并稳定持久化；实现机制必须保持开放，才能替换
 进程启动器、Scope 存储、输出存储等实现。二者需要明确分层。
@@ -107,11 +107,11 @@ Argv              = NonEmpty<NulFreeString>
 结构本身保证：
 
 - Core builtin 恰好只有 `Cd`、`Env`、`Umask`；
-- Pipeline 每增加一个 process 必须同时带一个 link，不依赖 `links.len() == processes.len()-1`
+- Pipeline 每增加一个进程必须同时带一个 link，不依赖 `links.len() == processes.len()-1`
   之类的运行时软约束；
 - Parallel 至少有两个分支；
-- extension 可以替换实现，但不能增加 `ExecutionPlan`、`BuiltinCommand`、`PipeLink` 或
-  `IoMode` 的语义 variant。
+- 扩展可以替换实现，但不能增加 `ExecutionPlan`、`BuiltinCommand`、`PipeLink` 或 `IoMode`
+  的语义 variant。
 
 ### <a id="term-scope"></a>执行范围 `Scope`
 
@@ -131,7 +131,7 @@ Scope 不含隐式 parent、delta 或 ambient environment。Scope 的流向只�
 | `Sequence(first, then, when)` | `first` 得到 `S`；被选择的 `then` 得到 `first` 输出 | 实际执行路径的最终 Scope |
 | `Parallel(branches, join)` | 每个分支都得到同一个 `S` | `S`；分支 Scope 不隐式合并 |
 
-因此 `cd`、`env`、`umask` 的影响只能通过 Sequence 显式传播；Parallel 永远 fork 同一个输入，
+因此 `cd`、`env`、`umask` 的影响只能通过 Sequence 显式传播；Parallel 永远从同一个输入分叉，
 不会偷偷合并分支状态。
 
 ### <a id="term-step"></a>步骤 `Step`
@@ -157,7 +157,7 @@ StepState  = Pending
 `Running` 的精确定义是：**该 Step 已经被归约器接纳为活动工作，并且对应启动请求属于同一次
 已提交状态转换。** 它不要求操作系统进程已经完成 `spawn`。
 
-因此 ready 决策不能拆成“先返回 ReadyStep、再由调用者另行 `mark_running()`”两个阶段。
+因此 ready 决策不能拆成“先返回 `ReadyStep`、再由调用者另行 `mark_running()`”两个阶段。
 归约器一旦决定 Step ready，就必须在同一个 transition 中完成：
 
 ```text
@@ -281,9 +281,9 @@ process    = assignment* command-word argument*
 只连续识别 command 前的 assignment，并在第一个 `=` 处分隔 key/value；value 可以为空或
 包含 `=`，不做 `$VAR`、命令替换或其他 shell 展开。同一 key 重复时最后一项生效。
 
-`A=B command` 只产生该 Process 的 `EnvPatch`，不影响 pipeline 的其他 process，也不改变
-后续 Sequence 的 Scope。command 后的 `A=B` 是普通 argv；只有 assignment 而没有 command
-的输入非法；assignment 不能修饰 Cue builtin。
+`A=B command` 只产生该 Process 的 `EnvPatch`，不影响 pipeline 的其他进程，也不改变后续
+Sequence 的 Scope。command 后的 `A=B` 是普通 argv；只有 assignment 而没有 command 的
+输入非法；assignment 不能修饰 Cue builtin。
 
 需要跨 Step 修改环境时必须显式使用 `Env` builtin，例如：
 
@@ -305,8 +305,8 @@ EnvEdit     = Set(EnvValue) + Unset
 
 变量名猜测只能辅助自动标注或警告，不能成为安全边界。初始 Scope、Process EnvPatch 或 Env
 builtin mutation 的任何位置出现 `Sensitive`，该 Execution 从提交开始就是易失执行：Scope、
-投影、事实、operation outcome 以及持久化请求记录都只能存在于内存，并且生命周期中不能从
-易失升级为持久。
+投影、事实、操作结果以及持久化请求记录都只能存在于内存，并且生命周期中不能从易失升级为
+持久。
 
 “易失执行”因此是 `Sensitivity` 的派生性质，不再作为独立领域概念。
 
@@ -316,7 +316,7 @@ builtin mutation 的任何位置出现 `Sensitive`，该 Execution 从提交开�
 ### <a id="term-composition"></a>组合 `Composition`
 
 `Composition` 是 Cue 的开放实现图：提供者在守护进程启动时声明能力、依赖和顺序，经校验后
-绑定为 typed runtime ports。它负责**如何实现** ExecutionPlan，而不能扩展或改写
+绑定为带类型的运行时端口。它负责**如何实现** ExecutionPlan，而不能扩展或改写
 ExecutionPlan 的语义。
 
 提供者收到的下列语义输入必须保持只读：
@@ -325,9 +325,8 @@ ExecutionPlan 的语义。
 StepId × Pipeline × IoMode × Scope
 ```
 
-workspace、wrapper、resource handle、sandbox、secret injection 等属于物理实现上下文，可以
-被构造或调整；但 StepId、逻辑 argv/EnvPatch、IoMode 和逻辑 Scope 不能在归约器决定之后被
-静默改写。
+工作目录材料、包装器、资源句柄、沙箱、秘密注入等属于物理实现上下文，可以被构造或调整；但
+StepId、逻辑 argv/EnvPatch、IoMode 和逻辑 Scope 不能在归约器决定之后被静默改写。
 
 Composition 的排序属于端口贡献关系，而不是提供者全局关系；一个提供者参与多个端口时，不能
 因为某个端口的排序声明要求目标也贡献其他无关端口。
