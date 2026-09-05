@@ -366,6 +366,7 @@ pub struct DaemonService {
     next_attachment: AtomicU64,
     lifecycle: tokio::sync::broadcast::Sender<LifecycleSignal>,
     draining: std::sync::atomic::AtomicBool,
+    lifecycle_outcomes: Mutex<BTreeMap<(String, String), LifecycleSignal>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,6 +415,7 @@ impl DaemonService {
             next_attachment: AtomicU64::new(1),
             lifecycle,
             draining: std::sync::atomic::AtomicBool::new(false),
+            lifecycle_outcomes: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -822,8 +824,9 @@ pub struct DaemonConnection {
 
 impl DaemonConnection {
     fn response_flushed(&mut self) {
-        if let Some(signal) = self.pending_lifecycle.take() {
-            self.service.draining.store(true, Ordering::Release);
+        if let Some(signal) = self.pending_lifecycle.take()
+            && !self.service.draining.swap(true, Ordering::AcqRel)
+        {
             let _ = self.service.lifecycle.send(signal);
         }
     }
@@ -1155,43 +1158,61 @@ impl DaemonConnection {
                     restart_id: restart_id.clone(),
                     target_instance_id: target_instance_id.clone(),
                 });
-                match self.service.store.record_durable_operation(
+                self.record_lifecycle(
                     &client,
                     &operation,
                     &command,
-                    &response,
-                    now_ms(),
-                )? {
-                    OperationOutcome::Inserted(_) => {
-                        self.pending_lifecycle = Some(LifecycleSignal::Restart {
-                            restart_id,
-                            target_instance_id,
-                        });
-                        Ok(response)
-                    }
-                    OperationOutcome::Replay(response) => Ok(response),
-                    OperationOutcome::Conflict => Err(operation_conflict()),
-                    OperationOutcome::Expired => Err(operation_expired()),
-                }
+                    response,
+                    LifecycleSignal::Restart {
+                        restart_id,
+                        target_instance_id,
+                    },
+                )
             }
-            Command::Shutdown => {
-                let response = ResponsePayload::ack();
-                match self.service.store.record_durable_operation(
-                    &client,
-                    &operation,
-                    &command,
-                    &response,
-                    now_ms(),
-                )? {
-                    OperationOutcome::Inserted(_) => {
-                        self.pending_lifecycle = Some(LifecycleSignal::Shutdown);
-                        Ok(response)
-                    }
-                    OperationOutcome::Replay(response) => Ok(response),
-                    OperationOutcome::Conflict => Err(operation_conflict()),
-                    OperationOutcome::Expired => Err(operation_expired()),
-                }
+            Command::Shutdown => self.record_lifecycle(
+                &client,
+                &operation,
+                &command,
+                ResponsePayload::ack(),
+                LifecycleSignal::Shutdown,
+            ),
+        }
+    }
+
+    fn record_lifecycle(
+        &mut self,
+        client: &ClientId,
+        operation: &OperationId,
+        command: &Command,
+        response: ResponsePayload,
+        signal: LifecycleSignal,
+    ) -> Result<ResponsePayload, RuntimeError> {
+        // Keep unflushed outcomes across connections of this host. A successor
+        // must not act on replayed lifecycle commands belonging to an older host.
+        let mut outcomes = self
+            .service
+            .lifecycle_outcomes
+            .lock()
+            .map_err(|_| RuntimeError::infrastructure("lifecycle outcomes lock poisoned"))?;
+        let key = (client.as_str().to_owned(), operation.as_str().to_owned());
+        match self.service.store.record_durable_operation(
+            client,
+            operation,
+            command,
+            &response,
+            now_ms(),
+        )? {
+            OperationOutcome::Inserted(_) => {
+                outcomes.insert(key, signal.clone());
+                self.pending_lifecycle = Some(signal);
+                Ok(response)
             }
+            OperationOutcome::Replay(response) => {
+                self.pending_lifecycle = outcomes.get(&key).cloned();
+                Ok(response)
+            }
+            OperationOutcome::Conflict => Err(operation_conflict()),
+            OperationOutcome::Expired => Err(operation_expired()),
         }
     }
 
@@ -2221,6 +2242,33 @@ mod tests {
         assert!(service.draining.load(Ordering::Acquire));
         drop(client);
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_replay_after_a_lost_ack_still_signals_once_after_flush() {
+        for command in [Command::Shutdown, Command::Restart] {
+            let service = DaemonService::in_memory().unwrap();
+            let mut signals = service.subscribe_lifecycle();
+            let mut connection = service.connection();
+            hello(&mut connection).await;
+            let message = Message::Command {
+                request_id: RequestId::new(2).unwrap(),
+                operation_id: OperationId::new("lifecycle:replay").unwrap(),
+                command,
+            };
+            let accepted = connection.handle(message.clone()).await;
+            drop(connection); // The committed outcome's response was never flushed.
+            assert!(signals.try_recv().is_err());
+            let mut retry = service.connection();
+            hello(&mut retry).await;
+            assert_eq!(retry.handle(message.clone()).await, accepted);
+            assert!(signals.try_recv().is_err());
+            retry.response_flushed();
+            signals.try_recv().unwrap();
+            assert_eq!(retry.handle(message).await, accepted);
+            retry.response_flushed();
+            assert!(signals.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

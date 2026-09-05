@@ -65,3 +65,8 @@ Lifecycle commands persist their outcome, then the connection writes and
 flushes the response before signalling the host. The host closes admission
 and drains owned Runs before releasing its exclusive lock or starting a
 successor. No fixed delay substitutes for acknowledgement delivery.
+
+If an acknowledgement is lost before flush, the same host retains the pending
+lifecycle outcome across connections. Replaying its OperationId flushes the same
+response before signalling once; a successor does not reapply its predecessor's
+lifecycle commands.
