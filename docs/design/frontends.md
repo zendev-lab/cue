@@ -23,6 +23,10 @@ language, submits through explicit Scope values, watches facts, and refreshes
 from authoritative daemon projections. Output and typed errors are kept in a
 small activity log. PTY terminal emulation remains the CLI passthrough owner's
 job, so `:fg E1/S1` points to `cue fg E1/S1`.
+The serial and multiplexed clients share the surface-to-protocol mapping.
+Compilation is local, only submissions persist Scope, and tail requests use
+TailOutput. Pending requests run outside the TUI key handler, so waiting leaves
+editing, cancellation, and quit keys responsive.
 
 The former session/cron/resource pages, client-side v3 state machine, target
 modal, foreground epoch compatibility, and debug protocol were deleted rather

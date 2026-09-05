@@ -15,6 +15,8 @@ Recovery reclaims durable runtime work only after exclusive host ownership.
 Unstarted Runs and replayable builtins may resume. A persisted physical Run
 attempt with unknown ownership rejects startup before replay or new facts;
 losing the supervisor does not establish process quiescence.
+Recovery walks every stored page, including older active executions behind
+newer terminal history.
 
 ## Command boundary
 
@@ -33,6 +35,9 @@ store together with their effect:
 The wire format is strict IPC v4 framing: a four-byte big-endian payload length
 followed by one validated message. Unknown fields, wrong message roles, and
 oversized frames are rejected.
+Partial frame state survives event delivery. Pending `WaitExecution` queries
+run independently of the connection reader, so the same connection can still
+query or cancel an execution. Mutation commands retain their receive order.
 
 ## Execution and observation
 
@@ -45,14 +50,23 @@ Generation-aware acknowledgements preserve newer cancellation work. Builtins are
 `Cd`, `Env`, and `Umask`; runs use the typed local pipeline runner. Completion
 returns to the reducer, including Sequence scope threading and Parallel
 fork/no-merge behavior.
+On a store failure, the worker retains its generation and any known completion,
+retries persistence, and releases the semantic state lock between attempts.
+A physical Run is never respawned to retry its completion or acknowledgement.
+Cancel replay checks the durable operation outcome before requiring a live task.
 
 `WatchExecution` replays facts after the supplied cursor before forwarding
 live facts. Output is addressed by stable `StepId`, stream, and absolute byte
 offset. Captured runs expose stdout/stderr; PTY runs expose one terminal stream.
+Replay reads every page through a cursor fixed with the stored snapshot, then
+filters duplicate live facts at that boundary.
 
 PTY attachments are connection-owned observer leases. At most one attachment
 per Step is the controller. Only that controller can write input or resize the
 terminal; every attachment may receive the same terminal output stream.
+The lease belongs to the individual connection even when another connection
+uses the same ClientId. EOF, transport errors, and connection task cancellation
+release its attachments and controller role.
 
 ## Owner boundary
 

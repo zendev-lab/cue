@@ -34,12 +34,21 @@ PTY mode retains the same internal PipeLinks but routes all terminal-facing
 stdin/stdout/stderr through one PTY endpoint for the entire Run. Its RunControl
 accepts explicit input, resize, graceful termination, and force termination;
 captured runs reject terminal input and resize.
+One PTY input write may be in flight at a time; another input request receives
+a busy conflict. Input backpressure does not block resize, process observation,
+or termination. Closing a Run interrupts any remaining input and reports a
+conflict to that writer; an already written prefix is not rolled back.
 
 ## Output and recovery
 
 OutputStore uses absolute monotonically increasing byte offsets. The memory
 provider bounds retained bytes per `(StepId, OutputStream)` without resetting
 offsets when old bytes are discarded, so readers can detect truncation.
+The bundled daemon retains output bytes only for its current process lifetime.
+Execution facts, including OutputAppended ranges, survive restart; those bytes
+do not. After restart, ReadOutput and TailOutput for an old Step return an empty
+buffer. This means no bytes remain in this provider, and does not prove the Run
+originally produced no output. Durable output retention needs another provider.
 
 Builtin and Run use the same committed Step lifecycle. `realize_builtin` observes
 Cd's resolved directory or reports Env/Umask success; it changes no ambient state
