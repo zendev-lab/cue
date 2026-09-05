@@ -12,6 +12,8 @@ until their corresponding migration lands.
   condition/parallel semantics, cancellation, and restart interruption.
 - [vNext protocol and store](vnext-protocol.md): v4 command/query separation,
   fact replay, operation idempotency, and fresh SQLite provider schema.
+- [vNext runtime](vnext-runtime.md): typed Assembly binding, captured/PTY
+  pipeline realization, output offsets, control, and restart recovery.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.

@@ -6,6 +6,7 @@
 
 mod env;
 mod execution;
+mod fact;
 mod plan;
 mod process;
 mod scope;
@@ -16,6 +17,7 @@ pub use execution::{
     ExecutionTransition, RunCompletion, SkipReason, StepAction, StepCancelCause, StepFailure,
     StepRecord, StepState,
 };
+pub use fact::{ExecutionProjection, Fact, FactDraft, FactEvent, OutputStream};
 pub use plan::{
     BuiltinCommand, CdPath, EnvMutation, ExecutionPlan, ExecutionSpec, IoMode, ParallelBranches,
     ParallelJoin, PlanValidationError, SequenceCondition, StepDescriptor, StepKind,
