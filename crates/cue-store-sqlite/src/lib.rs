@@ -5,12 +5,12 @@
 
 use cue_core::vnext::{Execution, ExecutionState, Fact, FactEvent, Scope, StepState};
 pub use cue_core::vnext::{ExecutionProjection as StoredExecution, FactDraft};
-use cue_core::{EventId, ExecutionId, ScopeHash};
+use cue_core::{EventId, ExecutionId, ScopeHash, StepId};
 use cue_protocol::{ClientId, Command, OperationId, ResponsePayload};
 use rusqlite::{Connection, OptionalExtension as _};
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const STORE_SCHEMA: &str = r#"
 CREATE TABLE scopes (
     hash            BLOB PRIMARY KEY,
@@ -25,6 +25,17 @@ CREATE TABLE executions (
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL
 );
+
+CREATE TABLE runtime_work (
+    execution_id INTEGER NOT NULL REFERENCES executions(id),
+    step_index INTEGER NOT NULL CHECK(step_index > 0),
+    desired_generation INTEGER NOT NULL CHECK(desired_generation > 0),
+    applied_generation INTEGER NOT NULL DEFAULT 0,
+    claimed_generation INTEGER,
+    attempt_started INTEGER NOT NULL DEFAULT 0 CHECK(attempt_started IN (0, 1)),
+    PRIMARY KEY (execution_id, step_index),
+    CHECK(applied_generation <= desired_generation)
+) WITHOUT ROWID;
 
 CREATE TABLE facts (
     event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +76,7 @@ impl Store {
     /// daemon owns permissions, symlink rejection, and archive placement.
     pub fn from_connection(connection: Connection) -> Result<Self, StoreError> {
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&connection)?;
         Ok(Self { connection })
@@ -76,20 +87,11 @@ impl Store {
         scope: &Scope,
         created_at_ms: i64,
     ) -> Result<ScopePersistence, StoreError> {
-        let persistence = Self::scope_persistence(scope);
-        if persistence == ScopePersistence::VolatileSensitiveEnvironment {
-            return Ok(ScopePersistence::VolatileSensitiveEnvironment);
+        if contains_sensitive_environment(scope) {
+            return Err(StoreError::SensitiveEnvironmentUnsupported);
         }
         put_scope_on(&self.connection, scope, created_at_ms)?;
-        Ok(persistence)
-    }
-
-    pub fn scope_persistence(scope: &Scope) -> ScopePersistence {
-        if contains_sensitive_environment(scope) {
-            ScopePersistence::VolatileSensitiveEnvironment
-        } else {
-            ScopePersistence::Persisted
-        }
+        Ok(ScopePersistence::Persisted)
     }
 
     pub fn get_scope(&self, hash: ScopeHash) -> Result<Option<Scope>, StoreError> {
@@ -156,8 +158,8 @@ impl Store {
         operation: OperationCommit<'_>,
         scope: &Scope,
     ) -> Result<ScopeCommandCommit, StoreError> {
-        if Self::scope_persistence(scope) != ScopePersistence::Persisted {
-            return Err(StoreError::VolatileScopeRequiresMemory);
+        if contains_sensitive_environment(scope) {
+            return Err(StoreError::SensitiveEnvironmentUnsupported);
         }
         let transaction = self.connection.unchecked_transaction()?;
         match record_operation_on(&transaction, operation)? {
@@ -219,6 +221,134 @@ impl Store {
             executions.push(decode_execution(row?)?);
         }
         Ok(executions)
+    }
+
+    /// Step references only. A consumer must read the latest committed snapshot.
+    pub fn pending_runtime_steps(&self) -> Result<Vec<StepId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT execution_id, step_index FROM runtime_work
+             WHERE desired_generation > applied_generation AND claimed_generation IS NULL
+             ORDER BY execution_id, step_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StepId {
+                execution: ExecutionId(read_u64(row, 0)?),
+                index: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Claim one generation; concurrent consumers cannot claim the same Step.
+    pub fn claim_runtime_step(&self, step: StepId) -> Result<Option<u64>, StoreError> {
+        self.connection
+            .query_row(
+                "UPDATE runtime_work SET claimed_generation = desired_generation
+             WHERE execution_id = ?1 AND step_index = ?2 AND claimed_generation IS NULL
+               AND desired_generation > applied_generation
+             RETURNING claimed_generation",
+                rusqlite::params![sqlite_id(step.execution)?, step.index],
+                |row| read_u64(row, 0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Acknowledge only this claim. A later generation remains pending.
+    pub fn acknowledge_runtime_step(
+        &self,
+        step: StepId,
+        generation: u64,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE runtime_work SET applied_generation = ?3, claimed_generation = NULL
+             WHERE execution_id = ?1 AND step_index = ?2 AND claimed_generation = ?3",
+            rusqlite::params![
+                sqlite_id(step.execution)?,
+                step.index,
+                sqlite_u64(generation, "generation")?
+            ],
+        )? == 1)
+    }
+
+    pub fn run_attempt_started(&self, step: StepId) -> Result<bool, StoreError> {
+        self.connection.query_row(
+            "SELECT attempt_started FROM runtime_work WHERE execution_id = ?1 AND step_index = ?2",
+            rusqlite::params![sqlite_id(step.execution)?, step.index], |row| row.get(0),
+        ).optional()?.ok_or(StoreError::MissingRuntimeWork(step))
+    }
+
+    /// Persist the uncertainty boundary before attempting any physical spawn.
+    /// Once set, recovery cannot infer that replay is safe from a Running snapshot.
+    pub fn begin_run_attempt(&self, step: StepId, generation: u64) -> Result<bool, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let projection = load_execution(&transaction, step.execution)?
+            .ok_or(StoreError::MissingExecution(step.execution))?;
+        let execution = Execution::restore(projection.snapshot)?;
+        if !matches!(
+            execution.step(step).map(|step| step.state()),
+            Some(StepState::Running)
+        ) || !matches!(
+            execution.action(step),
+            Some(cue_core::vnext::StepAction::Run { .. })
+        ) {
+            return Ok(false);
+        }
+        let started = transaction.execute(
+            "UPDATE runtime_work SET attempt_started = 1
+             WHERE execution_id = ?1 AND step_index = ?2 AND claimed_generation = ?3
+               AND desired_generation = ?3 AND attempt_started = 0",
+            rusqlite::params![
+                sqlite_id(step.execution)?,
+                step.index,
+                sqlite_u64(generation, "generation")?
+            ],
+        )? == 1;
+        transaction.commit()?;
+        Ok(started)
+    }
+
+    /// Call only after acquiring exclusive daemon ownership and retiring old workers.
+    /// This implementation cannot retake physical process ownership, so unknown
+    /// active attempts fail closed; unstarted work and replayable builtins are requeued.
+    pub fn recover_runtime_work(&self) -> Result<(), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut active = Vec::new();
+        let mut statement = transaction.prepare("SELECT id FROM executions ORDER BY id")?;
+        let ids = statement
+            .query_map([], |row| read_u64(row, 0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for id in ids {
+            let projection = load_execution(&transaction, ExecutionId(id))?
+                .ok_or(StoreError::MissingExecution(ExecutionId(id)))?;
+            for step in &projection.snapshot.steps {
+                if matches!(
+                    step.state(),
+                    StepState::Running | StepState::Cancelling { .. }
+                ) {
+                    let attempted = transaction.query_row(
+                        "SELECT attempt_started FROM runtime_work WHERE execution_id = ?1 AND step_index = ?2",
+                        rusqlite::params![sqlite_id(step.id().execution)?, step.id().index], |row| row.get::<_, bool>(0),
+                    ).optional()?.ok_or(StoreError::MissingRuntimeWork(step.id()))?;
+                    if attempted {
+                        return Err(StoreError::UncertainRunOwnership(step.id()));
+                    }
+                    active.push(step.id());
+                }
+            }
+        }
+        transaction.execute("UPDATE runtime_work SET claimed_generation = NULL", [])?;
+        for step in active {
+            transaction.execute(
+                "UPDATE runtime_work SET desired_generation = desired_generation + 1
+                WHERE execution_id = ?1 AND step_index = ?2",
+                rusqlite::params![sqlite_id(step.execution)?, step.index],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn facts_after(
@@ -311,7 +441,6 @@ impl Store {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopePersistence {
     Persisted,
-    VolatileSensitiveEnvironment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +618,23 @@ fn commit_projection(
         ],
     )?;
 
+    for draft in facts {
+        if let Fact::StepStateChanged {
+            id: step,
+            next: StepState::Running | StepState::Cancelling { .. },
+            ..
+        } = &draft.fact
+        {
+            connection.execute(
+                "INSERT INTO runtime_work (execution_id, step_index, desired_generation)
+                 VALUES (?1, ?2, 1)
+                 ON CONFLICT(execution_id, step_index) DO UPDATE SET
+                     desired_generation = desired_generation + 1",
+                rusqlite::params![id, i64::from(step.index)],
+            )?;
+        }
+    }
+
     let mut committed = Vec::with_capacity(facts.len());
     for draft in facts {
         connection.execute(
@@ -569,6 +715,9 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             supported: SCHEMA_VERSION,
         });
     }
+    if version != 0 && version != SCHEMA_VERSION {
+        return Err(StoreError::IncompatibleSchema(version));
+    }
     if version == 0 {
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(STORE_SCHEMA)?;
@@ -586,6 +735,25 @@ fn validate_execution(execution: &StoredExecution) -> Result<(), StoreError> {
         });
     }
     let reducer = Execution::restore(execution.snapshot.clone())?;
+    for step in reducer.steps() {
+        use cue_core::vnext::{BuiltinCommand, EnvEdit, Sensitivity, StepAction};
+        let sensitive_patch = |patch: &cue_core::vnext::EnvPatch| {
+            patch.iter().any(|(_, edit)|
+            matches!(edit, EnvEdit::Set(value) if value.sensitivity() == Sensitivity::Sensitive))
+        };
+        let sensitive = match reducer.action(step.id()) {
+            Some(StepAction::Builtin(BuiltinCommand::Env(mutation))) => {
+                sensitive_patch(mutation.patch())
+            }
+            Some(StepAction::Run { pipeline, .. }) => pipeline
+                .processes()
+                .any(|process| sensitive_patch(process.env())),
+            _ => false,
+        };
+        if sensitive {
+            return Err(StoreError::SensitiveEnvironmentUnsupported);
+        }
+    }
     let actual = reducer.state();
     if actual != execution.state {
         return Err(StoreError::ExecutionStateMismatch {
@@ -748,6 +916,29 @@ fn validate_fact_projection(
 }
 
 fn valid_step_transition(previous: &StepState, next: &StepState) -> bool {
+    if let (
+        StepState::Cancelling {
+            cause: previous_cause,
+            mode: cue_core::vnext::CancelMode::Graceful,
+        },
+        StepState::Cancelling {
+            cause: next_cause,
+            mode: cue_core::vnext::CancelMode::Force,
+        },
+    ) = (previous, next)
+    {
+        return previous_cause == next_cause;
+    }
+    if let (
+        StepState::Cancelling {
+            cause: previous_cause,
+            ..
+        },
+        StepState::Cancelled { cause: next_cause },
+    ) = (previous, next)
+    {
+        return previous_cause == next_cause;
+    }
     matches!(
         (previous, next),
         (StepState::Pending, StepState::Running)
@@ -755,7 +946,10 @@ fn valid_step_transition(previous: &StepState, next: &StepState) -> bool {
             | (StepState::Pending, StepState::Cancelled { .. })
             | (StepState::Running, StepState::Succeeded)
             | (StepState::Running, StepState::Failed { .. })
-            | (StepState::Running, StepState::Cancelled { .. })
+            | (StepState::Running, StepState::Cancelling { .. })
+            | (StepState::Cancelling { .. }, StepState::Succeeded)
+            | (StepState::Cancelling { .. }, StepState::Failed { .. })
+            | (StepState::Cancelling { .. }, StepState::Cancelled { .. })
     )
 }
 
@@ -763,10 +957,14 @@ fn valid_execution_transition(previous: &ExecutionState, next: &ExecutionState) 
     matches!(
         (previous, next),
         (ExecutionState::Pending, ExecutionState::Running)
-            | (ExecutionState::Pending, ExecutionState::Cancelled { .. })
+            | (ExecutionState::Pending, ExecutionState::Cancelled)
+            | (ExecutionState::Running, ExecutionState::Cancelling)
+            | (ExecutionState::Cancelling, ExecutionState::Succeeded)
+            | (ExecutionState::Cancelling, ExecutionState::Failed)
+            | (ExecutionState::Cancelling, ExecutionState::Cancelled)
             | (ExecutionState::Running, ExecutionState::Succeeded)
             | (ExecutionState::Running, ExecutionState::Failed)
-            | (ExecutionState::Running, ExecutionState::Cancelled { .. })
+            | (ExecutionState::Running, ExecutionState::Cancelled)
     )
 }
 
@@ -784,65 +982,19 @@ fn decode_execution(row: (String, String, i64, i64)) -> Result<StoredExecution, 
 fn contains_sensitive_environment(scope: &Scope) -> bool {
     scope
         .env()
-        .keys()
-        .any(|name| is_sensitive_env_name(name.as_str()))
+        .values()
+        .any(|value| value.sensitivity() == cue_core::vnext::Sensitivity::Sensitive)
 }
 
-fn is_sensitive_env_name(name: &str) -> bool {
-    let words = name
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_ascii_uppercase)
-        .collect::<Vec<_>>();
-    let compact = words.concat();
-    let has_word = |candidate: &str| words.iter().any(|word| word == candidate);
-    if [
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "PASS",
-        "CREDENTIAL",
-        "CREDENTIALS",
-        "AUTH",
-        "AUTHORIZATION",
-        "OAUTH",
-        "COOKIE",
-        "DSN",
-        "PASSPHRASE",
-    ]
-    .into_iter()
-    .any(has_word)
-    {
-        return true;
-    }
-    if compact.ends_with("TOKEN")
-        || compact.ends_with("SECRET")
-        || compact.contains("PASSWORD")
-        || compact.ends_with("CREDENTIAL")
-        || compact.ends_with("CREDENTIALS")
-        || compact.ends_with("COOKIE")
-        || compact.contains("APIKEY")
-        || compact.contains("ACCESSKEY")
-        || compact.contains("PRIVATEKEY")
-    {
-        return true;
-    }
-    let names_database = [
-        "DATABASE",
-        "REDIS",
-        "MONGO",
-        "MONGODB",
-        "POSTGRES",
-        "POSTGRESQL",
-    ]
-    .into_iter()
-    .any(|backend| compact.contains(backend));
-    let names_connection_locator = words
-        .iter()
-        .any(|word| matches!(word.as_str(), "URL" | "URI" | "CONNECTIONSTRING"))
-        || compact.contains("CONNECTIONSTRING");
-    names_database && names_connection_locator
+fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
 }
 
 fn hash_text(domain: &[u8], value: &str) -> [u8; 32] {
@@ -870,6 +1022,16 @@ fn hash_blob(blob: &[u8], kind: &'static str) -> Result<[u8; 32], StoreError> {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("Sensitive environments are not supported by this store")]
+    SensitiveEnvironmentUnsupported,
+    #[error("incompatible pre-FP IPC v4 schema {0}; retain the database and use a fresh store")]
+    IncompatibleSchema(u32),
+    #[error("missing execution {0}")]
+    MissingExecution(ExecutionId),
+    #[error("active step {0} has no durable runtime follow-up")]
+    MissingRuntimeWork(StepId),
+    #[error("cannot prove the old run attempt for {0} quiescent or uniquely controlled")]
+    UncertainRunOwnership(StepId),
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -929,8 +1091,6 @@ pub enum StoreError {
     InvalidHashLength { kind: &'static str, actual: usize },
     #[error("operation uniqueness conflict was reported but the durable row disappeared")]
     OperationLostAfterConflict,
-    #[error("secret-bearing scopes require the daemon volatile store")]
-    VolatileScopeRequiresMemory,
 }
 
 #[cfg(test)]
@@ -1043,11 +1203,21 @@ mod tests {
         );
         assert_eq!(store.get_scope(safe.compute_hash()).unwrap(), Some(safe));
 
-        let sensitive = scope(&[("PATH", "/bin"), ("API_TOKEN", "do-not-persist")]);
-        assert_eq!(
-            store.put_scope(&sensitive, 11).unwrap(),
-            ScopePersistence::VolatileSensitiveEnvironment
+        let mut entries = initial_scope().env().clone();
+        entries.insert(
+            key("ORDINARY_NAME"),
+            EnvValue::classified("do-not-persist", cue_core::vnext::Sensitivity::Sensitive)
+                .unwrap(),
         );
+        let sensitive = Scope::new(
+            initial_scope().cwd().clone(),
+            entries,
+            initial_scope().umask(),
+        );
+        assert!(matches!(
+            store.put_scope(&sensitive, 11),
+            Err(StoreError::SensitiveEnvironmentUnsupported)
+        ));
         assert_eq!(store.get_scope(sensitive.compute_hash()).unwrap(), None);
         let stored_json: String = store
             .connection()
@@ -1096,7 +1266,6 @@ mod tests {
             execution: EXECUTION_ID,
             index: 1,
         };
-        execution.mark_running(step_id).unwrap();
         let running = stored(&execution, 10, 11);
         let running_record = execution.step(step_id).unwrap();
         let running_facts = [
@@ -1123,7 +1292,9 @@ mod tests {
         assert_eq!(committed_running[0].id.get(), 2);
         assert_eq!(committed_running[1].id.get(), 3);
 
-        execution.complete_run(step_id, Ok(())).unwrap();
+        execution
+            .complete_run(step_id, cue_core::vnext::RunCompletion::Succeeded)
+            .unwrap();
         let completed = stored(&execution, 10, 20);
         let record = execution.step(step_id).unwrap();
         let facts = [
@@ -1229,7 +1400,6 @@ mod tests {
             execution: EXECUTION_ID,
             index: 1,
         };
-        execution.mark_running(step_id).unwrap();
         let running = stored(&execution, 10, 11);
         let record = execution.step(step_id).unwrap();
         let dishonest = FactDraft {
@@ -1444,7 +1614,16 @@ mod tests {
     #[test]
     fn scope_command_rejects_sensitive_values_without_claiming_operation() {
         let store = Store::in_memory().unwrap();
-        let sensitive = scope(&[("PATH", "/bin"), ("ACCESS_TOKEN", "do-not-persist")]);
+        let base = scope(&[("PATH", "/bin")]);
+        let sensitive = Scope::new(
+            base.cwd().clone(),
+            BTreeMap::from([(
+                EnvKey::new("PLAIN_NAME").unwrap(),
+                EnvValue::classified("do-not-persist", cue_core::vnext::Sensitivity::Sensitive)
+                    .unwrap(),
+            )]),
+            base.umask(),
+        );
         let client = ClientId::new("client-secret").unwrap();
         let operation = OperationId::new("scope:secret").unwrap();
         let command = Command::PutScope {
@@ -1462,7 +1641,7 @@ mod tests {
                 },
                 &sensitive,
             ),
-            Err(StoreError::VolatileScopeRequiresMemory)
+            Err(StoreError::SensitiveEnvironmentUnsupported)
         ));
         let operation_count: i64 = store
             .connection()
@@ -1503,11 +1682,10 @@ mod tests {
             execution: EXECUTION_ID,
             index: 1,
         };
-        execution.mark_running(step_id).unwrap();
         execution
             .complete_run(
                 step_id,
-                Err(StepFailure::Spawn {
+                cue_core::vnext::RunCompletion::Failed(StepFailure::Spawn {
                     message: "program missing".into(),
                 }),
             )
@@ -1568,5 +1746,247 @@ mod tests {
         ];
         store.commit_execution(&projection, &facts).unwrap();
         assert_eq!(store.get_execution(EXECUTION_ID).unwrap(), Some(projection));
+    }
+    fn commit_reducer(
+        store: &Store,
+        execution: &Execution,
+        time: i64,
+    ) -> Result<Vec<FactEvent>, StoreError> {
+        let previous = store.get_execution(execution.id())?;
+        let baseline = previous
+            .as_ref()
+            .map(|stored| stored.snapshot.clone())
+            .unwrap_or_else(|| Execution::new(execution.id(), execution.spec().clone()).snapshot());
+        let mut facts = Vec::new();
+        if previous.is_none() {
+            facts.push(FactDraft {
+                occurred_at_ms: time,
+                fact: Fact::ExecutionCreated {
+                    id: execution.id(),
+                    scope: execution.spec().scope(),
+                },
+            });
+        }
+        for (before, after) in baseline.steps.iter().zip(execution.steps()) {
+            if before != after {
+                facts.push(FactDraft {
+                    occurred_at_ms: time,
+                    fact: Fact::StepStateChanged {
+                        id: after.id(),
+                        previous: before.state().clone(),
+                        next: after.state().clone(),
+                        input_scope: after.input_scope(),
+                        output_scope: after.output_scope(),
+                    },
+                });
+            }
+        }
+        let before_state = previous
+            .as_ref()
+            .map(|stored| stored.state.clone())
+            .unwrap_or(ExecutionState::Pending);
+        if before_state != execution.state() {
+            facts.push(FactDraft {
+                occurred_at_ms: time,
+                fact: Fact::ExecutionStateChanged {
+                    id: execution.id(),
+                    previous: before_state.clone(),
+                    next: execution.state(),
+                },
+            });
+        }
+        if !before_state.is_terminal() && execution.state().is_terminal() {
+            facts.push(FactDraft {
+                occurred_at_ms: time,
+                fact: Fact::ExecutionFinished {
+                    id: execution.id(),
+                    state: execution.state(),
+                },
+            });
+        }
+        let created = previous
+            .as_ref()
+            .map(|stored| stored.created_at_ms)
+            .unwrap_or(time);
+        store.commit_execution(&stored(execution, created, time), &facts)
+    }
+
+    #[test]
+    fn failed_fact_insert_rolls_back_snapshot_and_runtime_follow_up() {
+        let store = Store::in_memory().unwrap();
+        persist_initial_scope(&store);
+        let mut execution = reducer();
+        commit_reducer(&store, &execution, 1).unwrap();
+        let before = store.get_execution(EXECUTION_ID).unwrap();
+        store.connection().execute_batch("CREATE TRIGGER fail_fact BEFORE INSERT ON facts BEGIN SELECT RAISE(ABORT, 'injected fact failure'); END").unwrap();
+        execution.advance().unwrap();
+        assert!(commit_reducer(&store, &execution, 2).is_err());
+        assert_eq!(store.get_execution(EXECUTION_ID).unwrap(), before);
+        assert!(store.pending_runtime_steps().unwrap().is_empty());
+        assert_eq!(store.facts_after(EXECUTION_ID, None, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scope_must_be_readable_before_snapshot_and_failed_commit_leaves_only_unreferenced_scope() {
+        use cue_core::vnext::{BuiltinCommand, BuiltinSuccess, EnvEdit, EnvPatch};
+        let store = Store::in_memory().unwrap();
+        persist_initial_scope(&store);
+        let command = BuiltinCommand::env(EnvPatch::new(BTreeMap::from([(
+            key("MODE"),
+            EnvEdit::set("changed").unwrap(),
+        )])))
+        .unwrap();
+        let mut execution = Execution::new(
+            EXECUTION_ID,
+            ExecutionSpec::new(
+                initial_scope().compute_hash(),
+                ExecutionPlan::builtin(command),
+            )
+            .unwrap(),
+        );
+        execution.advance().unwrap();
+        commit_reducer(&store, &execution, 1).unwrap();
+        let before = store.get_execution(EXECUTION_ID).unwrap();
+        let id = execution.steps()[0].id();
+        let transition = execution
+            .complete_builtin(id, &initial_scope(), Ok(BuiltinSuccess::Env))
+            .unwrap();
+        let scope = &transition.new_scopes[0];
+        assert!(matches!(
+            commit_reducer(&store, &execution, 2),
+            Err(StoreError::MissingScopeReference { .. })
+        ));
+        store.connection().execute_batch("CREATE TRIGGER fail_scope BEFORE INSERT ON scopes BEGIN SELECT RAISE(ABORT, 'injected scope failure'); END").unwrap();
+        assert!(store.put_scope(scope, 2).is_err());
+        assert_eq!(store.get_execution(EXECUTION_ID).unwrap(), before);
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_scope")
+            .unwrap();
+        store.put_scope(scope, 2).unwrap();
+        store.connection().execute_batch("CREATE TRIGGER fail_execution BEFORE UPDATE ON executions BEGIN SELECT RAISE(ABORT, 'injected execution failure'); END").unwrap();
+        assert!(commit_reducer(&store, &execution, 2).is_err());
+        assert_eq!(store.get_execution(EXECUTION_ID).unwrap(), before);
+        assert_eq!(
+            store.get_scope(scope.compute_hash()).unwrap().as_ref(),
+            Some(scope)
+        );
+        assert_eq!(store.pending_runtime_steps().unwrap(), vec![id]);
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_execution")
+            .unwrap();
+        commit_reducer(&store, &execution, 2).unwrap();
+        assert_eq!(
+            store.get_execution(EXECUTION_ID).unwrap().unwrap().state,
+            ExecutionState::Succeeded
+        );
+    }
+
+    #[test]
+    fn old_claim_cannot_clear_new_cancel_generation_or_start_after_cancellation() {
+        use cue_core::vnext::CancelMode;
+        let store = Store::in_memory().unwrap();
+        persist_initial_scope(&store);
+        let mut execution = reducer();
+        execution.advance().unwrap();
+        commit_reducer(&store, &execution, 1).unwrap();
+        let id = execution.steps()[0].id();
+        let old = store.claim_runtime_step(id).unwrap().unwrap();
+        assert!(store.claim_runtime_step(id).unwrap().is_none());
+        execution.cancel(CancelMode::Graceful);
+        commit_reducer(&store, &execution, 2).unwrap();
+        execution.cancel(CancelMode::Force);
+        commit_reducer(&store, &execution, 3).unwrap();
+        assert!(!store.begin_run_attempt(id, old).unwrap());
+        assert!(store.acknowledge_runtime_step(id, old).unwrap());
+        let latest = store.claim_runtime_step(id).unwrap().unwrap();
+        assert!(latest > old);
+        assert!(!store.acknowledge_runtime_step(id, old).unwrap());
+        assert!(matches!(
+            store
+                .get_execution(EXECUTION_ID)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .steps[0]
+                .state(),
+            StepState::Cancelling {
+                mode: CancelMode::Force,
+                ..
+            }
+        ));
+        assert!(!store.begin_run_attempt(id, latest).unwrap());
+        execution.complete_cancelled(id).unwrap();
+        commit_reducer(&store, &execution, 4).unwrap();
+        assert!(store.acknowledge_runtime_step(id, latest).unwrap());
+        assert!(store.pending_runtime_steps().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_requeues_unstarted_work_but_never_replays_an_uncertain_run() {
+        let connection = Connection::open("file:cue-fp-recovery?mode=memory&cache=shared").unwrap();
+        let store = Store::from_connection(connection).unwrap();
+        persist_initial_scope(&store);
+        let mut execution = reducer();
+        execution.advance().unwrap();
+        commit_reducer(&store, &execution, 1).unwrap();
+        let id = execution.steps()[0].id();
+        let abandoned = store.claim_runtime_step(id).unwrap().unwrap();
+        let reopened = Store::from_connection(
+            Connection::open("file:cue-fp-recovery?mode=memory&cache=shared").unwrap(),
+        )
+        .unwrap();
+        assert!(reopened.claim_runtime_step(id).unwrap().is_none());
+        reopened.recover_runtime_work().unwrap();
+        let current = reopened.claim_runtime_step(id).unwrap().unwrap();
+        assert!(current > abandoned);
+        assert!(!store.acknowledge_runtime_step(id, abandoned).unwrap());
+        assert!(reopened.begin_run_attempt(id, current).unwrap());
+        assert!(!reopened.begin_run_attempt(id, current).unwrap());
+        assert!(
+            matches!(reopened.recover_runtime_work(), Err(StoreError::UncertainRunOwnership(step)) if step == id)
+        );
+        assert_eq!(
+            reopened.get_execution(EXECUTION_ID).unwrap().unwrap().state,
+            ExecutionState::Running
+        );
+        assert!(
+            reopened
+                .facts_after(EXECUTION_ID, None, 100)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.fact, Fact::ExecutionFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn sensitivity_is_classification_not_a_variable_name_heuristic() {
+        use cue_core::vnext::{EnvEdit, EnvPatch, Sensitivity};
+        let store = Store::in_memory().unwrap();
+        let normal = scope(&[("API_TOKEN", "explicitly-normal")]);
+        assert_eq!(
+            store.put_scope(&normal, 1).unwrap(),
+            ScopePersistence::Persisted
+        );
+        persist_initial_scope(&store);
+        let secret = EnvValue::classified("classified-value", Sensitivity::Sensitive).unwrap();
+        let process = Process::with_env(
+            Argv::new("true", Vec::new()).unwrap(),
+            EnvPatch::new(BTreeMap::from([(key("INNOCENT"), EnvEdit::Set(secret))])),
+        );
+        let execution = Execution::new(
+            EXECUTION_ID,
+            ExecutionSpec::new(
+                initial_scope().compute_hash(),
+                ExecutionPlan::run(Pipeline::simple(process), IoMode::Captured),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            commit_reducer(&store, &execution, 1),
+            Err(StoreError::SensitiveEnvironmentUnsupported)
+        ));
+        assert!(store.get_execution(EXECUTION_ID).unwrap().is_none());
     }
 }

@@ -58,6 +58,11 @@ pub enum Query {
     WaitExecution {
         id: ExecutionId,
     },
+    TailOutput {
+        step: StepId,
+        stream: OutputStream,
+        max_bytes: u32,
+    },
     ReadOutput {
         step: StepId,
         stdout: OutputRange,
@@ -456,5 +461,28 @@ mod tests {
             end_offset: 8,
         };
         assert_eq!(fact.execution_id(), execution);
+    }
+    #[test]
+    fn sensitivity_roundtrips_through_strict_scope_commands() {
+        use cue_core::vnext::{EnvKey, EnvValue, Sensitivity};
+        for classification in [Sensitivity::Normal, Sensitivity::Sensitive] {
+            let scope = Scope::new(
+                scope().cwd().clone(),
+                BTreeMap::from([(
+                    EnvKey::new("VALUE").unwrap(),
+                    EnvValue::classified("payload", classification).unwrap(),
+                )]),
+                scope().umask(),
+            );
+            let message = Message::Command {
+                request_id: RequestId::new(1).unwrap(),
+                operation_id: OperationId::new("scope-classification").unwrap(),
+                command: Command::PutScope {
+                    scope: Box::new(scope),
+                },
+            };
+            let frame = crate::encode_message(&message).unwrap();
+            assert_eq!(crate::decode_message(&frame).unwrap(), message);
+        }
     }
 }

@@ -24,6 +24,7 @@ protocol.
 
 Start with:
 
+- [Feature Proposal governance](fps/FP-0000-governance.md)
 - [Design index](docs/design/README.md)
 - [vNext foundation](docs/design/vnext-foundation.md)
 - [Core types](docs/design/core-types.md)
