@@ -399,6 +399,16 @@ impl Store {
         Ok(facts)
     }
 
+    /// Read an existing outcome before checking live execution preconditions.
+    /// New operations must still be claimed in the effect's transaction.
+    pub fn get_operation(
+        &self,
+        client: &ClientId,
+        operation: &OperationId,
+    ) -> Result<Option<StoredOperation>, StoreError> {
+        get_operation_on(&self.connection, client, operation)
+    }
+
     /// Insert one completed operation or replay the immutable prior outcome.
     pub fn record_operation(
         &self,
@@ -468,6 +478,11 @@ pub enum OperationRecord {
     Inserted,
     Replay { response: Option<ResponsePayload> },
     Conflict { stored_fingerprint: [u8; 32] },
+}
+
+pub struct StoredOperation {
+    pub fingerprint: [u8; 32],
+    pub response: Option<ResponsePayload>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -707,6 +722,25 @@ fn record_operation_on(
         return Ok(OperationRecord::Inserted);
     }
 
+    let existing = get_operation_on(connection, operation.client, operation.operation)?
+        .ok_or(StoreError::OperationLostAfterConflict)?;
+    if existing.fingerprint != fingerprint {
+        return Ok(OperationRecord::Conflict {
+            stored_fingerprint: existing.fingerprint,
+        });
+    }
+    Ok(OperationRecord::Replay {
+        response: existing.response,
+    })
+}
+
+fn get_operation_on(
+    connection: &Connection,
+    client: &ClientId,
+    operation: &OperationId,
+) -> Result<Option<StoredOperation>, StoreError> {
+    let client_hash = hash_text(CLIENT_HASH_DOMAIN, client.as_str());
+    let operation_hash = hash_text(OPERATION_HASH_DOMAIN, operation.as_str());
     let existing = connection
         .query_row(
             "SELECT fingerprint, response_json FROM operations
@@ -715,16 +749,16 @@ fn record_operation_on(
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
-    let (stored_fingerprint, response_json) =
-        existing.ok_or(StoreError::OperationLostAfterConflict)?;
-    let stored_fingerprint = hash_blob(&stored_fingerprint, "operation fingerprint")?;
-    if stored_fingerprint != fingerprint {
-        return Ok(OperationRecord::Conflict { stored_fingerprint });
-    }
-    let response = response_json
-        .map(|json| serde_json::from_str(&json))
-        .transpose()?;
-    Ok(OperationRecord::Replay { response })
+    existing
+        .map(|(fingerprint, response)| {
+            Ok(StoredOperation {
+                fingerprint: hash_blob(&fingerprint, "operation fingerprint")?,
+                response: response
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?,
+            })
+        })
+        .transpose()
 }
 
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
@@ -1667,6 +1701,34 @@ mod tests {
             .unwrap();
         assert_eq!(operation_count, 0);
         assert_eq!(store.get_scope(sensitive.compute_hash()).unwrap(), None);
+    }
+
+    #[test]
+    fn operation_lookup_is_read_only_and_preserves_tombstones() {
+        let store = Store::in_memory().unwrap();
+        let client = ClientId::new("lookup").unwrap();
+        let operation = OperationId::new("cancel").unwrap();
+        let command = Command::UnwatchExecution { id: ExecutionId(1) };
+        assert!(store.get_operation(&client, &operation).unwrap().is_none());
+        assert_eq!(
+            store
+                .record_operation(
+                    &client,
+                    &operation,
+                    &command,
+                    Some(&ResponsePayload::ack()),
+                    1
+                )
+                .unwrap(),
+            OperationRecord::Inserted
+        );
+        let saved = store.get_operation(&client, &operation).unwrap().unwrap();
+        assert_eq!(saved.fingerprint, command_fingerprint(&command).unwrap());
+        assert_eq!(saved.response, Some(ResponsePayload::ack()));
+        store.tombstone_operation_responses_before(2).unwrap();
+        let saved = store.get_operation(&client, &operation).unwrap().unwrap();
+        assert_eq!(saved.fingerprint, command_fingerprint(&command).unwrap());
+        assert!(saved.response.is_none());
     }
 
     #[test]

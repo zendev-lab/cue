@@ -445,6 +445,7 @@ async fn supervise(
     let mut cancelled = false;
     let mut graceful_deadline = None;
     let mut reader_channel_open = true;
+    let mut input: Option<PtyInput> = None;
     loop {
         if let Err(error) = collect_statuses(&mut children, &mut statuses) {
             terminate_children(&mut children, CancelMode::Force);
@@ -460,6 +461,10 @@ async fn supervise(
         }
 
         tokio::select! {
+            result = async { input.as_mut().unwrap().write.as_mut().await }, if input.is_some() => {
+                let mut completed = input.take().unwrap();
+                let _ = completed.reply.take().unwrap().send(result);
+            }
             failure = reader_failures.recv(), if reader_channel_open => {
                 match failure {
                     Some(error) => {
@@ -477,6 +482,7 @@ async fn supervise(
                 };
                 let result = match command.request {
                     RunControlRequest::Terminate(mode) => {
+                        input = None;
                         cancelled = true;
                         terminate_children(&mut children, mode);
                         if mode == CancelMode::Graceful {
@@ -485,7 +491,15 @@ async fn supervise(
                         Ok(())
                     }
                     RunControlRequest::Input(data) => match &terminal {
-                        Some(terminal) => write_pty(terminal, &data).await,
+                        Some(terminal) if input.is_none() && !cancelled => {
+                            let terminal = terminal.clone();
+                            input = Some(PtyInput {
+                                write: Box::pin(async move { write_pty(&terminal, &data).await }),
+                                reply: Some(command.reply),
+                            });
+                            continue;
+                        }
+                        Some(_) => Err(RuntimeError::new(RuntimeErrorKind::Conflict, "PTY input is busy or closing")),
                         None => Err(RuntimeError::new(RuntimeErrorKind::Unsupported, "captured run has no input")),
                     },
                     RunControlRequest::Resize(size) => match &terminal {
@@ -496,6 +510,22 @@ async fn supervise(
                 let _ = command.reply.send(result);
             }
             () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+struct PtyInput {
+    write: RuntimeFuture<Result<(), RuntimeError>>,
+    reply: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+}
+
+impl Drop for PtyInput {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err(RuntimeError::new(
+                RuntimeErrorKind::Conflict,
+                "run closed before PTY input completed",
+            )));
         }
     }
 }
@@ -882,6 +912,74 @@ mod tests {
                 .unwrap()
                 .data
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_backpressure_does_not_block_resize_or_force_termination() {
+        let output = Arc::new(MemoryOutputStore::new(1024));
+        let run = LocalProcessSpawner::new(output.clone())
+            .spawn(
+                SpawnRequest {
+                    step: step(),
+                    pipeline: Pipeline::simple(process(
+                        "/bin/sh",
+                        &[
+                            "-c",
+                            "/bin/stty raw -echo; printf ready; exec /bin/sleep 30",
+                        ],
+                    )),
+                    io: IoMode::Pty,
+                    scope: scope(),
+                },
+                SpawnContext::local(&scope()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while output
+                .tail(step(), OutputStream::Terminal, 1024)
+                .unwrap()
+                .data
+                != b"ready"
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let control = run.control.clone();
+        let input = control.input(vec![b'x'; 1024 * 1024]);
+        tokio::pin!(input);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut input)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run.control.resize(TerminalSize::new(90, 30).unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            run.control.input(b"more".to_vec()).await.unwrap_err().kind,
+            RuntimeErrorKind::Conflict
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run.control.terminate(CancelMode::Force),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(input.await.unwrap_err().kind, RuntimeErrorKind::Conflict);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), run.wait())
+                .await
+                .unwrap(),
+            RunExit::Cancelled
         );
     }
 
