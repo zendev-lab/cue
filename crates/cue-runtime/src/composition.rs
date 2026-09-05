@@ -101,8 +101,8 @@ pub struct ProviderSpec {
     version: String,
     provides: BTreeSet<PortId>,
     requires: BTreeSet<PortId>,
-    before: BTreeSet<ProviderId>,
-    after: BTreeSet<ProviderId>,
+    before: BTreeMap<PortId, BTreeSet<ProviderId>>,
+    after: BTreeMap<PortId, BTreeSet<ProviderId>>,
 }
 
 impl ProviderSpec {
@@ -130,8 +130,8 @@ impl ProviderSpec {
             version,
             provides,
             requires: BTreeSet::new(),
-            before: BTreeSet::new(),
-            after: BTreeSet::new(),
+            before: BTreeMap::new(),
+            after: BTreeMap::new(),
         })
     }
 
@@ -140,13 +140,13 @@ impl ProviderSpec {
         self
     }
 
-    pub fn before(mut self, provider: ProviderId) -> Self {
-        self.before.insert(provider);
+    pub fn before(mut self, port: PortId, provider: ProviderId) -> Self {
+        self.before.entry(port).or_default().insert(provider);
         self
     }
 
-    pub fn after(mut self, provider: ProviderId) -> Self {
-        self.after.insert(provider);
+    pub fn after(mut self, port: PortId, provider: ProviderId) -> Self {
+        self.after.entry(port).or_default().insert(provider);
         self
     }
 
@@ -241,13 +241,10 @@ impl Composition {
         }
 
         let mut resolved = BTreeMap::new();
-        let mut ordering_edges = BTreeSet::new();
         for (port_id, contributors) in selected_ports {
             let port = &self.ports[&port_id];
             let ordered = if port.combine().allows_many() {
-                let (ordered, edges) = self.order_contributors(&port_id, &contributors)?;
-                ordering_edges.extend(edges);
-                ordered
+                self.order_contributors(&port_id, &contributors)?
             } else {
                 contributors
             };
@@ -261,7 +258,6 @@ impl Composition {
             );
         }
 
-        dependency_edges.extend(ordering_edges);
         let initialization_order = topological_order(&selected_providers, &dependency_edges)
             .map_err(|providers| CompositionError::DependencyCycle { providers })?;
 
@@ -296,12 +292,27 @@ impl Composition {
                     });
                 }
             }
-            for target in provider.before.iter().chain(&provider.after) {
-                if !self.providers.contains_key(target) {
-                    return Err(CompositionError::UnknownOrderingProvider {
-                        provider: provider.id.clone(),
-                        target: target.clone(),
-                    });
+            for (port, targets) in provider.before.iter().chain(&provider.after) {
+                for target in targets {
+                    let target_spec = self.providers.get(target).ok_or_else(|| {
+                        CompositionError::UnknownOrderingProvider {
+                            provider: provider.id.clone(),
+                            target: target.clone(),
+                        }
+                    })?;
+                    if !provider.provides.contains(port)
+                        || !target_spec.provides.contains(port)
+                        || !self
+                            .ports
+                            .get(port)
+                            .is_some_and(|port| port.combine().allows_many())
+                    {
+                        return Err(CompositionError::InvalidOrderingTarget {
+                            port: port.clone(),
+                            provider: provider.id.clone(),
+                            target: target.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -320,12 +331,12 @@ impl Composition {
         &self,
         port: &PortId,
         contributors: &[ProviderId],
-    ) -> Result<(Vec<ProviderId>, ProviderEdges), CompositionError> {
+    ) -> Result<Vec<ProviderId>, CompositionError> {
         let nodes = contributors.iter().cloned().collect::<BTreeSet<_>>();
         let mut edges = BTreeSet::new();
         for provider_id in contributors {
             let provider = &self.providers[provider_id];
-            for target in &provider.before {
+            for target in provider.before.get(port).into_iter().flatten() {
                 if !nodes.contains(target) {
                     return Err(CompositionError::InvalidOrderingTarget {
                         port: port.clone(),
@@ -335,7 +346,7 @@ impl Composition {
                 }
                 edges.insert((provider_id.clone(), target.clone()));
             }
-            for target in &provider.after {
+            for target in provider.after.get(port).into_iter().flatten() {
                 if !nodes.contains(target) {
                     return Err(CompositionError::InvalidOrderingTarget {
                         port: port.clone(),
@@ -352,7 +363,7 @@ impl Composition {
                 providers,
             }
         })?;
-        Ok((ordered, edges))
+        Ok(ordered)
     }
 }
 
@@ -612,7 +623,8 @@ mod tests {
             .unwrap();
         composition
             .register_provider(
-                provide("wrapper", &["spawn_transform"]).after(provider("workspace")),
+                provide("wrapper", &["spawn_transform"])
+                    .after(port("spawn_transform"), provider("workspace")),
             )
             .unwrap();
 
@@ -672,10 +684,10 @@ mod tests {
             .register_port(PortSpec::new(port("guard"), Combine::All))
             .unwrap();
         cycle
-            .register_provider(provide("a", &["guard"]).before(provider("b")))
+            .register_provider(provide("a", &["guard"]).before(port("guard"), provider("b")))
             .unwrap();
         cycle
-            .register_provider(provide("b", &["guard"]).before(provider("a")))
+            .register_provider(provide("b", &["guard"]).before(port("guard"), provider("a")))
             .unwrap();
         assert!(matches!(
             cycle.resolve([port("guard")]),
@@ -690,7 +702,9 @@ mod tests {
             .register_port(PortSpec::new(port("observer"), Combine::Fanout))
             .unwrap();
         cross_port
-            .register_provider(provide("guard", &["guard"]).before(provider("observer")))
+            .register_provider(
+                provide("guard", &["guard"]).before(port("guard"), provider("observer")),
+            )
             .unwrap();
         cross_port
             .register_provider(provide("observer", &["observer"]))
@@ -720,5 +734,67 @@ mod tests {
         let manifest = composition.resolve([port("store")]).unwrap().manifest();
         assert_eq!(manifest.providers.len(), 1);
         assert_eq!(manifest.providers[0].id, provider("sqlite"));
+    }
+    #[test]
+    fn ordering_is_local_to_each_port_contribution() {
+        let mut composition = Composition::new();
+        for name in ["guard", "observer"] {
+            composition
+                .register_port(PortSpec::new(port(name), Combine::Chain))
+                .unwrap();
+        }
+        composition
+            .register_provider(
+                provide("a", &["guard", "observer"])
+                    .before(port("guard"), provider("b"))
+                    .after(port("observer"), provider("b")),
+            )
+            .unwrap();
+        composition
+            .register_provider(provide("b", &["guard", "observer"]))
+            .unwrap();
+        composition
+            .register_provider(provide("c", &["observer"]))
+            .unwrap();
+        let assembly = composition
+            .resolve([port("guard"), port("observer")])
+            .unwrap();
+        assert_eq!(
+            assembly.port(&port("guard")).unwrap().providers,
+            vec![provider("a"), provider("b")]
+        );
+        assert_eq!(
+            assembly.port(&port("observer")).unwrap().providers,
+            vec![provider("b"), provider("a"), provider("c")]
+        );
+    }
+
+    #[test]
+    fn ordering_does_not_require_target_to_contribute_unrelated_ports() {
+        let mut composition = Composition::new();
+        for name in ["guard", "observer"] {
+            composition
+                .register_port(PortSpec::new(port(name), Combine::Chain))
+                .unwrap();
+        }
+        composition
+            .register_provider(
+                provide("a", &["guard", "observer"]).after(port("guard"), provider("b")),
+            )
+            .unwrap();
+        composition
+            .register_provider(provide("b", &["guard"]))
+            .unwrap();
+        let assembly = composition
+            .resolve([port("guard"), port("observer")])
+            .unwrap();
+        assert_eq!(
+            assembly.port(&port("guard")).unwrap().providers,
+            vec![provider("b"), provider("a")]
+        );
+        assert_eq!(
+            assembly.port(&port("observer")).unwrap().providers,
+            vec![provider("a")]
+        );
     }
 }
