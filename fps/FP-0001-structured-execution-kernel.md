@@ -33,7 +33,8 @@ Cue 收敛为持久、可观察的本地结构化进程执行内核。Core 用�
 已经进入 `Running` 的 Step 只有在运行时回报 completion 后才能成为终态；Core 负责解释该
 completion 对状态和 Scope 的语义影响。
 
-状态、事实、新 Scope 和运行时跟进必须先原子提交，外部动作只能发生在提交之后。
+状态、事实和运行时跟进必须原子提交；提交引用的 Scope 必须已经持久可读。运行时外部动作
+只能发生在提交之后。
 
 ## 动机
 
@@ -120,16 +121,42 @@ Argv              = NonEmpty<NulFreeString>
 - 扩展可以替换实现，但不能增加 `ExecutionPlan`、`BuiltinCommand`、`PipeLink` 或 `IoMode`
   的语义 variant。
 
+`Argv` 的首项 executable 必须非空，其余参数允许空字符串；所有项都不得含 NUL。构造与
+反序列化均须校验这些约束。叶子使用的数据类型见 [Scope](#term-scope)。
+
 ### <a id="term-scope"></a>执行范围 `Scope`
 
 `Scope` 是 `cwd × env × umask` 的完整不可变快照，由内容哈希标识：
 
 ```text
-Scope = AbsolutePath × Env × FileModeMask
+NulFreeString = String where !contains_nul
+AbsolutePath  = Path where is_absolute && !contains_nul
+CdPath        = Path where !is_empty && !contains_nul
+FileModeMask  = u16 where value & !0o777 == 0
+
+EnvKey        = NulFreeString where !is_empty && !contains('=')
+Sensitivity   = Normal + Sensitive
+EnvValue      = NulFreeString × Sensitivity
+Env           = Map<EnvKey, EnvValue>
+
+EnvPatch      = Map<EnvKey, EnvEdit>
+EnvEdit       = Set(EnvValue) + Unset
+EnvMutation   = EnvPatch where !is_empty
+
+Scope         = AbsolutePath × Env × FileModeMask
 ExecutionSpec = ScopeHash × ExecutionPlan
 ```
 
-Scope 不含隐式 parent、delta 或 ambient environment。Scope 的流向只由计划结构决定：
+`Env` builtin 至少包含一项 edit，`Env({})` 非法。同一 `EnvKey` 在 Map 中只能对应
+`Set(value)` 或 `Unset` 之一，不能同时 set 与 unset。敏感性分类的语义见
+[Sensitivity](#term-sensitivity)。
+
+Scope 不含隐式 parent、delta 或 ambient environment，也不包含 stdio、PTY、credentials、
+resource limits、sandbox 或 workspace realization。每个 `Run` 自己持有 I/O 模式；一个
+PTY Run/Pipeline 只有一个 terminal endpoint，Builtin 不拥有 stdio 或 PTY。
+
+`ScopeHash` 是 Scope 完整值的内容哈希，包含环境值的敏感性分类；改变分类不能复用旧哈希。
+正常成功或失败时，Scope 的流向只由计划结构决定：
 
 | Plan | 子项输入 Scope | Plan 输出 Scope |
 |---|---|---|
@@ -143,10 +170,16 @@ Scope 不含隐式 parent、delta 或 ambient environment。Scope 的流向只�
 
 ### <a id="term-step"></a>步骤 `Step`
 
-`Step` 是 `Builtin` 或 `Run` 叶子。组合节点不是 Step。每个叶子在 Execution 创建时按稳定顺序
-获得一个 `StepId`，并持久记录输入、输出 Scope 哈希和状态：
+`Step` 是 `Builtin` 或 `Run` 叶子。组合节点不是 Step。每个叶子在 Execution 创建时按计划
+前序遍历分配从 1 开始的序号：Sequence 先 first 后 then，Parallel 按分支存储顺序遍历。
+`StepId` 包含所属 `ExecutionId` 和该序号，在 Execution 生命周期及恢复后保持不变；不同
+Execution 的同序号叶子不是同一个 Step。StepId 足以定位所属 Execution 及其叶子。
+
+Step 持久记录输入、输出 Scope 哈希和状态：
 
 ```text
+StepId     = ExecutionId × (u32 where value >= 1)
+
 StepRecord = StepId
            × StepState
            × Option<InputScopeHash>
@@ -159,7 +192,28 @@ StepState  = Pending
            + Failed(StepFailure)
            + Skipped(SkipReason)
            + Cancelled(StepCancelCause)
+
+StepFailure = Exit(i32)
+            + Signal(i32)
+            + Spawn(String)
+            + Builtin(String)
+            + Infrastructure(String)
+SkipReason  = ConditionNotMet + AnySuccessSatisfied
 ```
+
+`Exit` 表示非零退出码；零退出是成功，明确取消使用 cancellation completion 而不是伪造失败。
+`InputScopeHash` / `OutputScopeHash` 都是 `ScopeHash`，只是字段角色不同。
+
+| Step 状态 | input_scope | output_scope |
+|---|---|---|
+| `Pending` / `Skipped` | 无 | 无 |
+| `Running` / `Cancelling` | 必须存在 | 无 |
+| `Succeeded` / `Failed` | 必须存在 | 必须存在 |
+| `Cancelled` | 从 Pending 取消时无；曾进入 Running 时保留 | 无 |
+
+输入 Scope 在 `Pending -> Running` 时写入，之后不可修改。`Skipped` / `Cancelled` 不产生
+输出 Scope；取消不构造一个假装成功的 Builtin 结果。恢复必须校验叶子数量、StepId 归属与
+顺序、Scope 字段存在性和计划中的 Scope 关系，不接受仅在字段类型上合法的任意快照。
 
 Builtin 和 Run 使用同一套 Step 生命周期。`Running` 的精确定义是：**该 Step 已经被归约器接纳为
 活动工作，并且同一次已提交状态转换已经把该 `StepId` 标记为需要运行时跟进。** 它表示存在待
@@ -182,6 +236,10 @@ Builtin 不形成另一套状态机或 action 代数。运行时对三种 builti
 相关的必要观察；随后都只把 typed completion 回送归约器，由归约器计算成功后的输出 Scope。
 `Run` 则通过进程运行时落实 Pipeline。实现方式可以不同，但 Step 生命周期、提交边界和完成协议
 不分叉。
+
+成功的 `Env` / `Umask` completion 不携带替换 Scope，归约器从 command 和输入 Scope 计算
+结果；`Cd` success 携带必要的已解析绝对目录观察，归约器只据此更新 cwd。completion 必须与
+计划中的 Builtin variant 匹配，提供者不能回传任意 Scope。
 
 Builtin realization 可以观察运行时环境，但不能修改守护进程自己的 ambient cwd/env/umask，
 也不能留下独立的外部资源或物理 ownership。除 Step completion 及其产生的状态/Fact 外，它对
@@ -214,9 +272,16 @@ StepCancelCause  = ExecutionRequested + AnySuccessSatisfied
 - runtime 若能证明该 Step 尚未产生需要清理的物理运行尝试，则观察到 `Cancelling` 后不得再
   开始 realization，并应直接回报 cancellation completion；Builtin 本身不拥有需要跨取消排空的
   物理进程，因此也遵循这一规则；
-- `Force` 可以强化先前的 `Graceful`，强化时再次标记同一个 `StepId` 需要运行时跟进；
-- 同等级重复请求幂等；
+- `AnySuccessSatisfied` 对活动 loser 使用 `Force`；
+- Step 的 cause 保留首次被归约器接受并提交的取消来源；后续来源不覆盖它。mode 则按
+  `Graceful < Force` 单调取最大值，执行级取消模式也不得降级；
+- 强化 mode 时再次标记同一个 `StepId` 需要运行时跟进；相同或更弱的请求不重复产生跟进；
+- 终态不再接受生命周期变更；迟到的取消不能覆盖已提交的完成结果；
 - 并发结果只按归约器接受并提交输入的顺序决定，不比较墙钟时间。
+
+例如，先接受执行级 Graceful、再成为 AnySuccess loser，得到
+`Cancelling(ExecutionRequested, Force)`；反过来则保留 `AnySuccessSatisfied` 来源。
+来源的历史归属与当前终止强度互不混淆。
 
 执行级 `ExecutionState` 也是派生值：
 
@@ -231,6 +296,38 @@ ExecutionState = Pending + Running + Cancelling + Succeeded + Failed + Cancelled
 Parallel 必须等所有已启动 loser 进入终态后才能成为终态。由此保持结构化执行的核心不变量：
 
 > terminal structured node 不拥有活动 child。
+
+#### 组合节点与执行状态投影
+
+组合节点的结果从计划与叶子递归计算，不另行持久化一套生命周期。全部叶子在启动前被排除的
+子树投影为 `Skipped`，对应叶子标记相应的 SkipReason；已有终态不改写。
+
+| Sequence 条件 | first 的哪些结果选择 then |
+|---|---|
+| `Success` | `Succeeded` |
+| `Failure` | `Failed`，不含 `Cancelled` |
+| `Always` | `Succeeded`、`Failed`、`Cancelled`，不含 `Skipped` |
+
+first 未终结时不得启动 then；条件不满足时，then 的 Pending 叶子标为
+`Skipped(ConditionNotMet)`，Sequence 沿用 first 的结果。条件满足时，`Success` / `Failure`
+使用 then 的结果；`Always` 等待 then 终结，再按 `Failed > Cancelled > Succeeded` 聚合两侧
+结果，不能因清理成功而抹掉原先的失败。then 没有正常输出时不贡献新 Scope，保留已执行路径
+上的上下文；被取消叶子只能保留其输入上下文，不能产生成功输出。
+
+执行级取消和祖先 AnySuccess 的 loser 排除优先于上述条件：它们阻止整个受影响子树启动新的
+Step，包括 Failure/Always 后继。不能因某个活动 Step 在取消后自然成功而重新启动已排除的
+后继；这不影响该 Step 本身如实记录成功。
+
+| Parallel join | 派生结果 |
+|---|---|
+| `All` | 等待全部分支终结；有失败则 Failed，否则有取消则 Cancelled，否则 Succeeded。 |
+| `AnySuccess` | 出现成功分支后排空已启动 loser，再 Succeeded；loser 的失败或取消不覆盖成功。没有成功时等待全部分支；有失败则 Failed，否则 Cancelled。 |
+
+winner 出现到 loser 排空之间，Parallel 仍非终态；它的父节点不能提前继续执行。
+`ExecutionState` 先按根计划取终态结果；根仍非终态且执行级取消已请求、仍有活动 Step 时为
+`Cancelling`；尚未推进、全部叶子为 Pending 时为 `Pending`，其余非终态为 `Running`。
+仅 AnySuccess loser 的取消不会把整个 Execution 标为 `Cancelling`。正常归约不能留下
+“执行级取消已提交，但仍有未处理的 Pending 叶子”的快照。
 
 ### <a id="term-fact"></a>事实 `Fact`
 
@@ -267,15 +364,21 @@ transition.new_scopes    : Vec<Scope>
 
 ```text
 计算下一状态
-  -> 原子提交 snapshot / facts / new scopes / runtime follow-up
+  -> 确保新 Scope 持久可读
+  -> 原子提交 snapshot / facts / runtime follow-up
   -> 更新内存中的权威投影
   -> 发布已提交 facts
   -> 按 StepId 读取最新 committed snapshot 并收敛运行时状态
   -> 将真实结果作为下一次 reducer input
 ```
 
-因此提交之前不得修改权威内存投影、发布 fact、启动进程或发送取消信号。提交失败时，本次
-transition 对外完全不可见。
+任何已提交 snapshot 或 Fact 引用的 Scope 都必须持久可读。Scope 与执行存储在同一事务
+域时可以一起提交；使用独立内容寻址存储时，可以先幂等写入 Scope，再提交执行事务，不要求
+跨存储 ACID。执行事务失败最多留下未引用 Scope，可由存储回收；回收不得删除已被引用或
+仍受在途提交保护的 Scope。
+
+Scope 预写不发布 Fact 或授予访问权限。执行事务提交之前不得修改权威内存投影、发布 Fact、
+启动进程或发送取消信号；失败时不得暴露这次候选状态，也不得执行其运行时跟进。
 
 ### 运行时跟进与状态收敛
 
@@ -306,14 +409,16 @@ worker 即使由较早的 `Running` transition 被唤醒，只要是在取消提
 不能再按“尚未开始”处理。Graceful -> Force 同样只服从最新 committed StepState。
 
 `StepId` 本身不能表达运行时工作的**交付进度**。持久实现仍必须保存无法从 snapshot 推导出的
-交付元数据，以防重复 worker、丢失唤醒或旧 worker 覆盖新状态。推荐实现是每个 Step 使用单调
-递增的 generation：
+交付元数据，以防重复 worker、丢失唤醒或旧 worker 覆盖新状态。规范要求是：状态变化与待跟进
+记录原子提交，重复交付不能创建第二个物理运行尝试，旧 worker 不能确认掉更新后的跟进。
+
+以下 generation/claim 结构只是非规范实现示例，不限制存储布局或要求 Core 暴露这些字段：
 
 ```text
 runtime_work = StepId × desired_generation × applied_generation × claim?
 ```
 
-归约器 transition 每次把 Step 加入 `runtime_steps`，持久层都在同一事务中推进
+在这个示例中，归约器 transition 每次把 Step 加入 `runtime_steps`，持久层都在同一事务中推进
 `desired_generation`。worker 只能把自己已处理的 generation 推进到 `applied_generation`；若
 处理期间状态再次变化，新的 `desired_generation` 仍然大于 applied，不会被旧 worker 清掉。
 
@@ -335,12 +440,13 @@ spawn 成功
 
 对可能留下物理运行尝试的 realization，恢复必须遵守：
 
-> 在无法证明旧运行尝试已经静止，或无法重新取得其唯一控制权时，既不能再次启动同一个 Step，
-> 也不能把它提前宣布为终态。
+> 若既不能证明旧运行尝试已经静止，也不能重新取得其唯一控制权，则不得继续 realization
+> 或发布终态。
 
 运行时可以通过独立进程监护器、可重新定位的稳定进程句柄或其他机制证明旧运行尝试已经静止，
 或重新取得控制权。FP 不规定具体实现。若无法证明，则必须失败关闭：不重复启动、不启动依赖
-工作，也不发布虚假的终态事实。
+工作，也不发布虚假的终态事实。接管只允许继续控制既有 attempt，不授权再次 spawn；静止
+证明只允许报告已知结果或重启中断，不表示原操作从未执行，也不授权自动重放 Run。
 
 Builtin 不留下这种物理 ownership，因此不受上述重复 spawn 限制；若其 completion 尚未提交，
 恢复后可以从最新 committed Step 与 Scope 重新执行 realization。Core 也可以提供“把活动 Run
@@ -371,26 +477,17 @@ env set A=left -> printenv A
 
 ### <a id="term-sensitivity"></a>敏感性 `Sensitivity`
 
-环境值可以显式携带敏感性分类：
+`Sensitivity` 是环境值的显式敏感性分类：`Normal` 表示未声明敏感，`Sensitive` 表示声明敏感；
+`Normal` 不是“已证明不含秘密”。ADT 记法与环境数据类型集中定义于 [Scope](#term-scope)，
+本节定义分类的语义与处理边界。
 
-```text
-Sensitivity = Normal + Sensitive
-EnvValue    = NulFreeString × Sensitivity
-Env         = Map<EnvKey, EnvValue>
-EnvPatch    = Map<EnvKey, EnvEdit>
-EnvEdit     = Set(EnvValue) + Unset
-```
-
-`Sensitivity` 只表达数据分类，不在 Core 中引入第二套 Execution 或持久化状态。变量名猜测可以
+该分类不在 Core 中引入第二套 Execution 或持久化状态。变量名猜测可以
 辅助自动标注或警告，但不能替代显式分类，也不能成为安全边界。
 
 该分类使实现能够提供 Sensitive Execution，例如采用易失存储或不透明凭证引用。**本 FP 不规定
 Sensitive Execution 的持久化、恢复、重连或崩溃处理协议，也不要求第一阶段实现必须提供这些
 能力。** 不支持 Sensitive Execution 的实现应显式拒绝，而不能静默把 `Sensitive` 降级为
 `Normal`。具体保护策略可以由后续 FP 单独定义。
-
-长期更推荐凭证提供者在运行时根据不透明引用注入秘密字节，使秘密值本身不进入语义计划、Scope
-或事实。
 
 ### <a id="term-composition"></a>组合 `Composition`
 
@@ -454,21 +551,25 @@ v4 不得同时拥有同一 socket。外部 policy owner 的迁移方式是把�
 
 ## 验证
 
-- 定义所有权检查证明 9 个 Cue 稳定概念与 `term-*` 小标题一一对应，参考实现术语不取得
-  定义所有权；
-- Core serialization 测试证明 `ExecutionPlan` 只有四个 variant，非法 pipeline、空并行和
-  冲突 env edit 无法构造或反序列化；
+- 定义所有权检查验证 `defines` 与 `term-*` 锚点对应，参考实现术语不取得定义所有权；
+  基础数据类型只有一个 ADT 定义位置，Scope 与 Sensitivity 的交叉引用可解析；
+- Core serialization 测试覆盖四种 plan variant，以及空 executable、含 NUL 字符串、非法路径、
+  非法 EnvKey、越界 umask、空 EnvMutation、非法 pipeline 和不足两个分支的 Parallel 拒绝；
+  普通空参数与空环境值合法，同一 EnvKey 不会同时具有 Set/Unset；
 - reducer 测试证明 Builtin/Run ready 决策与 `Pending -> Running`、`runtime_steps += StepId`
-  属于同一个 transition，并覆盖稳定 StepId、Sequence Scope threading、Parallel fork/no-merge；
+  属于同一个 transition，并覆盖跨 Execution 的 StepId 区分、前序遍历稳定性、Scope 字段约束、
+  Sequence 条件与 Scope threading、Parallel fork/no-merge，以及非法 snapshot restore 拒绝；
 - cancellation 测试覆盖 `Running -> Cancelling -> terminal`、未开始 realization 的直接取消
-  完成、正常完成与取消竞争、Graceful -> Force 强化、AnySuccess loser draining，并证明取消
-  来源与模式互不重复编码；
-- 持久化测试证明 snapshot/facts/new scopes/runtime follow-up 原子记录，commit failure 不修改
-  live state且不执行外部动作；
+  完成、正常完成与取消竞争、两种来源的先后顺序、mode 不降级与重复请求幂等、AnySuccess
+  Force loser draining；组合测试覆盖 Always 不吞失败、loser 失败不覆盖 winner、无 winner 的
+  失败聚合，以及 execution cancel/祖先 loser 排除后不再启动后继；
+- 持久化测试证明 snapshot/facts/runtime follow-up 原子记录，以及引用 Scope 先持久可读；
+  分别覆盖 Scope 写入失败、预写后执行事务失败、崩溃恢复和回收与在途提交竞争，确保无悬空引用、
+  不发布候选 Fact、不修改 live state、不执行未提交的外部动作；
 - 运行时收敛测试证明过期 Running 唤醒在最新状态为 Cancelling/terminal 时不会开始 realization，
   Graceful 旧唤醒服从最新 Force 状态；
-- 交付测试证明同一 Step 在 worker 执行期间再次变化时不会丢失新一代 follow-up，旧 worker
-  不能把更新后的 generation 标记为已完成；
+- 交付测试证明同一 Step 在 worker 执行期间再次变化时不会丢失后续跟进，旧 worker 不能确认
+  更新后的工作，重复交付不产生重复物理运行尝试；
 - 崩溃恢复测试证明 Builtin 可安全重放，同时无法确认旧 Run attempt 静止或重新取得控制权时不会
   重复 spawn，也不会发布虚假终态；
 - Language 测试覆盖三个 builtin、process-local `A=B`、assignment-only 拒绝、pipe link 和
