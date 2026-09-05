@@ -1,10 +1,13 @@
 # Cue design index
 
-These documents describe the IPC v3 execution runtime. Source types and strict
-wire validators remain authoritative when prose and code disagree.
-Changes to the public contract are governed by
-[FP-0000](../../fps/FP-0000-governance.md).
+Cue vNext is being built as a hard cut from the current IPC v3 runtime.
+[FP-0001](../../fps/FP-0001-structured-execution-kernel.md) defines the public
+execution contract under [FP-0000](../../fps/FP-0000-governance.md).
+The vNext documents describe its implementation; the IPC v3 documents remain
+until their corresponding migration lands.
 
+- [vNext foundation](vnext-foundation.md): target boundary, closed execution ADT,
+  explicit Scope, and bootstrap Composition.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.

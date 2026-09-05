@@ -1,0 +1,12 @@
+[package]
+name = "cue-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Bootstrap composition contracts for Cue runtime implementations"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

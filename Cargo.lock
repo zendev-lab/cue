@@ -406,6 +406,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cue-runtime"
+version = "0.1.2"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cue-tui"
 version = "0.1.2"
 dependencies = [
