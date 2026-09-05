@@ -78,6 +78,9 @@ ExecutionSnapshot = ExecutionId
                   × Option<CancelMode>
 ```
 
+`ExecutionId` 是一次 Execution 的稳定不透明标识，在同一持久化执行命名空间内唯一，
+恢复时保持不变；具体编码由协议规定。
+
 `ExecutionState` 不是第二份可独立修改的状态，而是从计划、Step 状态和取消请求**派生出的
 投影**。持久层不得同时维护另一套生命周期真相。
 
@@ -317,6 +320,10 @@ first 未终结时不得启动 then；条件不满足时，then 的 Pending 叶�
 执行级取消和祖先 AnySuccess 的 loser 排除优先于上述条件：它们阻止整个受影响子树启动新的
 Step，包括 Failure/Always 后继。不能因某个活动 Step 在取消后自然成功而重新启动已排除的
 后继；这不影响该 Step 本身如实记录成功。
+
+实际推进的 then 至少有一个叶子进入过 `Running`，因而不会整体投影为 `Skipped`。
+first 为 `Skipped` 时不选择 then；对于 `Always`，then 因祖先排除而整体为 `Skipped` 时
+沿用 first 的结果，不参与上述三档聚合，也不得重新启动。
 
 | Parallel join | 派生结果 |
 |---|---|
