@@ -1,9 +1,9 @@
 # Cue vNext foundation
 
-This document freezes the target contract used to migrate the current IPC v3
-runtime. It is deliberately smaller than the complete delivery plan: later
-slices add the reducer, protocol, storage, runner, clients, and external
-producers without reopening these boundaries.
+This document describes the foundation used to migrate the current IPC v3
+runtime. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the
+public contract; later stack layers implement its reducer, protocol, storage,
+runtime, and clients.
 
 ## Product boundary
 
@@ -51,7 +51,8 @@ Scope is the full immutable snapshot:
 Scope = absolute cwd × Env × umask
 ```
 
-Its identity uses a versioned canonical hash. Parent/delta relationships may be
+Each environment value carries an explicit Normal or Sensitive classification.
+Its identity uses a versioned canonical hash that includes that classification. Parent/delta relationships may be
 recorded as execution history, but are not part of Scope identity.
 
 The Core builtin families are Cd, Env, and Umask. Env uses a map from EnvKey to

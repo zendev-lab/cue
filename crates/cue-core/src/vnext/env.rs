@@ -38,21 +38,41 @@ impl<'de> Deserialize<'de> for EnvKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sensitivity {
+    Normal,
+    Sensitive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct EnvValue(String);
+pub struct EnvValue {
+    value: String,
+    sensitivity: Sensitivity,
+}
 
 impl EnvValue {
     pub fn new(value: impl Into<String>) -> Result<Self, EnvError> {
+        Self::classified(value, Sensitivity::Normal)
+    }
+
+    pub fn classified(
+        value: impl Into<String>,
+        sensitivity: Sensitivity,
+    ) -> Result<Self, EnvError> {
         let value = value.into();
         if value.contains('\0') {
             return Err(EnvError::ValueContainsNul);
         }
-        Ok(Self(value))
+        Ok(Self { value, sensitivity })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
+    }
+
+    pub const fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
     }
 }
 
@@ -61,8 +81,14 @@ impl<'de> Deserialize<'de> for EnvValue {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            value: String,
+            sensitivity: Sensitivity,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::classified(wire.value, wire.sensitivity).map_err(serde::de::Error::custom)
     }
 }
 
@@ -167,6 +193,20 @@ mod tests {
         assert!(serde_json::from_str::<EnvKey>(r#""A=B""#).is_err());
         assert!(serde_json::from_str::<EnvKey>(r#""A\u0000B""#).is_err());
         assert!(EnvValue::new("a\0b").is_err());
+    }
+
+    #[test]
+    fn sensitivity_is_explicit_and_survives_serialization() {
+        for sensitivity in [Sensitivity::Normal, Sensitivity::Sensitive] {
+            let value = EnvValue::classified("", sensitivity).unwrap();
+            let wire = serde_json::to_value(&value).unwrap();
+            assert_eq!(serde_json::from_value::<EnvValue>(wire).unwrap(), value);
+        }
+        assert!(serde_json::from_str::<EnvValue>(r#"{"value":"secret"}"#).is_err());
+        assert!(
+            serde_json::from_str::<EnvValue>(r#"{"value":"a\u0000b","sensitivity":"sensitive"}"#)
+                .is_err()
+        );
     }
 
     #[test]

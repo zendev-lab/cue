@@ -9,7 +9,7 @@ mod plan;
 mod process;
 mod scope;
 
-pub use env::{Env, EnvEdit, EnvKey, EnvPatch, EnvValue};
+pub use env::{Env, EnvEdit, EnvKey, EnvPatch, EnvValue, Sensitivity};
 pub use plan::{
     BuiltinCommand, CdPath, EnvMutation, ExecutionPlan, ExecutionSpec, IoMode, ParallelBranches,
     ParallelJoin, PlanValidationError, SequenceCondition, StepDescriptor, StepKind,
