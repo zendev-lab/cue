@@ -4,15 +4,14 @@
 //! connection binds a `ClientId` through `Hello`; commands then use the strict
 //! operation ledger while queries remain side-effect free.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cue_core::vnext::{
-    AbsolutePath, BuiltinCommand, BuiltinSuccess, Execution, ExecutionProjection,
-    ExecutionSnapshot, ExecutionState, Fact, FactDraft, FactEvent, OutputStream, ReadyStep, Scope,
-    StepAction, StepFailure, StepState,
+    Execution, ExecutionProjection, ExecutionSnapshot, ExecutionState, Fact, FactDraft, FactEvent,
+    OutputStream, RunCompletion, Scope, StepAction, StepFailure, StepState,
 };
 use cue_core::{EventId, ExecutionId, ScopeHash, StepId};
 use cue_protocol::{
@@ -29,22 +28,14 @@ use cue_runtime::{
     runtime_root_ports,
 };
 use cue_store_sqlite::{
-    ExecutionCommandCommit, OperationCommit, OperationRecord, ScopeCommandCommit, ScopePersistence,
-    Store, StoreError, command_fingerprint,
+    ExecutionCommandCommit, OperationCommit, OperationRecord, ScopeCommandCommit, Store, StoreError,
 };
 
-const VOLATILE_EVENT_BASE: u64 = 1 << 63;
 const OUTPUT_READ_LIMIT: usize = 16 * 1024 * 1024;
 
-/// Store adapter that keeps secret-bearing scopes and their executions in
-/// memory while delegating durable state to the fresh vNext SQLite schema.
+/// SQLite is the authoritative store; unsupported Sensitive data is rejected.
 struct StoreProvider {
     durable: Mutex<Store>,
-    scopes: Mutex<HashMap<ScopeHash, Scope>>,
-    volatile_executions: Mutex<BTreeMap<ExecutionId, ExecutionProjection>>,
-    volatile_facts: Mutex<Vec<FactEvent>>,
-    volatile_operations: Mutex<HashMap<(String, String), VolatileOperation>>,
-    next_volatile_event: AtomicU64,
     events: tokio::sync::broadcast::Sender<FactEvent>,
     output_events: tokio::sync::broadcast::Sender<LiveOutput>,
 }
@@ -57,95 +48,38 @@ struct LiveOutput {
     data: Vec<u8>,
 }
 
-#[derive(Clone)]
-struct VolatileOperation {
-    fingerprint: [u8; 32],
-    response: ResponsePayload,
-}
-
 impl StoreProvider {
     fn new(store: Store) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(1024);
         let (output_events, _) = tokio::sync::broadcast::channel(1024);
         Self {
             durable: Mutex::new(store),
-            scopes: Mutex::new(HashMap::new()),
-            volatile_executions: Mutex::new(BTreeMap::new()),
-            volatile_facts: Mutex::new(Vec::new()),
-            volatile_operations: Mutex::new(HashMap::new()),
-            next_volatile_event: AtomicU64::new(VOLATILE_EVENT_BASE),
             events,
             output_events,
         }
     }
 
-    fn scope_is_durable(&self, hash: ScopeHash) -> Result<bool, RuntimeError> {
-        self.durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
-            .get_scope(hash)
-            .map(|scope| scope.is_some())
-            .map_err(store_error)
+    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, Store>, RuntimeError> {
+        self.durable.lock().map_err(|_| lock_error("SQLite store"))
     }
 
     fn load_scope(&self, hash: ScopeHash) -> Result<Option<Scope>, RuntimeError> {
         ScopeStore::get(self, hash)
     }
-
     fn load_execution(&self, id: ExecutionId) -> Result<Option<ExecutionProjection>, RuntimeError> {
         ExecutionStore::get(self, id)
     }
 
-    fn execution_is_volatile(&self, id: ExecutionId) -> Result<bool, RuntimeError> {
-        Ok(self
-            .volatile_executions
-            .lock()
-            .map_err(|_| lock_error("volatile execution store"))?
-            .contains_key(&id))
-    }
-
     fn next_execution_id(&self) -> Result<ExecutionId, RuntimeError> {
         let maximum = self
-            .list(None, u16::MAX)?
-            .into_iter()
+            .list(None, 1)?
+            .first()
             .map(|execution| execution.snapshot.id.0)
-            .max()
             .unwrap_or(0);
         maximum
             .checked_add(1)
             .map(ExecutionId)
             .ok_or_else(|| RuntimeError::infrastructure("execution ID space exhausted"))
-    }
-
-    fn record_volatile_operation(
-        &self,
-        client: &ClientId,
-        operation: &OperationId,
-        command: &Command,
-        response: &ResponsePayload,
-    ) -> Result<OperationOutcome, RuntimeError> {
-        let fingerprint = command_fingerprint(command).map_err(store_error)?;
-        let key = (client.as_str().to_owned(), operation.as_str().to_owned());
-        let mut operations = self
-            .volatile_operations
-            .lock()
-            .map_err(|_| lock_error("volatile operation store"))?;
-        match operations.get(&key) {
-            Some(existing) if existing.fingerprint == fingerprint => {
-                Ok(OperationOutcome::Replay(existing.response.clone()))
-            }
-            Some(_) => Ok(OperationOutcome::Conflict),
-            None => {
-                operations.insert(
-                    key,
-                    VolatileOperation {
-                        fingerprint,
-                        response: response.clone(),
-                    },
-                );
-                Ok(OperationOutcome::Inserted)
-            }
-        }
     }
 
     fn record_durable_operation(
@@ -156,20 +90,20 @@ impl StoreProvider {
         response: &ResponsePayload,
         completed_at_ms: i64,
     ) -> Result<OperationOutcome, RuntimeError> {
-        let result = self
-            .durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
-            .record_operation(client, operation, command, Some(response), completed_at_ms)
-            .map_err(store_error)?;
-        Ok(match result {
-            OperationRecord::Inserted => OperationOutcome::Inserted,
-            OperationRecord::Replay {
-                response: Some(response),
-            } => OperationOutcome::Replay(response),
-            OperationRecord::Replay { response: None } => OperationOutcome::Expired,
-            OperationRecord::Conflict { .. } => OperationOutcome::Conflict,
-        })
+        Ok(
+            match self
+                .lock_store()?
+                .record_operation(client, operation, command, Some(response), completed_at_ms)
+                .map_err(store_error)?
+            {
+                OperationRecord::Inserted => OperationOutcome::Inserted(Vec::new()),
+                OperationRecord::Replay {
+                    response: Some(response),
+                } => OperationOutcome::Replay(response),
+                OperationRecord::Replay { response: None } => OperationOutcome::Expired,
+                OperationRecord::Conflict { .. } => OperationOutcome::Conflict,
+            },
+        )
     }
 
     fn commit_submission(
@@ -181,35 +115,9 @@ impl StoreProvider {
         facts: &[FactDraft],
         response: &ResponsePayload,
     ) -> Result<OperationOutcome, RuntimeError> {
-        if !self.scope_is_durable(execution.snapshot.spec.scope())? {
-            let fingerprint = command_fingerprint(command).map_err(store_error)?;
-            let key = (client.as_str().to_owned(), operation.as_str().to_owned());
-            let mut operations = self
-                .volatile_operations
-                .lock()
-                .map_err(|_| lock_error("volatile operation store"))?;
-            match operations.get(&key) {
-                Some(existing) if existing.fingerprint == fingerprint => {
-                    Ok(OperationOutcome::Replay(existing.response.clone()))
-                }
-                Some(_) => Ok(OperationOutcome::Conflict),
-                None => {
-                    self.commit(execution, facts)?;
-                    operations.insert(
-                        key,
-                        VolatileOperation {
-                            fingerprint,
-                            response: response.clone(),
-                        },
-                    );
-                    Ok(OperationOutcome::Inserted)
-                }
-            }
-        } else {
-            let result = self
-                .durable
-                .lock()
-                .map_err(|_| lock_error("SQLite store"))?
+        Ok(
+            match self
+                .lock_store()?
                 .commit_execution_command(
                     OperationCommit {
                         client,
@@ -221,19 +129,16 @@ impl StoreProvider {
                     execution,
                     facts,
                 )
-                .map_err(store_error)?;
-            Ok(match result {
-                ExecutionCommandCommit::Committed { facts } => {
-                    self.publish(&facts);
-                    OperationOutcome::Inserted
-                }
+                .map_err(store_error)?
+            {
+                ExecutionCommandCommit::Committed { facts } => OperationOutcome::Inserted(facts),
                 ExecutionCommandCommit::Replay {
                     response: Some(response),
                 } => OperationOutcome::Replay(response),
                 ExecutionCommandCommit::Replay { response: None } => OperationOutcome::Expired,
                 ExecutionCommandCommit::Conflict { .. } => OperationOutcome::Conflict,
-            })
-        }
+            },
+        )
     }
 
     fn commit_scope_operation(
@@ -245,71 +150,28 @@ impl StoreProvider {
         response: &ResponsePayload,
         completed_at_ms: i64,
     ) -> Result<(OperationOutcome, ScopeDurability), RuntimeError> {
-        if Store::scope_persistence(scope) == ScopePersistence::Persisted {
-            let result = self
-                .durable
-                .lock()
-                .map_err(|_| lock_error("SQLite store"))?
-                .commit_scope_command(
-                    OperationCommit {
-                        client,
-                        operation,
-                        command,
-                        response: Some(response),
-                        completed_at_ms,
-                    },
-                    scope,
-                )
-                .map_err(store_error)?;
-            let outcome = match result {
-                ScopeCommandCommit::Committed => {
-                    self.scopes
-                        .lock()
-                        .map_err(|_| lock_error("scope cache"))?
-                        .insert(scope.compute_hash(), scope.clone());
-                    OperationOutcome::Inserted
-                }
-                ScopeCommandCommit::Replay {
+        let outcome = match self
+            .lock_store()?
+            .commit_scope_command(
+                OperationCommit {
+                    client,
+                    operation,
+                    command,
                     response: Some(response),
-                } => OperationOutcome::Replay(response),
-                ScopeCommandCommit::Replay { response: None } => OperationOutcome::Expired,
-                ScopeCommandCommit::Conflict { .. } => OperationOutcome::Conflict,
-            };
-            return Ok((outcome, ScopeDurability::Durable));
-        }
-
-        let fingerprint = command_fingerprint(command).map_err(store_error)?;
-        let key = (client.as_str().to_owned(), operation.as_str().to_owned());
-        let mut operations = self
-            .volatile_operations
-            .lock()
-            .map_err(|_| lock_error("volatile operation store"))?;
-        let outcome = match operations.get(&key) {
-            Some(existing) if existing.fingerprint == fingerprint => {
-                OperationOutcome::Replay(existing.response.clone())
-            }
-            Some(_) => OperationOutcome::Conflict,
-            None => {
-                self.scopes
-                    .lock()
-                    .map_err(|_| lock_error("scope cache"))?
-                    .insert(scope.compute_hash(), scope.clone());
-                operations.insert(
-                    key,
-                    VolatileOperation {
-                        fingerprint,
-                        response: response.clone(),
-                    },
-                );
-                OperationOutcome::Inserted
-            }
+                    completed_at_ms,
+                },
+                scope,
+            )
+            .map_err(store_error)?
+        {
+            ScopeCommandCommit::Committed => OperationOutcome::Inserted(Vec::new()),
+            ScopeCommandCommit::Replay {
+                response: Some(response),
+            } => OperationOutcome::Replay(response),
+            ScopeCommandCommit::Replay { response: None } => OperationOutcome::Expired,
+            ScopeCommandCommit::Conflict { .. } => OperationOutcome::Conflict,
         };
-        Ok((outcome, ScopeDurability::Volatile))
-    }
-
-    fn next_volatile_event_id(&self) -> Result<EventId, RuntimeError> {
-        let id = self.next_volatile_event.fetch_add(1, Ordering::Relaxed);
-        EventId::new(id).map_err(|error| RuntimeError::infrastructure(error.to_string()))
+        Ok((outcome, ScopeDurability::Durable))
     }
 
     fn publish(&self, events: &[FactEvent]) {
@@ -320,7 +182,7 @@ impl StoreProvider {
 }
 
 enum OperationOutcome {
-    Inserted,
+    Inserted(Vec<FactEvent>),
     Replay(ResponsePayload),
     Conflict,
     Expired,
@@ -328,106 +190,33 @@ enum OperationOutcome {
 
 impl ExecutionStore for StoreProvider {
     fn get(&self, id: ExecutionId) -> Result<Option<ExecutionProjection>, RuntimeError> {
-        if let Some(execution) = self
-            .volatile_executions
-            .lock()
-            .map_err(|_| lock_error("volatile execution store"))?
-            .get(&id)
-            .cloned()
-        {
-            return Ok(Some(execution));
-        }
-        self.durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
-            .get_execution(id)
-            .map_err(store_error)
+        self.lock_store()?.get_execution(id).map_err(store_error)
     }
-
     fn list(
         &self,
         before: Option<ExecutionId>,
         limit: u16,
     ) -> Result<Vec<ExecutionProjection>, RuntimeError> {
-        let mut executions = self
-            .durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
+        self.lock_store()?
             .list_executions(before, limit)
-            .map_err(store_error)?;
-        executions.extend(
-            self.volatile_executions
-                .lock()
-                .map_err(|_| lock_error("volatile execution store"))?
-                .values()
-                .filter(|execution| before.is_none_or(|id| execution.snapshot.id < id))
-                .cloned(),
-        );
-        executions.sort_by_key(|execution| std::cmp::Reverse(execution.snapshot.id));
-        executions.truncate(usize::from(limit));
-        Ok(executions)
+            .map_err(store_error)
     }
-
     fn commit(
         &self,
         execution: &ExecutionProjection,
         facts: &[FactDraft],
     ) -> Result<Vec<FactEvent>, RuntimeError> {
-        let volatile = self.execution_is_volatile(execution.snapshot.id)?
-            || !self.scope_is_durable(execution.snapshot.spec.scope())?;
-        if !volatile {
-            let committed = self
-                .durable
-                .lock()
-                .map_err(|_| lock_error("SQLite store"))?
-                .commit_execution(execution, facts)
-                .map_err(store_error)?;
-            self.publish(&committed);
-            return Ok(committed);
-        }
-        Execution::restore(execution.snapshot.clone())
-            .map_err(|error| RuntimeError::new(RuntimeErrorKind::Conflict, error.to_string()))?;
-        self.volatile_executions
-            .lock()
-            .map_err(|_| lock_error("volatile execution store"))?
-            .insert(execution.snapshot.id, execution.clone());
-        let mut committed = Vec::with_capacity(facts.len());
-        for draft in facts {
-            committed.push(FactEvent {
-                id: self.next_volatile_event_id()?,
-                occurred_at_ms: draft.occurred_at_ms,
-                fact: draft.fact.clone(),
-            });
-        }
-        self.volatile_facts
-            .lock()
-            .map_err(|_| lock_error("volatile fact store"))?
-            .extend(committed.iter().cloned());
-        self.publish(&committed);
-        Ok(committed)
+        self.lock_store()?
+            .commit_execution(execution, facts)
+            .map_err(store_error)
     }
-
     fn facts_after(
         &self,
         execution: ExecutionId,
         after: Option<EventId>,
         limit: u16,
     ) -> Result<Vec<FactEvent>, RuntimeError> {
-        if self.execution_is_volatile(execution)? {
-            let cursor = after.map(EventId::get).unwrap_or(0);
-            return Ok(self
-                .volatile_facts
-                .lock()
-                .map_err(|_| lock_error("volatile fact store"))?
-                .iter()
-                .filter(|event| event.fact.execution_id() == execution && event.id.get() > cursor)
-                .take(usize::from(limit))
-                .cloned()
-                .collect());
-        }
-        self.durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
+        self.lock_store()?
             .facts_after(execution, after, limit)
             .map_err(store_error)
     }
@@ -435,38 +224,13 @@ impl ExecutionStore for StoreProvider {
 
 impl ScopeStore for StoreProvider {
     fn put(&self, scope: &Scope, created_at_ms: i64) -> Result<ScopeDurability, RuntimeError> {
-        let hash = scope.compute_hash();
-        self.scopes
-            .lock()
-            .map_err(|_| lock_error("scope cache"))?
-            .insert(hash, scope.clone());
-        let persistence = self
-            .durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
+        self.lock_store()?
             .put_scope(scope, created_at_ms)
             .map_err(store_error)?;
-        Ok(match persistence {
-            ScopePersistence::Persisted => ScopeDurability::Durable,
-            ScopePersistence::VolatileSensitiveEnvironment => ScopeDurability::Volatile,
-        })
+        Ok(ScopeDurability::Durable)
     }
-
     fn get(&self, hash: ScopeHash) -> Result<Option<Scope>, RuntimeError> {
-        if let Some(scope) = self
-            .scopes
-            .lock()
-            .map_err(|_| lock_error("scope cache"))?
-            .get(&hash)
-            .cloned()
-        {
-            return Ok(Some(scope));
-        }
-        self.durable
-            .lock()
-            .map_err(|_| lock_error("SQLite store"))?
-            .get_scope(hash)
-            .map_err(store_error)
+        self.lock_store()?.get_scope(hash).map_err(store_error)
     }
 }
 
@@ -491,28 +255,37 @@ impl OutputStore for FactingOutputStore {
         stream: OutputStream,
         data: &[u8],
     ) -> Result<OutputAppend, RuntimeError> {
-        let append = self.output.append(step, stream, data)?;
+        let (append, committed) = {
+            let store = self.executions.lock_store()?;
+            let mut execution = store
+                .get_execution(step.execution)
+                .map_err(store_error)?
+                .ok_or_else(|| RuntimeError::infrastructure("output execution disappeared"))?;
+            let append = self.output.append(step, stream, data)?;
+            execution.updated_at_ms = now_ms().max(execution.updated_at_ms);
+            let committed = store
+                .commit_execution(
+                    &execution,
+                    &[FactDraft {
+                        occurred_at_ms: execution.updated_at_ms,
+                        fact: Fact::OutputAppended {
+                            step,
+                            stream,
+                            start_offset: append.start_offset,
+                            end_offset: append.end_offset,
+                        },
+                    }],
+                )
+                .map_err(store_error)?;
+            (append, committed)
+        };
+        self.executions.publish(&committed);
         let _ = self.executions.output_events.send(LiveOutput {
             step,
             stream,
             offset: append.start_offset,
             data: data.to_vec(),
         });
-        if let Some(mut execution) = self.executions.load_execution(step.execution)? {
-            execution.updated_at_ms = now_ms().max(execution.updated_at_ms);
-            self.executions.commit(
-                &execution,
-                &[FactDraft {
-                    occurred_at_ms: execution.updated_at_ms,
-                    fact: Fact::OutputAppended {
-                        step,
-                        stream,
-                        start_offset: append.start_offset,
-                        end_offset: append.end_offset,
-                    },
-                }],
-            )?;
-        }
         Ok(append)
     }
 
@@ -595,6 +368,7 @@ pub struct VnextService {
 }
 
 struct ExecutionTask {
+    id: ExecutionId,
     state: tokio::sync::Mutex<TaskState>,
     controls: tokio::sync::Mutex<BTreeMap<StepId, RunControl>>,
     changed: tokio::sync::Notify,
@@ -647,26 +421,23 @@ impl VnextService {
         self.store.output_events.subscribe()
     }
 
-    /// Restore all non-terminal projections. Running steps are first committed
-    /// as infrastructure failures, then ordinary reducer advancement resumes.
+    /// Recover unstarted/replayable work only after exclusive host ownership.
+    /// Unknown physical attempts reject recovery before any facts or spawn.
     pub async fn recover(self: &Arc<Self>) -> Result<(), RuntimeError> {
+        self.store
+            .lock_store()?
+            .recover_runtime_work()
+            .map_err(store_error)?;
         let projections = self.store.list(None, u16::MAX)?;
-        for mut projection in projections {
+        for projection in projections {
             if projection.state.is_terminal() {
                 continue;
-            }
-            if let Some(recovery) = cue_runtime::recover_interrupted(
-                &projection,
-                now_ms().max(projection.updated_at_ms),
-                "daemon restarted",
-            )? {
-                self.store.commit(&recovery.execution, &recovery.facts)?;
-                projection = recovery.execution;
             }
             let execution = Execution::restore(projection.snapshot.clone()).map_err(|error| {
                 RuntimeError::new(RuntimeErrorKind::Conflict, error.to_string())
             })?;
             let task = Arc::new(ExecutionTask {
+                id: projection.snapshot.id,
                 state: tokio::sync::Mutex::new(TaskState {
                     execution,
                     created_at_ms: projection.created_at_ms,
@@ -697,6 +468,7 @@ impl VnextService {
                 format!("scope {} is not available", spec.scope()),
             ));
         }
+        let mut tasks = self.tasks.lock().await;
         let id = self.store.next_execution_id()?;
         let now = now_ms();
         let execution = Execution::new(id, spec);
@@ -711,7 +483,7 @@ impl VnextService {
                 scope: projection.snapshot.spec.scope(),
             },
         };
-        match self.store.commit_submission(
+        let committed = match self.store.commit_submission(
             client,
             operation,
             command,
@@ -722,9 +494,10 @@ impl VnextService {
             OperationOutcome::Replay(response) => return Ok(response),
             OperationOutcome::Conflict => return Err(operation_conflict()),
             OperationOutcome::Expired => return Err(operation_expired()),
-            OperationOutcome::Inserted => {}
-        }
+            OperationOutcome::Inserted(facts) => facts,
+        };
         let task = Arc::new(ExecutionTask {
+            id,
             state: tokio::sync::Mutex::new(TaskState {
                 execution,
                 created_at_ms: now,
@@ -733,44 +506,38 @@ impl VnextService {
             controls: tokio::sync::Mutex::new(BTreeMap::new()),
             changed: tokio::sync::Notify::new(),
         });
-        self.tasks.lock().await.insert(id, task.clone());
+        tasks.insert(id, task.clone());
+        drop(tasks);
+        self.store.publish(&committed);
         self.clone().drive(task).await?;
         Ok(response)
     }
 
     async fn drive(self: Arc<Self>, task: Arc<ExecutionTask>) -> Result<(), RuntimeError> {
-        let (ready, to_cancel) = {
+        {
             let mut state = task.state.lock().await;
-            let before = state.execution.snapshot();
-            let before_state = state.execution.state();
-            let transition = state.execution.advance().map_err(reducer_error)?;
-            for scope in &transition.new_scopes {
-                self.runtime.scope_store().put(scope, now_ms())?;
+            let mut candidate = state.execution.clone();
+            let transition = candidate.advance().map_err(reducer_error)?;
+            if candidate != state.execution {
+                self.commit_transition(&mut state, candidate, &transition)?;
             }
-            for ready in &transition.ready {
-                state
-                    .execution
-                    .mark_running(ready.id)
-                    .map_err(reducer_error)?;
-            }
-            let timestamp = now_ms().max(state.updated_at_ms);
-            let facts = transition_facts(&before, &before_state, &state.execution, timestamp);
-            state.updated_at_ms = timestamp;
-            self.store.commit(
-                &projection(&state.execution, state.created_at_ms, state.updated_at_ms),
-                &facts,
-            )?;
-            (transition.ready, transition.to_cancel)
-        };
-        self.terminate_steps(&task, &to_cancel, cue_core::vnext::CancelMode::Force)
-            .await;
+        }
         task.changed.notify_waiters();
-        for ready in ready {
+        self.schedule_runtime(task)
+    }
+
+    fn schedule_runtime(self: &Arc<Self>, task: Arc<ExecutionTask>) -> Result<(), RuntimeError> {
+        let steps = self
+            .store
+            .lock_store()?
+            .pending_runtime_steps()
+            .map_err(store_error)?;
+        for step in steps.into_iter().filter(|step| step.execution == task.id) {
             let service = self.clone();
             let task = task.clone();
             tokio::spawn(async move {
-                if let Err(error) = service.realize(task, ready).await {
-                    tracing::error!(%error, "vNext execution leaf failed");
+                if let Err(error) = service.realize(task, step).await {
+                    tracing::error!(%step, %error, "runtime follow-up stopped without asserting completion");
                 }
             });
         }
@@ -780,172 +547,186 @@ impl VnextService {
     fn realize(
         self: Arc<Self>,
         task: Arc<ExecutionTask>,
-        ready: ReadyStep,
+        step: StepId,
     ) -> RuntimeFuture<Result<(), RuntimeError>> {
         Box::pin(async move {
-            let scope = self
-                .runtime
-                .scope_store()
-                .get(ready.input_scope)?
-                .ok_or_else(|| {
-                    RuntimeError::new(
-                        RuntimeErrorKind::NotFound,
-                        format!("scope {} disappeared", ready.input_scope),
-                    )
-                })?;
-            match ready.action {
-                StepAction::Builtin(command) => {
-                    let result = realize_builtin(&command, &scope);
-                    self.complete_builtin(task, ready.id, scope, result).await
-                }
-                StepAction::Run { pipeline, io } => {
-                    let spawned = self
-                        .runtime
-                        .spawn(SpawnRequest {
-                            step: ready.id,
-                            pipeline,
-                            io,
-                            scope,
-                        })
-                        .await;
-                    match spawned {
-                        Ok(spawned) => {
-                            task.controls
-                                .lock()
-                                .await
-                                .insert(ready.id, spawned.control.clone());
-                            let result = run_result(spawned.wait().await);
-                            task.controls.lock().await.remove(&ready.id);
-                            self.complete_run(task, ready.id, result).await
-                        }
-                        Err(error) => {
-                            self.complete_run(
-                                task,
-                                ready.id,
-                                Err(StepFailure::Spawn {
-                                    message: error.to_string(),
-                                }),
-                            )
-                            .await
+            let spawned = {
+                // Serialize the physical start boundary with cancellation commits.
+                let mut state = task.state.lock().await;
+                let generation = self
+                    .store
+                    .lock_store()?
+                    .claim_runtime_step(step)
+                    .map_err(store_error)?;
+                let Some(generation) = generation else {
+                    return Ok(());
+                };
+                let committed = self
+                    .store
+                    .load_execution(step.execution)?
+                    .ok_or_else(|| RuntimeError::infrastructure("claimed execution disappeared"))?;
+                let latest = Execution::restore(committed.snapshot).map_err(reducer_error)?;
+                let record = latest
+                    .step(step)
+                    .ok_or_else(|| RuntimeError::infrastructure("claimed step disappeared"))?;
+                let mut spawned = None;
+                match record.state() {
+                    StepState::Running => {
+                        if !task.controls.lock().await.contains_key(&step) {
+                            let input = record.input_scope().ok_or_else(|| {
+                                RuntimeError::infrastructure("active step lacks scope")
+                            })?;
+                            let scope = self.store.load_scope(input)?.ok_or_else(|| {
+                                RuntimeError::infrastructure("committed scope disappeared")
+                            })?;
+                            match latest.action(step).ok_or_else(|| {
+                                RuntimeError::infrastructure("committed plan leaf disappeared")
+                            })? {
+                                StepAction::Builtin(command) => {
+                                    let result =
+                                        cue_runtime::realize_builtin(step, &command, &scope)
+                                            .map_err(|error| StepFailure::Builtin {
+                                                message: error.to_string(),
+                                            });
+                                    let mut candidate = latest;
+                                    let transition = candidate
+                                        .complete_builtin(step, &scope, result)
+                                        .map_err(reducer_error)?;
+                                    self.commit_transition(&mut state, candidate, &transition)?;
+                                }
+                                StepAction::Run { pipeline, io } => {
+                                    if !self
+                                        .store
+                                        .lock_store()?
+                                        .begin_run_attempt(step, generation)
+                                        .map_err(store_error)?
+                                    {
+                                        return Err(RuntimeError::new(
+                                            RuntimeErrorKind::Conflict,
+                                            "Run start is stale or already owned",
+                                        ));
+                                    }
+                                    match self
+                                        .runtime
+                                        .spawn(SpawnRequest {
+                                            step,
+                                            pipeline,
+                                            io,
+                                            scope,
+                                        })
+                                        .await
+                                    {
+                                        Ok(run) => {
+                                            task.controls
+                                                .lock()
+                                                .await
+                                                .insert(step, run.control.clone());
+                                            spawned = Some(run);
+                                        }
+                                        Err(error) => {
+                                            let mut candidate = latest;
+                                            let transition = candidate
+                                                .complete_run(
+                                                    step,
+                                                    RunCompletion::Failed(StepFailure::Spawn {
+                                                        message: error.to_string(),
+                                                    }),
+                                                )
+                                                .map_err(reducer_error)?;
+                                            self.commit_transition(
+                                                &mut state,
+                                                candidate,
+                                                &transition,
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+                    StepState::Cancelling { mode, .. } => {
+                        let control = task.controls.lock().await.get(&step).cloned();
+                        if let Some(control) = control {
+                            // A raced natural completion is still reported by its owner.
+                            let _ = control.terminate(*mode).await;
+                        } else {
+                            if self
+                                .store
+                                .lock_store()?
+                                .run_attempt_started(step)
+                                .map_err(store_error)?
+                            {
+                                return Err(RuntimeError::new(
+                                    RuntimeErrorKind::Conflict,
+                                    "cannot cancel an unowned physical Run attempt",
+                                ));
+                            }
+                            let mut candidate = latest;
+                            let transition =
+                                candidate.complete_cancelled(step).map_err(reducer_error)?;
+                            self.commit_transition(&mut state, candidate, &transition)?;
+                        }
+                    }
+                    _ => {}
                 }
+                self.store
+                    .lock_store()?
+                    .acknowledge_runtime_step(step, generation)
+                    .map_err(store_error)?;
+                spawned
+            };
+            task.changed.notify_waiters();
+            self.schedule_runtime(task.clone())?;
+            if let Some(run) = spawned {
+                let result = run_result(run.wait().await)?;
+                let mut state = task.state.lock().await;
+                let mut candidate = state.execution.clone();
+                let transition = candidate
+                    .complete_run(step, result)
+                    .map_err(reducer_error)?;
+                self.commit_transition(&mut state, candidate, &transition)?;
+                task.controls.lock().await.remove(&step);
+                drop(state);
+                task.changed.notify_waiters();
+                self.schedule_runtime(task)?;
             }
+            Ok(())
         })
-    }
-
-    async fn complete_run(
-        self: Arc<Self>,
-        task: Arc<ExecutionTask>,
-        step: StepId,
-        result: Result<(), StepFailure>,
-    ) -> Result<(), RuntimeError> {
-        let (ready, to_cancel) = {
-            let mut state = task.state.lock().await;
-            if !matches!(
-                state.execution.step(step).map(|record| record.state()),
-                Some(StepState::Running)
-            ) {
-                return Ok(());
-            }
-            let before = state.execution.snapshot();
-            let before_state = state.execution.state();
-            let transition = state
-                .execution
-                .complete_run(step, result)
-                .map_err(reducer_error)?;
-            self.commit_transition(&mut state, &before, &before_state, &transition)?;
-            (transition.ready, transition.to_cancel)
-        };
-        self.terminate_steps(&task, &to_cancel, cue_core::vnext::CancelMode::Force)
-            .await;
-        task.changed.notify_waiters();
-        for ready in ready {
-            let service = self.clone();
-            let task = task.clone();
-            tokio::spawn(async move {
-                if let Err(error) = service.realize(task, ready).await {
-                    tracing::error!(%error, "vNext execution leaf failed");
-                }
-            });
-        }
-        Ok(())
-    }
-
-    async fn complete_builtin(
-        self: Arc<Self>,
-        task: Arc<ExecutionTask>,
-        step: StepId,
-        input: Scope,
-        result: Result<BuiltinSuccess, StepFailure>,
-    ) -> Result<(), RuntimeError> {
-        let (ready, to_cancel) = {
-            let mut state = task.state.lock().await;
-            let before = state.execution.snapshot();
-            let before_state = state.execution.state();
-            let transition = state
-                .execution
-                .complete_builtin(step, &input, result)
-                .map_err(reducer_error)?;
-            self.commit_transition(&mut state, &before, &before_state, &transition)?;
-            (transition.ready, transition.to_cancel)
-        };
-        self.terminate_steps(&task, &to_cancel, cue_core::vnext::CancelMode::Force)
-            .await;
-        task.changed.notify_waiters();
-        for ready in ready {
-            let service = self.clone();
-            let task = task.clone();
-            tokio::spawn(async move {
-                if let Err(error) = service.realize(task, ready).await {
-                    tracing::error!(%error, "vNext execution leaf failed");
-                }
-            });
-        }
-        Ok(())
     }
 
     fn commit_transition(
         &self,
         state: &mut TaskState,
-        before: &ExecutionSnapshot,
-        before_state: &ExecutionState,
+        candidate: Execution,
         transition: &cue_core::vnext::ExecutionTransition,
     ) -> Result<(), RuntimeError> {
-        let timestamp = now_ms().max(state.updated_at_ms);
+        let latest_time = self
+            .store
+            .load_execution(candidate.id())?
+            .map(|stored| stored.updated_at_ms)
+            .unwrap_or(state.updated_at_ms);
+        let timestamp = now_ms().max(state.updated_at_ms).max(latest_time);
         for scope in &transition.new_scopes {
             self.runtime.scope_store().put(scope, timestamp)?;
         }
-        for ready in &transition.ready {
-            state
-                .execution
-                .mark_running(ready.id)
-                .map_err(reducer_error)?;
-        }
-        let facts = transition_facts(before, before_state, &state.execution, timestamp);
-        state.updated_at_ms = timestamp;
-        self.store.commit(
-            &projection(&state.execution, state.created_at_ms, state.updated_at_ms),
+        let facts = transition_facts(
+            &state.execution.snapshot(),
+            &state.execution.state(),
+            &candidate,
+            timestamp,
+        );
+        let committed = self.store.commit(
+            &projection(&candidate, state.created_at_ms, timestamp),
             &facts,
         )?;
+        state.execution = candidate;
+        state.updated_at_ms = timestamp;
+        self.store.publish(&committed);
         Ok(())
     }
 
-    async fn terminate_steps(
-        &self,
-        task: &ExecutionTask,
-        steps: &[StepId],
-        mode: cue_core::vnext::CancelMode,
-    ) {
-        let controls = task.controls.lock().await;
-        for step in steps {
-            if let Some(control) = controls.get(step) {
-                let _ = control.terminate(mode).await;
-            }
-        }
-    }
-
     async fn wait_execution(&self, id: ExecutionId) -> Result<ExecutionProjection, RuntimeError> {
+        let mut changes = self.store.events.subscribe();
         loop {
             let Some(execution) = self.store.load_execution(id)? else {
                 return Err(RuntimeError::new(
@@ -956,13 +737,14 @@ impl VnextService {
             if execution.state.is_terminal() {
                 return Ok(execution);
             }
-            let task = self.tasks.lock().await.get(&id).cloned().ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorKind::Conflict,
-                    format!("execution {id} has no active runtime task"),
-                )
-            })?;
-            task.changed.notified().await;
+            match changes.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(RuntimeError::infrastructure(
+                        "execution event stream closed",
+                    ));
+                }
+            }
         }
     }
 }
@@ -1099,6 +881,25 @@ impl VnextConnection {
                             execution: Box::new(view(&execution)),
                         }))
                     }
+                    Query::TailOutput {
+                        step,
+                        stream,
+                        max_bytes,
+                    } => {
+                        let maximum = usize::try_from(max_bytes)
+                            .unwrap_or(OUTPUT_READ_LIMIT)
+                            .min(OUTPUT_READ_LIMIT);
+                        let slice = self.service.output.tail(step, stream, maximum)?;
+                        Ok(ResponsePayload::Ok(ResultPayload::Output {
+                            chunks: vec![OutputChunk {
+                                step,
+                                stream,
+                                offset: slice.offset,
+                                data: slice.data,
+                                eof: true,
+                            }],
+                        }))
+                    }
                     Query::ReadOutput {
                         step,
                         stdout,
@@ -1131,7 +932,7 @@ impl VnextConnection {
         match &command {
             Command::PutScope { scope } => {
                 let hash = scope.compute_hash();
-                let durable = Store::scope_persistence(scope) == ScopePersistence::Persisted;
+                let durable = true;
                 let response = ResponsePayload::Ok(ResultPayload::ScopeStored { hash, durable });
                 let (outcome, _) = self.service.store.commit_scope_operation(
                     &client,
@@ -1142,7 +943,7 @@ impl VnextConnection {
                     now_ms(),
                 )?;
                 match outcome {
-                    OperationOutcome::Inserted => Ok(response),
+                    OperationOutcome::Inserted(_) => Ok(response),
                     OperationOutcome::Replay(response) => Ok(response),
                     OperationOutcome::Conflict => Err(operation_conflict()),
                     OperationOutcome::Expired => Err(operation_expired()),
@@ -1172,16 +973,14 @@ impl VnextConnection {
                     execution: Box::new(view(&execution)),
                     latest_event,
                 });
-                let response =
-                    self.record_plain(&client, &operation, &command, &response, false)?;
+                let response = self.record_plain(&client, &operation, &command, &response)?;
                 self.pending_facts.extend(replay);
                 self.watched.insert(*id, latest_event);
                 Ok(response)
             }
             Command::UnwatchExecution { id } => {
                 let response = ResponsePayload::ack();
-                let response =
-                    self.record_plain(&client, &operation, &command, &response, false)?;
+                let response = self.record_plain(&client, &operation, &command, &response)?;
                 self.watched.remove(id);
                 Ok(response)
             }
@@ -1195,23 +994,23 @@ impl VnextConnection {
                 attachments.remove(attachment);
                 drop(attachments);
                 let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
             Command::ClaimPtyControl { attachment } => {
                 self.set_control(&client, *attachment, true).await?;
                 let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
             Command::ReleasePtyControl { attachment } => {
                 self.set_control(&client, *attachment, false).await?;
                 let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
             Command::PtyInput { attachment, data } => {
                 let control = self.pty_control(&client, *attachment).await?;
                 control.input(data.clone()).await?;
                 let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
             Command::PtyResize {
                 attachment,
@@ -1221,18 +1020,18 @@ impl VnextConnection {
                 let control = self.pty_control(&client, *attachment).await?;
                 control.resize(TerminalSize::new(*cols, *rows)?).await?;
                 let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
             Command::Restart => {
                 let response = ResponsePayload::Ok(ResultPayload::RestartAccepted {
                     restart_id: uuid::Uuid::new_v4().to_string(),
                     target_instance_id: uuid::Uuid::new_v4().to_string(),
                 });
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
             Command::Shutdown => {
                 let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response, false)
+                self.record_plain(&client, &operation, &command, &response)
             }
         }
     }
@@ -1282,23 +1081,16 @@ impl VnextConnection {
         operation: &OperationId,
         command: &Command,
         response: &ResponsePayload,
-        volatile: bool,
     ) -> Result<ResponsePayload, RuntimeError> {
-        let outcome = if volatile {
-            self.service
-                .store
-                .record_volatile_operation(client, operation, command, response)?
-        } else {
-            self.service.store.record_durable_operation(
-                client,
-                operation,
-                command,
-                response,
-                now_ms(),
-            )?
-        };
+        let outcome = self.service.store.record_durable_operation(
+            client,
+            operation,
+            command,
+            response,
+            now_ms(),
+        )?;
         match outcome {
-            OperationOutcome::Inserted => Ok(response.clone()),
+            OperationOutcome::Inserted(_) => Ok(response.clone()),
             OperationOutcome::Replay(response) => Ok(response),
             OperationOutcome::Conflict => Err(operation_conflict()),
             OperationOutcome::Expired => Err(operation_expired()),
@@ -1351,16 +1143,24 @@ impl VnextConnection {
                     format!("execution {id} has no active task"),
                 )
             })?;
-        let (response, to_cancel) = {
+        let response = {
             let mut state = task.state.lock().await;
-            let previous = state.execution.clone();
-            let before = state.execution.snapshot();
-            let before_state = state.execution.state();
-            let transition = state.execution.cancel(mode);
-            let timestamp = now_ms().max(state.updated_at_ms);
-            let facts = transition_facts(&before, &before_state, &state.execution, timestamp);
-            state.updated_at_ms = timestamp;
-            let projection = projection(&state.execution, state.created_at_ms, state.updated_at_ms);
+            let mut candidate = state.execution.clone();
+            candidate.cancel(mode);
+            let latest_time = self
+                .service
+                .store
+                .load_execution(id)?
+                .map(|stored| stored.updated_at_ms)
+                .unwrap_or(state.updated_at_ms);
+            let timestamp = now_ms().max(state.updated_at_ms).max(latest_time);
+            let facts = transition_facts(
+                &state.execution.snapshot(),
+                &state.execution.state(),
+                &candidate,
+                timestamp,
+            );
+            let projection = projection(&candidate, state.created_at_ms, timestamp);
             let response = ResponsePayload::Ok(ResultPayload::Execution {
                 execution: Box::new(view(&projection)),
             });
@@ -1372,23 +1172,19 @@ impl VnextConnection {
                 &facts,
                 &response,
             )? {
-                OperationOutcome::Inserted => (response, transition.to_cancel),
-                OperationOutcome::Replay(response) => {
-                    state.execution = previous;
-                    return Ok(response);
+                OperationOutcome::Inserted(committed) => {
+                    state.execution = candidate;
+                    state.updated_at_ms = timestamp;
+                    self.service.store.publish(&committed);
+                    response
                 }
-                OperationOutcome::Conflict => {
-                    state.execution = previous;
-                    return Err(operation_conflict());
-                }
-                OperationOutcome::Expired => {
-                    state.execution = previous;
-                    return Err(operation_expired());
-                }
+                OperationOutcome::Replay(response) => return Ok(response),
+                OperationOutcome::Conflict => return Err(operation_conflict()),
+                OperationOutcome::Expired => return Err(operation_expired()),
             }
         };
-        self.service.terminate_steps(&task, &to_cancel, mode).await;
         task.changed.notify_waiters();
+        self.service.schedule_runtime(task)?;
         Ok(response)
     }
 
@@ -1430,7 +1226,7 @@ impl VnextConnection {
             snapshot_truncated: snapshot.truncated,
             next_offset: snapshot.next_offset,
         });
-        match self.record_plain(client, operation, command, &response, false)? {
+        match self.record_plain(client, operation, command, &response)? {
             replay if replay != response => Ok(replay),
             _ => {
                 self.service.attachments.lock().await.insert(
@@ -1730,46 +1526,20 @@ fn view(execution: &ExecutionProjection) -> ExecutionView {
     }
 }
 
-fn realize_builtin(command: &BuiltinCommand, scope: &Scope) -> Result<BuiltinSuccess, StepFailure> {
-    match command {
-        BuiltinCommand::Cd(path) => {
-            let requested = path.as_path();
-            let target = if requested.is_absolute() {
-                requested.to_path_buf()
-            } else {
-                scope.cwd().as_path().join(requested)
-            };
-            let canonical = target
-                .canonicalize()
-                .map_err(|error| StepFailure::Builtin {
-                    message: format!("cannot cd to {}: {error}", target.display()),
-                })?;
-            if !canonical.is_dir() {
-                return Err(StepFailure::Builtin {
-                    message: format!("cd target is not a directory: {}", canonical.display()),
-                });
-            }
-            let cwd = AbsolutePath::new(canonical).map_err(|error| StepFailure::Builtin {
-                message: error.to_string(),
-            })?;
-            Ok(BuiltinSuccess::Cd { cwd })
+fn run_result(exit: RunExit) -> Result<RunCompletion, RuntimeError> {
+    Ok(match exit {
+        RunExit::Success => RunCompletion::Succeeded,
+        RunExit::ExitCode(code) => RunCompletion::Failed(StepFailure::Exit { code }),
+        RunExit::Signalled { signal } => RunCompletion::Failed(StepFailure::Signal { signal }),
+        RunExit::Cancelled => RunCompletion::Cancelled,
+        RunExit::SpawnFailed(message) => RunCompletion::Failed(StepFailure::Spawn { message }),
+        RunExit::InfrastructureFailure(message) => {
+            RunCompletion::Failed(StepFailure::Infrastructure { message })
         }
-        BuiltinCommand::Env(_) => Ok(BuiltinSuccess::Env),
-        BuiltinCommand::Umask(_) => Ok(BuiltinSuccess::Umask),
-    }
-}
-
-fn run_result(exit: RunExit) -> Result<(), StepFailure> {
-    match exit {
-        RunExit::Success => Ok(()),
-        RunExit::ExitCode(code) => Err(StepFailure::Exit { code }),
-        RunExit::Signalled { signal } => Err(StepFailure::Signal { signal }),
-        RunExit::Cancelled => Err(StepFailure::Infrastructure {
-            message: "runner reported cancellation before reducer cancellation".into(),
-        }),
-        RunExit::SpawnFailed(message) => Err(StepFailure::Spawn { message }),
-        RunExit::InfrastructureFailure(message) => Err(StepFailure::Infrastructure { message }),
-    }
+        RunExit::OwnershipLost(message) => {
+            return Err(RuntimeError::new(RuntimeErrorKind::Conflict, message));
+        }
+    })
 }
 
 fn require_attachment_owner<'a>(
@@ -1822,7 +1592,12 @@ fn reducer_error(error: impl std::fmt::Display) -> RuntimeError {
 }
 
 fn store_error(error: StoreError) -> RuntimeError {
-    RuntimeError::new(RuntimeErrorKind::Infrastructure, error.to_string())
+    let kind = if matches!(error, StoreError::SensitiveEnvironmentUnsupported) {
+        RuntimeErrorKind::Unsupported
+    } else {
+        RuntimeErrorKind::Infrastructure
+    };
+    RuntimeError::new(kind, error.to_string())
 }
 
 fn lock_error(name: &str) -> RuntimeError {
@@ -1953,6 +1728,203 @@ mod tests {
             panic!("unexpected submission response: {message:?}");
         };
         execution.snapshot.id
+    }
+
+    async fn committed_running_task(
+        service: &Arc<VnextService>,
+        plan: ExecutionPlan,
+    ) -> Arc<ExecutionTask> {
+        let input = scope(false);
+        service
+            .store
+            .lock_store()
+            .unwrap()
+            .put_scope(&input, 1)
+            .unwrap();
+        let mut execution = Execution::new(
+            ExecutionId(1),
+            ExecutionSpec::new(input.compute_hash(), plan).unwrap(),
+        );
+        let before = execution.snapshot();
+        execution.advance().unwrap();
+        let mut facts = vec![FactDraft {
+            occurred_at_ms: 1,
+            fact: Fact::ExecutionCreated {
+                id: execution.id(),
+                scope: input.compute_hash(),
+            },
+        }];
+        facts.extend(transition_facts(
+            &before,
+            &ExecutionState::Pending,
+            &execution,
+            1,
+        ));
+        service
+            .store
+            .commit(&projection(&execution, 1, 1), &facts)
+            .unwrap();
+        let task = Arc::new(ExecutionTask {
+            id: execution.id(),
+            state: tokio::sync::Mutex::new(TaskState {
+                execution,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }),
+            controls: tokio::sync::Mutex::new(BTreeMap::new()),
+            changed: tokio::sync::Notify::new(),
+        });
+        service.tasks.lock().await.insert(task.id, task.clone());
+        task
+    }
+
+    #[tokio::test]
+    async fn stale_running_delivery_obeys_latest_cancel_for_runs_and_builtins() {
+        let plans = [
+            spec(scope(false).compute_hash(), "/bin/echo", &["must-not-run"])
+                .plan()
+                .clone(),
+            ExecutionPlan::builtin(BuiltinCommand::Umask(FileModeMask::new(0o077).unwrap())),
+        ];
+        for plan in plans {
+            let service = VnextService::in_memory().unwrap();
+            let task = committed_running_task(&service, plan).await;
+            let step = StepId {
+                execution: task.id,
+                index: 1,
+            };
+            {
+                let mut state = task.state.lock().await;
+                let mut next = state.execution.clone();
+                let transition = next.cancel(cue_core::vnext::CancelMode::Force);
+                service
+                    .commit_transition(&mut state, next, &transition)
+                    .unwrap();
+            }
+            service.clone().realize(task.clone(), step).await.unwrap();
+            assert_eq!(
+                task.state.lock().await.execution.state(),
+                ExecutionState::Cancelled
+            );
+            assert!(
+                !service
+                    .store
+                    .lock_store()
+                    .unwrap()
+                    .run_attempt_started(step)
+                    .unwrap()
+            );
+            assert!(
+                service
+                    .output
+                    .read(step, OutputStream::Stdout, 0, 1024)
+                    .unwrap()
+                    .data
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_delivery_starts_one_physical_attempt() {
+        let service = VnextService::in_memory().unwrap();
+        let plan = spec(scope(false).compute_hash(), "/usr/bin/printf", &["once"])
+            .plan()
+            .clone();
+        let task = committed_running_task(&service, plan).await;
+        let step = StepId {
+            execution: task.id,
+            index: 1,
+        };
+        let (first, duplicate) = tokio::join!(
+            service.clone().realize(task.clone(), step),
+            service.clone().realize(task.clone(), step)
+        );
+        first.unwrap();
+        duplicate.unwrap();
+        service.clone().realize(task.clone(), step).await.unwrap();
+        assert_eq!(
+            task.state.lock().await.execution.state(),
+            ExecutionState::Succeeded
+        );
+        assert_eq!(
+            service
+                .output
+                .read(step, OutputStream::Stdout, 0, 1024)
+                .unwrap()
+                .data,
+            b"once"
+        );
+        assert!(
+            service
+                .store
+                .lock_store()
+                .unwrap()
+                .pending_runtime_steps()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_commit_keeps_live_state_and_restart_fails_closed_for_unknown_attempt() {
+        let uri = format!(
+            "file:cue-fp-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let store = Store::from_connection(rusqlite::Connection::open(&uri).unwrap()).unwrap();
+        let injection = rusqlite::Connection::open(&uri).unwrap();
+        let service = VnextService::from_store(store).unwrap();
+        let task = committed_running_task(
+            &service,
+            spec(scope(false).compute_hash(), "/bin/echo", &["must-not-run"])
+                .plan()
+                .clone(),
+        )
+        .await;
+        let mut events = service.subscribe_facts();
+        injection.execute_batch("CREATE TRIGGER reject_fact BEFORE INSERT ON facts BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        {
+            let mut state = task.state.lock().await;
+            let before = state.execution.clone();
+            let mut next = before.clone();
+            let transition = next.cancel(cue_core::vnext::CancelMode::Force);
+            assert!(
+                service
+                    .commit_transition(&mut state, next, &transition)
+                    .is_err()
+            );
+            assert_eq!(state.execution, before);
+            assert_eq!(
+                service
+                    .store
+                    .load_execution(task.id)
+                    .unwrap()
+                    .unwrap()
+                    .snapshot,
+                before.snapshot()
+            );
+        }
+        assert!(events.try_recv().is_err());
+        injection
+            .execute_batch("DROP TRIGGER reject_fact;")
+            .unwrap();
+        let step = StepId {
+            execution: task.id,
+            index: 1,
+        };
+        {
+            let store = service.store.lock_store().unwrap();
+            let generation = store.claim_runtime_step(step).unwrap().unwrap();
+            assert!(store.begin_run_attempt(step, generation).unwrap());
+        }
+        assert!(service.recover().await.is_err());
+        assert_eq!(
+            task.state.lock().await.execution.state(),
+            ExecutionState::Running
+        );
+        assert!(events.try_recv().is_err());
+        assert!(run_result(RunExit::OwnershipLost("lost supervisor".into())).is_err());
     }
 
     #[tokio::test]
@@ -2094,23 +2066,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sensitive_scope_and_execution_remain_available_but_volatile() {
+    async fn sensitive_scope_is_explicitly_rejected_without_storing_values() {
+        use cue_core::vnext::Sensitivity;
         let service = VnextService::in_memory().unwrap();
         let mut connection = service.connection();
         hello(&mut connection).await;
-        let (scope, durable) = put_scope(&mut connection, scope(true)).await;
-        assert!(!durable);
-        let submitted = submit(
-            &mut connection,
-            3,
-            "submit:volatile",
-            spec(scope, "/usr/bin/true", &[]),
-        )
-        .await;
-        let id = submitted_id(&submitted);
-        let projection = service.wait_execution(id).await.unwrap();
-        assert_eq!(projection.state, ExecutionState::Succeeded);
-        assert!(service.store.execution_is_volatile(id).unwrap());
+        let initial = scope(false);
+        let mut env = initial.env().clone();
+        env.insert(
+            EnvKey::new("PLAIN_NAME").unwrap(),
+            EnvValue::classified("classified", Sensitivity::Sensitive).unwrap(),
+        );
+        let scope = Scope::new(initial.cwd().clone(), env, initial.umask());
+        let hash = scope.compute_hash();
+        let response = connection
+            .handle(Message::Command {
+                request_id: RequestId::new(2).unwrap(),
+                operation_id: OperationId::new("unsupported-sensitive").unwrap(),
+                command: Command::PutScope {
+                    scope: Box::new(scope),
+                },
+            })
+            .await;
+        assert!(
+            matches!(response, Message::Response { payload: ResponsePayload::Error(error), .. } if error.code == ProtocolErrorCode::NotSupported)
+        );
+        assert!(service.store.load_scope(hash).unwrap().is_none());
     }
 
     #[tokio::test]

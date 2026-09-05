@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -35,10 +35,19 @@ pub enum SurfaceOutcome {
     Frontend(VnextFrontendAction),
 }
 
+/// An immutable logical command identity, retained across connection replacement.
+#[derive(Debug, Clone)]
+pub struct PreparedCommand {
+    client_id: ClientId,
+    operation_id: OperationId,
+    command: Command,
+}
+
 /// Sequential IPC v4 connection. Convert it into a multiplexed client before
 /// sharing it between an interactive frontend's request and event loops.
 pub struct VnextClient {
     stream: BoxedStream,
+    reconnect_socket: Option<PathBuf>,
     client_id: ClientId,
     operation_prefix: String,
     next_request: u64,
@@ -53,7 +62,9 @@ impl VnextClient {
             .await
             .with_context(|| format!("connect to {}", socket.display()))?;
         let client_id = generated_client_id()?;
-        Self::connect_stream(stream, client_id).await
+        let mut client = Self::connect_stream(stream, client_id).await?;
+        client.reconnect_socket = Some(socket.to_path_buf());
+        Ok(client)
     }
 
     pub async fn connect_stream<S>(stream: S, client_id: ClientId) -> Result<Self>
@@ -63,6 +74,7 @@ impl VnextClient {
         let operation_prefix = format!("{}:{}", client_id.as_str(), uuid::Uuid::new_v4());
         let mut client = Self {
             stream: Box::new(stream),
+            reconnect_socket: None,
             client_id,
             operation_prefix,
             next_request: 1,
@@ -117,13 +129,49 @@ impl VnextClient {
         self.wait_response(request_id).await
     }
 
+    pub fn prepare_command(&mut self, command: Command) -> Result<PreparedCommand> {
+        Ok(PreparedCommand {
+            client_id: self.client_id.clone(),
+            operation_id: self.allocate_operation_id()?,
+            command,
+        })
+    }
+
     pub async fn command(&mut self, command: Command) -> Result<ResultPayload> {
+        let prepared = self.prepare_command(command)?;
+        self.execute_prepared(&prepared).await
+    }
+
+    /// Retry one transport failure with the same logical identity. Explicit
+    /// stream callers can retain this value and execute it after reconnecting.
+    pub async fn execute_prepared(&mut self, prepared: &PreparedCommand) -> Result<ResultPayload> {
+        if prepared.client_id != self.client_id {
+            bail!("logical command belongs to another client identity");
+        }
+        let response = self.send_prepared(prepared).await;
+        if response
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<std::io::Error>().is_some())
+            && let Some(socket) = self.reconnect_socket.clone()
+        {
+            let stream = UnixStream::connect(&socket)
+                .await
+                .context("reconnect IPC v4 socket")?;
+            self.stream = Box::new(stream);
+            self.pending_events.clear();
+            self.hello().await?;
+            return self.send_prepared(prepared).await;
+        }
+        response
+    }
+
+    async fn send_prepared(&mut self, prepared: &PreparedCommand) -> Result<ResultPayload> {
         let request_id = self.allocate_request_id();
-        let operation_id = self.allocate_operation_id()?;
         self.send(&Message::Command {
             request_id,
-            operation_id,
-            command,
+            operation_id: prepared.operation_id.clone(),
+            command: prepared.command.clone(),
         })
         .await?;
         self.wait_response(request_id).await
@@ -169,13 +217,16 @@ impl VnextClient {
         source: &str,
         mode: Mode,
     ) -> Result<SurfaceOutcome> {
-        let (hash, _) = self.put_scope(scope).await?;
+        let hash = scope.compute_hash();
         let command =
             compile_vnext_command(source, mode, hash).context("compile Cue command for IPC v4")?;
         let result = match command {
-            VnextCommand::Submit(spec) => ResultPayload::ExecutionSubmitted {
-                execution: Box::new(self.submit(spec).await?),
-            },
+            VnextCommand::Submit(spec) => {
+                self.put_scope(scope).await?;
+                ResultPayload::ExecutionSubmitted {
+                    execution: Box::new(self.submit(spec).await?),
+                }
+            }
             VnextCommand::ListExecutions => {
                 self.query(Query::ListExecutions {
                     before: None,
@@ -191,7 +242,20 @@ impl VnextClient {
                 tail_bytes,
             } => {
                 let step = resolve_output_step(self, target).await?;
-                let maximum = tail_bytes.unwrap_or(1024 * 1024).min(u32::MAX as usize) as u32;
+                if let Some(maximum) = tail_bytes {
+                    let result = self
+                        .query(Query::TailOutput {
+                            step,
+                            stream: match stream {
+                                cue_language::OutputSelection::Stdout => OutputStream::Stdout,
+                                cue_language::OutputSelection::Stderr => OutputStream::Stderr,
+                            },
+                            max_bytes: maximum.min(u32::MAX as usize) as u32,
+                        })
+                        .await?;
+                    return Ok(SurfaceOutcome::Response(result));
+                }
+                let maximum = 1024 * 1024;
                 let range = OutputRange {
                     offset: 0,
                     max_bytes: maximum,
@@ -316,6 +380,7 @@ impl VnextClient {
 
 /// Concurrent v4 client for TUI and other event-driven frontends.
 pub struct VnextMultiplexedClient {
+    client_id: ClientId,
     writer: Arc<Mutex<io::WriteHalf<BoxedStream>>>,
     operation_prefix: String,
     next_request: AtomicU64,
@@ -329,6 +394,7 @@ pub struct VnextMultiplexedClient {
 impl VnextMultiplexedClient {
     fn new(client: VnextClient) -> Self {
         let VnextClient {
+            client_id,
             stream,
             operation_prefix,
             next_request,
@@ -345,6 +411,7 @@ impl VnextMultiplexedClient {
         }
         let reader_task = tokio::spawn(run_reader(reader, pending.clone(), event_tx));
         Self {
+            client_id,
             writer: Arc::new(Mutex::new(writer)),
             operation_prefix,
             next_request: AtomicU64::new(next_request),
@@ -366,17 +433,32 @@ impl VnextMultiplexedClient {
             .await
     }
 
-    pub async fn command(&self, command: Command) -> Result<ResultPayload> {
-        let request_id = atomic_id(&self.next_request);
+    pub fn prepare_command(&self, command: Command) -> Result<PreparedCommand> {
         let operation = atomic_counter(&self.next_operation);
         let operation_id = OperationId::new(format!("{}:{operation}", self.operation_prefix))
             .context("construct operation identity")?;
+        Ok(PreparedCommand {
+            client_id: self.client_id.clone(),
+            operation_id,
+            command,
+        })
+    }
+
+    pub async fn command(&self, command: Command) -> Result<ResultPayload> {
+        self.execute_prepared(&self.prepare_command(command)?).await
+    }
+
+    pub async fn execute_prepared(&self, prepared: &PreparedCommand) -> Result<ResultPayload> {
+        if prepared.client_id != self.client_id {
+            bail!("logical command belongs to another client identity");
+        }
+        let request_id = atomic_id(&self.next_request);
         self.call(
             request_id,
             Message::Command {
                 request_id,
-                operation_id,
-                command,
+                operation_id: prepared.operation_id.clone(),
+                command: prepared.command.clone(),
             },
         )
         .await
@@ -637,6 +719,102 @@ mod tests {
 
     fn client_id() -> ClientId {
         ClientId::new("client-test").unwrap()
+    }
+
+    #[tokio::test]
+    async fn surface_queries_do_not_store_scope_and_tail_reads_the_suffix() {
+        let service = VnextService::in_memory().unwrap();
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(serve_stream(service, server_stream));
+        let mut client = VnextClient::connect_stream(client_stream, client_id())
+            .await
+            .unwrap();
+        client
+            .execute_surface(scope(), ":log", Mode::Job)
+            .await
+            .unwrap();
+        assert!(
+            client
+                .query(Query::GetScope {
+                    hash: scope().compute_hash()
+                })
+                .await
+                .is_err()
+        );
+        let execution = client
+            .submit_file(scope(), "/usr/bin/printf abcdefghij")
+            .await
+            .unwrap();
+        wait_execution(&mut client, execution.snapshot.id)
+            .await
+            .unwrap();
+        let outcome = client
+            .execute_surface(
+                scope(),
+                &format!(":tail {} 4", execution.snapshot.id),
+                Mode::Job,
+            )
+            .await
+            .unwrap();
+        let SurfaceOutcome::Response(ResultPayload::Output { chunks }) = outcome else {
+            panic!("unexpected tail result")
+        };
+        assert_eq!(chunks[0].offset, 6);
+        assert_eq!(output_bytes(&chunks, OutputStream::Stdout), b"ghij");
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_lost_submit_response_reuses_the_logical_operation() {
+        let socket = std::env::temp_dir().join(format!("cue-client-{}.sock", uuid::Uuid::new_v4()));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let service = VnextService::in_memory().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut connection = service.connection();
+            loop {
+                let message = read_message(&mut stream).await.unwrap();
+                let submitted = matches!(
+                    &message,
+                    Message::Command {
+                        command: Command::SubmitExecution { .. },
+                        ..
+                    }
+                );
+                let response = connection.handle(message).await;
+                if submitted {
+                    break;
+                }
+                stream
+                    .write_all(&encode_message(&response).unwrap())
+                    .await
+                    .unwrap();
+            }
+            drop(stream); // Submission committed, response lost in transport.
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_stream(service, stream).await.unwrap();
+        });
+        let mut client = VnextClient::connect(&socket).await.unwrap();
+        let execution = client.submit_file(scope(), "/usr/bin/true").await.unwrap();
+        wait_execution(&mut client, execution.snapshot.id)
+            .await
+            .unwrap();
+        let ResultPayload::Executions { executions, .. } = client
+            .query(Query::ListExecutions {
+                before: None,
+                limit: 10,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected list response")
+        };
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].snapshot.id, execution.snapshot.id);
+        drop(client);
+        server.await.unwrap();
+        std::fs::remove_file(socket).unwrap();
     }
 
     #[tokio::test]
