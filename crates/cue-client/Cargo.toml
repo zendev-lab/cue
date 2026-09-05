@@ -15,6 +15,7 @@ path = "src/bin/cue-client.rs"
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+crossterm.workspace = true
 cue-core = { path = "../cue-core" }
 cue-language = { path = "../cue-language" }
 cue-protocol = { path = "../cue-protocol" }

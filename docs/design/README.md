@@ -20,6 +20,8 @@ until their corresponding migration lands.
   commands, event replay, volatile secrets, and PTY attachment ownership.
 - [vNext client](vnext-client.md): explicit frontend Scope snapshots, operation
   identities, typed dispatch, and concurrent response/event routing.
+- [vNext frontends](vnext-frontends.md): CLI command surface, PTY passthrough,
+  execution TUI, and the removal of kernel-owned policy screens.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.
