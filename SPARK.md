@@ -131,6 +131,9 @@ process 的可观察性。
 
 ## 修订记录
 
+- 2026-08-30：固化 vNext 纯 reducer；每个 Builtin/Run Step 持久记录输入/输出
+  ScopeHash，Sequence 传递、Parallel fork/no-merge、Skipped/Cancelled 和重启中断语义
+  均由 Core 决定。
 - 2026-08-30：启动 vNext 大重构；确定 closed Execution ADT、显式 Scope、per-Run
   PTY、bootstrap Composition，并把 session/schedule/resource/retry policy 移出内核。
 - 2026-08-21：硬切 IPC v3，统一 Execution/Step，拆出 cue-language 和
