@@ -20,21 +20,15 @@ repository = "https://github.com/zendev-lab/cue"
 license = "MIT"
 
 [workspace.dependencies]
-# Color
-ansi-to-tui = "8"
 # Error handling
 anyhow = "1"
 base64 = "0.23"
 # Hashing
 blake3 = "1"
-# CLI
-bpaf = { version = "0.9", features = ["dull-color"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "events"] }
 # Snapshot tests
 insta = { version = "1", features = ["json"] }
 libc = "0.2"
-owo-colors = "4"
 # TUI
 ratatui = "0.30"
 # Storage
@@ -59,7 +53,6 @@ toml = "1.1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tui-term = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
 [profile.dev]

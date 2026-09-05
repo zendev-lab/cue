@@ -1,4 +1,4 @@
-use cue_core::vnext::{
+use cue_core::{
     CancelMode, ExecutionSnapshot, ExecutionSpec, ExecutionState, FactEvent, OutputStream, Scope,
 };
 use cue_core::{ExecutionId, ScopeHash, StepId};
@@ -329,7 +329,7 @@ mod base64_bytes {
 mod tests {
     use std::collections::BTreeMap;
 
-    use cue_core::vnext::{
+    use cue_core::{
         AbsolutePath, Argv, Execution, ExecutionPlan, Fact, FileModeMask, IoMode, Pipeline, Process,
     };
 
@@ -464,7 +464,7 @@ mod tests {
     }
     #[test]
     fn sensitivity_roundtrips_through_strict_scope_commands() {
-        use cue_core::vnext::{EnvKey, EnvValue, Sensitivity};
+        use cue_core::{EnvKey, EnvValue, Sensitivity};
         for classification in [Sensitivity::Normal, Sensitivity::Sensitive] {
             let scope = Scope::new(
                 scope().cwd().clone(),

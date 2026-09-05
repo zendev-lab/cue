@@ -1,45 +1,32 @@
-//! Shared client connection stack for Cue frontends.
+//! IPC v4 client and executable frontend support.
 
 pub mod cli;
-mod client;
-mod config_paths;
-pub mod daemon_lifecycle;
-mod host_discovery;
-mod reconnect;
-mod restart;
+pub mod execution;
 pub mod script_runner;
-mod ssh_config;
-mod ssh_transport;
-mod transport_config;
-mod transport_discovery;
-mod transport_schema;
-mod transport_settings;
-pub mod version_check;
-pub mod vnext;
 
-pub use client::{
-    ClientReader, CuedClient, MultiplexedClient, WriterHandle, WriterSendError, default_socket_path,
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+pub use execution::{
+    ExecutionClient, MultiplexedClient, PreparedCommand, SurfaceOutcome, process_scope,
 };
-pub use config_paths::{
-    ClientConfigPaths, ClientConfigSource, ClientConfigSources, client_config_paths,
-    optional_client_config_paths, read_client_config_sources,
-};
-pub use host_discovery::{HostDiscoveryConfig, detected_configured_hosts};
-pub use reconnect::{
-    ClientConnector, ConnectionControlError, ConnectionController, ConnectionEvent,
-    spawn_connection_manager_controllable,
-};
-pub use restart::RestartHandle;
-pub use ssh_transport::{connect_ssh_transport, transport_connector};
-pub use transport_config::{
-    ResolvedTransport, SshProfile, TransportConfig, TransportProfile, UnixProfile,
-    load_transport_config, load_transport_config_from_sources, parse_transport_config,
-};
-pub use transport_schema::validate_client_config_root_sections;
-pub use transport_settings::{
-    TransportProfileKind, TransportProfileSource, TransportProfileSummary,
-    TransportSettingsSnapshot, load_transport_settings_snapshot,
-    load_transport_settings_snapshot_from_sources, parse_transport_snapshot,
-    save_default_transport_profile,
-};
-pub use vnext::{SurfaceOutcome, VnextClient, VnextMultiplexedClient, process_scope};
+
+/// Resolve `$XDG_RUNTIME_DIR/cue/cued.sock`, falling back to the process temp
+/// directory when no runtime directory is configured.
+pub fn default_socket_path() -> PathBuf {
+    let root = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from(std::env::temp_dir()));
+    PathBuf::from(root).join("cue/cued.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_socket_has_v4_daemon_name() {
+        assert_eq!(
+            crate::default_socket_path().file_name().unwrap(),
+            "cued.sock"
+        );
+    }
+}

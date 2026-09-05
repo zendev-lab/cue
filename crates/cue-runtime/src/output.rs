@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
+use cue_core::OutputStream;
 use cue_core::StepId;
-use cue_core::vnext::OutputStream;
 
 use crate::{OutputAppend, OutputSlice, OutputStore, RuntimeError, RuntimeErrorKind};
 

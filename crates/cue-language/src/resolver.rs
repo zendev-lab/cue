@@ -7,11 +7,10 @@
 //! 4. Produce validated, language-owned execution syntax
 
 use crate::Mode;
-use cue_core::command::{ModeParams, ParamValue};
-use cue_core::cron::{
+use crate::schedule::{
     CronPreset, CronSchedule, CrontabSchedule, parse_day_filter, parse_time_of_day,
 };
-use cue_core::pipeline::PipeOp;
+use crate::surface::{ModeParams, ParamValue, PipeOp};
 
 use super::ast::{
     Argument, Ast, ChainNode, CronScheduleAst, JobExpr, ParallelOp, Pipeline, ScriptItemAst,
@@ -709,7 +708,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::command_spec::{COMMAND_SPECS, CommandArgKind};
-    use cue_core::cron::{DayFilter, Weekday};
+    use crate::schedule::{DayFilter, Weekday};
 
     use super::super::parse::Parser as CueParser;
     use super::*;

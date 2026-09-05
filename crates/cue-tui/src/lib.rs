@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use cue_client::{SurfaceOutcome, VnextClient, VnextMultiplexedClient, process_scope};
-use cue_core::vnext::Fact;
-use cue_language::{Mode, VnextCommand, VnextFrontendAction, compile_vnext_command};
+use cue_client::{ExecutionClient, MultiplexedClient, SurfaceOutcome, process_scope};
+use cue_core::Fact;
+use cue_language::{FrontendAction, Mode, SurfaceCommand, compile_command};
 use cue_protocol::{Command, EventPayload, ExecutionView, Query, ResultPayload};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,7 +22,7 @@ pub fn run_cli() -> Result<()> {
 
 pub async fn run(socket: PathBuf) -> Result<()> {
     let client = Arc::new(
-        VnextClient::connect(&socket)
+        ExecutionClient::connect(&socket)
             .await
             .with_context(|| format!("connect to {}", socket.display()))?
             .into_multiplexed(),
@@ -91,7 +91,7 @@ struct State {
 
 fn handle_event(
     event: Event,
-    client: &Arc<VnextMultiplexedClient>,
+    client: &Arc<MultiplexedClient>,
     state: &mut State,
     pending: &mut tokio::task::JoinSet<Result<ResultPayload>>,
 ) -> Result<bool> {
@@ -123,13 +123,13 @@ fn handle_event(
 }
 
 fn dispatch(
-    client: &Arc<VnextMultiplexedClient>,
+    client: &Arc<MultiplexedClient>,
     state: &mut State,
     source: &str,
     pending: &mut tokio::task::JoinSet<Result<ResultPayload>>,
 ) -> Result<bool> {
     let scope = process_scope()?;
-    let command = match compile_vnext_command(source, Mode::Job, scope.compute_hash()) {
+    let command = match compile_command(source, Mode::Job, scope.compute_hash()) {
         Ok(command) => command,
         Err(error) => {
             state.log.push(error.to_string());
@@ -137,12 +137,12 @@ fn dispatch(
         }
     };
     match command {
-        VnextCommand::AttachPty { step, .. } => state.log.push(format!(
+        SurfaceCommand::AttachPty { step, .. } => state.log.push(format!(
             "PTY {step} needs terminal passthrough; run `cue fg {step}`"
         )),
-        VnextCommand::Frontend(VnextFrontendAction::Clear) => state.log.clear(),
-        VnextCommand::Frontend(VnextFrontendAction::Quit) => return Ok(true),
-        VnextCommand::Frontend(VnextFrontendAction::Help { .. }) => state.log.push(
+        SurfaceCommand::Frontend(FrontendAction::Clear) => state.log.clear(),
+        SurfaceCommand::Frontend(FrontendAction::Quit) => return Ok(true),
+        SurfaceCommand::Frontend(FrontendAction::Help { .. }) => state.log.push(
             "run commands directly; :jobs, :log E1, :wait E1, :out E1/S1, :cancel E1, :fg E1/S1"
                 .into(),
         ),
@@ -155,10 +155,7 @@ fn dispatch(
             }
             let client = client.clone();
             pending.spawn(async move {
-                if matches!(
-                    command,
-                    VnextCommand::Frontend(VnextFrontendAction::Restart)
-                ) {
+                if matches!(command, SurfaceCommand::Frontend(FrontendAction::Restart)) {
                     return client.command(Command::Restart).await;
                 }
                 let SurfaceOutcome::Response(result) =
@@ -182,7 +179,7 @@ fn dispatch(
 }
 
 async fn apply_result(
-    client: &VnextMultiplexedClient,
+    client: &MultiplexedClient,
     state: &mut State,
     result: ResultPayload,
 ) -> Result<()> {
@@ -212,7 +209,7 @@ async fn apply_result(
     Ok(())
 }
 
-async fn refresh(client: &VnextMultiplexedClient, state: &mut State) -> Result<()> {
+async fn refresh(client: &MultiplexedClient, state: &mut State) -> Result<()> {
     let result = client
         .query(Query::ListExecutions {
             before: None,
@@ -318,18 +315,15 @@ mod tests {
     use cue_core::ExecutionId;
     use std::time::Duration;
 
-    async fn client() -> (
-        Arc<VnextMultiplexedClient>,
-        tokio::task::JoinHandle<Result<()>>,
-    ) {
-        let service = cue_daemon::vnext::VnextService::in_memory().unwrap();
+    async fn client() -> (Arc<MultiplexedClient>, tokio::task::JoinHandle<Result<()>>) {
+        let service = cue_daemon::service::DaemonService::in_memory().unwrap();
         let (stream, server_stream) = tokio::io::duplex(128 * 1024);
         let server = tokio::spawn(async move {
-            cue_daemon::vnext::serve_stream(service, server_stream)
+            cue_daemon::service::serve_stream(service, server_stream)
                 .await
                 .map_err(anyhow::Error::from)
         });
-        let client = VnextClient::connect_stream(
+        let client = ExecutionClient::connect_stream(
             stream,
             cue_protocol::ClientId::new("tui-regression").unwrap(),
         )
@@ -428,11 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn fact_summary_uses_vnext_execution_identity() {
+    fn fact_summary_uses_execution_identity() {
         assert_eq!(
             fact_summary(&Fact::ExecutionFinished {
                 id: ExecutionId(7),
-                state: cue_core::vnext::ExecutionState::Succeeded,
+                state: cue_core::ExecutionState::Succeeded,
             }),
             "E7: Succeeded"
         );

@@ -12,17 +12,13 @@ check: architecture
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
 
-# Enforce crate and migration boundaries that keep vNext semantics closed.
+# Enforce crate boundaries that keep execution semantics closed.
 architecture:
     ./scripts/check_architecture.sh
 
 # Run tests
 test *ARGS:
     cargo test {{ ARGS }}
-
-# Exercise cue-tui's first-party debug socket in a real PTY
-tui-debug-smoke:
-    uv run scripts/cue_tui_debug_smoke.py
 
 # Run tests with coverage (requires cargo-llvm-cov)
 cov:

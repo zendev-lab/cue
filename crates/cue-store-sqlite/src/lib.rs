@@ -1,11 +1,11 @@
-//! SQLite-backed vNext execution, scope, fact, and idempotency store.
+//! SQLite-backed execution, scope, fact, and idempotency store.
 //!
 //! This provider owns a fresh schema. It never opens, imports, or mutates the
-//! IPC v3 database; the daemon hard cut archives that database separately.
+//! IPC v3 database; the daemon archives that database separately.
 
-use cue_core::vnext::{Execution, ExecutionState, Fact, FactEvent, Scope, StepState};
-pub use cue_core::vnext::{ExecutionProjection as StoredExecution, FactDraft};
 use cue_core::{EventId, ExecutionId, ScopeHash, StepId};
+use cue_core::{Execution, ExecutionState, Fact, FactEvent, Scope, StepState};
+pub use cue_core::{ExecutionProjection as StoredExecution, FactDraft};
 use cue_protocol::{ClientId, Command, OperationId, ResponsePayload};
 use rusqlite::{Connection, OptionalExtension as _};
 use thiserror::Error;
@@ -57,9 +57,9 @@ CREATE TABLE operations (
 ) WITHOUT ROWID;
 "#;
 
-const CLIENT_HASH_DOMAIN: &[u8] = b"cue-vnext-client-id\0";
-const OPERATION_HASH_DOMAIN: &[u8] = b"cue-vnext-operation-id\0";
-const COMMAND_HASH_DOMAIN: &[u8] = b"cue-vnext-command\0";
+const CLIENT_HASH_DOMAIN: &[u8] = b"cue-v4-client-id\0";
+const OPERATION_HASH_DOMAIN: &[u8] = b"cue-v4-operation-id\0";
+const COMMAND_HASH_DOMAIN: &[u8] = b"cue-v4-command\0";
 
 pub struct Store {
     connection: Connection,
@@ -291,7 +291,7 @@ impl Store {
             Some(StepState::Running)
         ) || !matches!(
             execution.action(step),
-            Some(cue_core::vnext::StepAction::Run { .. })
+            Some(cue_core::StepAction::Run { .. })
         ) {
             return Ok(false);
         }
@@ -428,6 +428,26 @@ impl Store {
                 completed_at_ms,
             },
         )
+    }
+
+    /// Finish an external effect only from the caller that inserted its empty
+    /// operation claim. An abandoned claim remains non-replayable after a crash.
+    pub fn finish_claimed_operation(
+        &self,
+        operation: OperationCommit<'_>,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE operations SET response_json = ?4, completed_at_ms = ?5
+             WHERE client_id_hash = ?1 AND operation_id_hash = ?2 AND fingerprint = ?3 AND response_json IS NULL",
+            rusqlite::params![
+                hash_text(CLIENT_HASH_DOMAIN, operation.client.as_str()).as_slice(),
+                hash_text(OPERATION_HASH_DOMAIN, operation.operation.as_str()).as_slice(),
+                command_fingerprint(operation.command)?.as_slice(),
+                operation.response.map(serde_json::to_string).transpose()?,
+                operation.completed_at_ms,
+            ],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Drop replay payloads while preserving permanent at-most-once tombstones.
@@ -669,7 +689,7 @@ fn commit_projection(
                     value: raw_event_id,
                 }
             })?)
-            .expect("SQLite AUTOINCREMENT event ids are non-zero"),
+            .map_err(StoreError::InvalidCoreId)?,
             occurred_at_ms: draft.occurred_at_ms,
             fact: draft.fact.clone(),
         });
@@ -770,8 +790,8 @@ fn validate_execution(execution: &StoredExecution) -> Result<(), StoreError> {
     }
     let reducer = Execution::restore(execution.snapshot.clone())?;
     for step in reducer.steps() {
-        use cue_core::vnext::{BuiltinCommand, EnvEdit, Sensitivity, StepAction};
-        let sensitive_patch = |patch: &cue_core::vnext::EnvPatch| {
+        use cue_core::{BuiltinCommand, EnvEdit, Sensitivity, StepAction};
+        let sensitive_patch = |patch: &cue_core::EnvPatch| {
             patch.iter().any(|(_, edit)|
             matches!(edit, EnvEdit::Set(value) if value.sensitivity() == Sensitivity::Sensitive))
         };
@@ -953,11 +973,11 @@ fn valid_step_transition(previous: &StepState, next: &StepState) -> bool {
     if let (
         StepState::Cancelling {
             cause: previous_cause,
-            mode: cue_core::vnext::CancelMode::Graceful,
+            mode: cue_core::CancelMode::Graceful,
         },
         StepState::Cancelling {
             cause: next_cause,
-            mode: cue_core::vnext::CancelMode::Force,
+            mode: cue_core::CancelMode::Force,
         },
     ) = (previous, next)
     {
@@ -1017,7 +1037,7 @@ fn contains_sensitive_environment(scope: &Scope) -> bool {
     scope
         .env()
         .values()
-        .any(|value| value.sensitivity() == cue_core::vnext::Sensitivity::Sensitive)
+        .any(|value| value.sensitivity() == cue_core::Sensitivity::Sensitive)
 }
 
 fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
@@ -1071,7 +1091,7 @@ pub enum StoreError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    InvalidSnapshot(#[from] cue_core::vnext::ExecutionError),
+    InvalidSnapshot(#[from] cue_core::ExecutionError),
     #[error(transparent)]
     InvalidCoreId(#[from] cue_core::id::ParseIdError),
     #[error("database schema {actual} is newer than supported schema {supported}")]
@@ -1132,7 +1152,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cue_core::StepId;
-    use cue_core::vnext::{
+    use cue_core::{
         AbsolutePath, Argv, EnvKey, EnvValue, ExecutionPlan, ExecutionSpec, FileModeMask, IoMode,
         Pipeline, Process, StepFailure, StepState,
     };
@@ -1240,8 +1260,7 @@ mod tests {
         let mut entries = initial_scope().env().clone();
         entries.insert(
             key("ORDINARY_NAME"),
-            EnvValue::classified("do-not-persist", cue_core::vnext::Sensitivity::Sensitive)
-                .unwrap(),
+            EnvValue::classified("do-not-persist", cue_core::Sensitivity::Sensitive).unwrap(),
         );
         let sensitive = Scope::new(
             initial_scope().cwd().clone(),
@@ -1327,7 +1346,7 @@ mod tests {
         assert_eq!(committed_running[1].id.get(), 3);
 
         execution
-            .complete_run(step_id, cue_core::vnext::RunCompletion::Succeeded)
+            .complete_run(step_id, cue_core::RunCompletion::Succeeded)
             .unwrap();
         let completed = stored(&execution, 10, 20);
         let record = execution.step(step_id).unwrap();
@@ -1653,8 +1672,7 @@ mod tests {
             base.cwd().clone(),
             BTreeMap::from([(
                 EnvKey::new("PLAIN_NAME").unwrap(),
-                EnvValue::classified("do-not-persist", cue_core::vnext::Sensitivity::Sensitive)
-                    .unwrap(),
+                EnvValue::classified("do-not-persist", cue_core::Sensitivity::Sensitive).unwrap(),
             )]),
             base.umask(),
         );
@@ -1747,7 +1765,7 @@ mod tests {
         execution
             .complete_run(
                 step_id,
-                cue_core::vnext::RunCompletion::Failed(StepFailure::Spawn {
+                cue_core::RunCompletion::Failed(StepFailure::Spawn {
                     message: "program missing".into(),
                 }),
             )
@@ -1890,7 +1908,7 @@ mod tests {
 
     #[test]
     fn scope_must_be_readable_before_snapshot_and_failed_commit_leaves_only_unreferenced_scope() {
-        use cue_core::vnext::{BuiltinCommand, BuiltinSuccess, EnvEdit, EnvPatch};
+        use cue_core::{BuiltinCommand, BuiltinSuccess, EnvEdit, EnvPatch};
         let store = Store::in_memory().unwrap();
         persist_initial_scope(&store);
         let command = BuiltinCommand::env(EnvPatch::new(BTreeMap::from([(
@@ -1947,7 +1965,7 @@ mod tests {
 
     #[test]
     fn old_claim_cannot_clear_new_cancel_generation_or_start_after_cancellation() {
-        use cue_core::vnext::CancelMode;
+        use cue_core::CancelMode;
         let store = Store::in_memory().unwrap();
         persist_initial_scope(&store);
         let mut execution = reducer();
@@ -2024,7 +2042,7 @@ mod tests {
 
     #[test]
     fn sensitivity_is_classification_not_a_variable_name_heuristic() {
-        use cue_core::vnext::{EnvEdit, EnvPatch, Sensitivity};
+        use cue_core::{EnvEdit, EnvPatch, Sensitivity};
         let store = Store::in_memory().unwrap();
         let normal = scope(&[("API_TOKEN", "explicitly-normal")]);
         assert_eq!(

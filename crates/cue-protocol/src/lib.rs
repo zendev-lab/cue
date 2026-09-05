@@ -1,4 +1,4 @@
-//! Strict, versioned wire contract for Cue vNext.
+//! Strict, versioned IPC v4 wire contract for Cue.
 //!
 //! The protocol depends on Core facts, never the reverse. Commands always
 //! carry an operation identity; queries cannot accidentally trigger a durable
@@ -9,7 +9,7 @@ mod id;
 mod message;
 
 pub use cue_core::EventId;
-pub use cue_core::vnext::{Fact, FactEvent, OutputStream};
+pub use cue_core::{Fact, FactEvent, OutputStream};
 pub use framing::{FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message};
 pub use id::{AttachmentId, ClientId, IdError, OperationId, RequestId};
 pub use message::{

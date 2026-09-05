@@ -1,7 +1,7 @@
 # Cue Shell 语法决策记录
 
 > 本文档合并了前缀语法调研、cron 语法设计和模式转换设计的研究过程与决策理由。
-> 最终决策已体现在 [commands-and-modes.md](../design/commands-and-modes.md) 中，本文档保留研究过程供参考。
+> 当前执行边界见 [language.md](../design/language.md)；本文档只保留历史研究过程。
 
 ---
 
