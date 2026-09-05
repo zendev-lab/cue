@@ -131,6 +131,9 @@ process 的可观察性。
 
 ## 修订记录
 
+- 2026-08-30：完成 vNext surface compiler；初始 Scope 通过 `PutScope -> ScopeHash`
+  显式传入，Core builtin 固定为 Cd/Env/Umask，assignment 只作用于单个 Process，PTY
+  在每个 Run 上 resolve；schedule/resource/retry/session 命令不再 lower 到内核。
 - 2026-08-30：完成 vNext typed Assembly 与 local runner；captured/PTY 都直接实现 typed
   Pipeline，PTY 每个 Run 仅一个 terminal endpoint，显式 control、绝对 output offset 与
   restart interruption recovery 不再由 v3 ProcessManager 私有状态决定。

@@ -11,7 +11,6 @@ use cue_core::command::{ModeParams, ParamValue};
 use cue_core::cron::{
     CronPreset, CronSchedule, CrontabSchedule, parse_day_filter, parse_time_of_day,
 };
-use cue_core::ipc::ForegroundRole;
 use cue_core::pipeline::PipeOp;
 
 use super::ast::{
@@ -52,7 +51,10 @@ pub(crate) enum ResolvedCommand {
     /// View stderr.
     Err { id: String },
     /// Attach to a PTY job as either its controller or a read-only observer.
-    Fg { id: String, role: ForegroundRole },
+    Fg {
+        id: String,
+        role: ResolvedForegroundRole,
+    },
     /// Wait for job completion.
     Wait { id: String },
     /// Cancel a pending job.
@@ -77,6 +79,8 @@ pub(crate) enum ResolvedCommand {
     Env { subcommand: Option<String> },
     /// Change directory.
     Cd { path: String },
+    /// Change the file-creation mask.
+    Umask { mask: String },
     /// Scope operations.
     Scope { subcommand: Option<String> },
     /// Help.
@@ -89,6 +93,12 @@ pub(crate) enum ResolvedCommand {
     Quit,
     /// Restart the local daemon through the frontend lifecycle owner.
     Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedForegroundRole {
+    Controller,
+    Observer,
 }
 
 #[derive(Debug, Clone)]
@@ -219,11 +229,11 @@ impl Resolver {
             },
             "fg" => ResolvedCommand::Fg {
                 id: extract_id(argument, span, "fg")?,
-                role: ForegroundRole::Controller,
+                role: ResolvedForegroundRole::Controller,
             },
             "watch" => ResolvedCommand::Fg {
                 id: extract_id(argument, span, "watch")?,
-                role: ForegroundRole::Observer,
+                role: ResolvedForegroundRole::Observer,
             },
             "wait" => ResolvedCommand::Wait {
                 id: extract_id(argument, span, "wait")?,
@@ -256,6 +266,9 @@ impl Resolver {
             },
             "cd" => ResolvedCommand::Cd {
                 path: extract_text(argument),
+            },
+            "umask" => ResolvedCommand::Umask {
+                mask: extract_text(argument),
             },
             "scope" => ResolvedCommand::Scope {
                 subcommand: extract_optional_text(argument),
@@ -1042,14 +1055,14 @@ mod tests {
             resolve(":fg E1/S1", Mode::Job),
             ResolvedCommand::Fg {
                 id,
-                role: ForegroundRole::Controller,
+                role: ResolvedForegroundRole::Controller,
             } if id == "E1/S1"
         ));
         assert!(matches!(
             resolve(":watch E1/S1", Mode::Job),
             ResolvedCommand::Fg {
                 id,
-                role: ForegroundRole::Observer,
+                role: ResolvedForegroundRole::Observer,
             } if id == "E1/S1"
         ));
     }

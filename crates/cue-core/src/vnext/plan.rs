@@ -300,8 +300,6 @@ impl ExecutionPlan {
 pub struct ExecutionSpec {
     scope: ScopeHash,
     plan: ExecutionPlan,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retry_of: Option<ExecutionId>,
 }
 
 impl<'de> Deserialize<'de> for ExecutionSpec {
@@ -314,30 +312,17 @@ impl<'de> Deserialize<'de> for ExecutionSpec {
         struct WireExecutionSpec {
             scope: ScopeHash,
             plan: ExecutionPlan,
-            #[serde(default)]
-            retry_of: Option<ExecutionId>,
         }
 
         let wire = WireExecutionSpec::deserialize(deserializer)?;
-        let mut spec = Self::new(wire.scope, wire.plan).map_err(serde::de::Error::custom)?;
-        spec.retry_of = wire.retry_of;
-        Ok(spec)
+        Self::new(wire.scope, wire.plan).map_err(serde::de::Error::custom)
     }
 }
 
 impl ExecutionSpec {
     pub fn new(scope: ScopeHash, plan: ExecutionPlan) -> Result<Self, PlanValidationError> {
         plan.validate()?;
-        Ok(Self {
-            scope,
-            plan,
-            retry_of: None,
-        })
-    }
-
-    pub fn with_retry_of(mut self, execution: ExecutionId) -> Self {
-        self.retry_of = Some(execution);
-        self
+        Ok(Self { scope, plan })
     }
 
     pub const fn scope(&self) -> ScopeHash {
@@ -346,10 +331,6 @@ impl ExecutionSpec {
 
     pub fn plan(&self) -> &ExecutionPlan {
         &self.plan
-    }
-
-    pub const fn retry_of(&self) -> Option<ExecutionId> {
-        self.retry_of
     }
 }
 
@@ -446,17 +427,22 @@ mod tests {
 
     #[test]
     fn execution_spec_requires_an_explicit_scope_and_has_no_launch_context() {
-        let spec = ExecutionSpec::new(ScopeHash([7; 32]), run("echo", IoMode::Captured))
-            .unwrap()
-            .with_retry_of(ExecutionId(4));
+        let spec = ExecutionSpec::new(ScopeHash([7; 32]), run("echo", IoMode::Captured)).unwrap();
         let json = serde_json::to_value(&spec).unwrap();
         assert!(json.get("scope").is_some());
         assert!(json.get("start_scope").is_none());
         assert!(json.get("launch_context").is_none());
-        assert_eq!(spec.retry_of(), Some(ExecutionId(4)));
+        assert!(json.get("retry_of").is_none());
 
         let without_scope = serde_json::json!({ "plan": json["plan"].clone() });
         assert!(serde_json::from_value::<ExecutionSpec>(without_scope).is_err());
+
+        let with_retired_retry = serde_json::json!({
+            "scope": json["scope"].clone(),
+            "plan": json["plan"].clone(),
+            "retry_of": "E4"
+        });
+        assert!(serde_json::from_value::<ExecutionSpec>(with_retired_retry).is_err());
     }
 
     #[test]
