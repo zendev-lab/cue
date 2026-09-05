@@ -64,15 +64,15 @@ ci: check test msrv package-smoke npm-package-smoke
 
 # Run pre-commit on all files
 pre-commit:
-    uvx --from prek==0.4.12 prek run --all-files
+    uvx prek run --all-files
 
 # Install local git hooks via prek
 pre-commit-install:
-    uvx --from prek==0.4.12 prek install --install-hooks --hook-type pre-commit --hook-type commit-msg
+    uvx prek install --install-hooks --hook-type pre-commit --hook-type commit-msg
 
 # Remove local git hooks installed by prek
 pre-commit-uninstall:
-    uvx --from prek==0.4.12 prek uninstall
+    uvx prek uninstall
 
 # Display project information
 info:

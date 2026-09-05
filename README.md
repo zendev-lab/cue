@@ -86,8 +86,10 @@ lifecycle operations—no raw source or ambient session handshake.
 The default database is `$XDG_DATA_HOME/cue/cued-v4.db` (or the corresponding
 XDG fallback). A legacy `cued.db` is renamed to a read-only
 `cued-v3-<timestamp>.db.archive` with its sidecars. Cue does not import or
-dual-read incompatible v3 semantics. Credential-shaped environments remain
-volatile and are not serialized to SQLite.
+dual-read incompatible v3 semantics. Environment values carry explicit
+sensitivity; this host rejects Sensitive values before persistence. Variable
+names never determine classification. An uncertain physical Run after a crash
+blocks recovery instead of replaying it or inventing completion.
 
 ## CLI
 
@@ -118,6 +120,10 @@ number of observers; Ctrl-] detaches the controller CLI.
 - `cue-cli`: installed command aggregator and extension dispatch.
 
 Development gates:
+
+Changes to Cue's public contracts start with a numbered
+[Feature Proposal](fps/README.md). Candidate proposals live directly in `fps/`;
+there is no separate drafts directory.
 
 ```bash
 just check

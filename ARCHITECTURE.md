@@ -26,3 +26,5 @@ read-only archival of the old database before the v4 store opens.
 
 Start with the [design index](docs/design/README.md) and
 [project direction](SPARK.md).
+
+[FP-0001](fps/FP-0001-structured-execution-kernel.md) owns the normative contract.

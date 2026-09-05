@@ -138,6 +138,10 @@ impl Scope {
         for (key, value) in &self.env {
             update_bytes(&mut hasher, key.as_str().as_bytes());
             update_bytes(&mut hasher, value.as_str().as_bytes());
+            hasher.update(&[match value.sensitivity() {
+                super::Sensitivity::Normal => 0,
+                super::Sensitivity::Sensitive => 1,
+            }]);
         }
         ScopeHash(*hasher.finalize().as_bytes())
     }
@@ -199,6 +203,18 @@ mod tests {
         let patch = EnvPatch::new(BTreeMap::from([(
             key("MODE"),
             EnvEdit::set("release").unwrap(),
+        )]));
+        assert_ne!(base.compute_hash(), base.apply_env(&patch).compute_hash());
+    }
+
+    #[test]
+    fn sensitivity_changes_scope_identity() {
+        let base = scope();
+        let patch = EnvPatch::new(BTreeMap::from([(
+            key("HOME"),
+            EnvEdit::Set(
+                EnvValue::classified("/home/user", super::super::Sensitivity::Sensitive).unwrap(),
+            ),
         )]));
         assert_ne!(base.compute_hash(), base.apply_env(&patch).compute_hash());
     }

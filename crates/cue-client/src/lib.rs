@@ -7,7 +7,9 @@ pub mod script_runner;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub use execution::{ExecutionClient, MultiplexedClient, SurfaceOutcome, process_scope};
+pub use execution::{
+    ExecutionClient, MultiplexedClient, PreparedCommand, SurfaceOutcome, process_scope,
+};
 
 /// Resolve `$XDG_RUNTIME_DIR/cue/cued.sock`, falling back to the process temp
 /// directory when no runtime directory is configured.

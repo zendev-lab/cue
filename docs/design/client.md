@@ -13,14 +13,16 @@ environment, and current `umask` into a complete `Scope`. The ordered flow is:
 3. `SubmitExecution(typed_spec)`.
 
 The daemon therefore never guesses which shell, terminal, session, or process
-environment a command came from. Sensitive environment names are accepted by
-the client but classified by the daemon as volatile and are never persisted.
+environment a command came from. Environment values carry explicit sensitivity. The SQLite host rejects
+Sensitive values; ordinary variable names do not imply sensitivity.
 
 ## Identity and framing
 
 A connection creates one bounded `ClientId` and sends `Hello` before any other
-message. Every query receives a fresh non-zero `RequestId`; every command also
-receives a fresh `OperationId` containing a per-connection random prefix. The
+message. Every query receives a fresh non-zero `RequestId`. A logical command owns an
+immutable `PreparedCommand` with its ClientId, OperationId, and payload. Socket
+reconnection retries it with the original identity. Stream and multiplexed
+callers can retain and reuse prepared commands across connection replacement. The
 client uses the same strict length-prefixed IPC v4 framing as the daemon and
 surfaces typed protocol errors without retrying a rejected effect.
 
@@ -35,3 +37,7 @@ facts/PTY events to a separate event queue.
 those intents into Query or Command envelopes. Schedule, retry, resource,
 session, and approval policies remain external owners and cannot reappear as
 hidden daemon request fields.
+
+Surface queries compile against a locally computed ScopeHash without PutScope.
+Only submission writes Scope. `tail N` uses TailOutput to read the final N
+retained bytes and returns their absolute offsets.

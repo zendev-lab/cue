@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::provider::{RunControlCommand, RunControlRequest};
 use crate::{
     OutputStore, ProcessSpawner, RunControl, RunExit, RuntimeError, RuntimeErrorKind,
-    RuntimeFuture, SpawnRequest, SpawnedRun, TerminalSize,
+    RuntimeFuture, SpawnContext, SpawnRequest, SpawnedRun, TerminalSize,
 };
 
 const CONTROL_CAPACITY: usize = 32;
@@ -52,13 +52,17 @@ impl LocalProcessSpawner {
 }
 
 impl ProcessSpawner for LocalProcessSpawner {
-    fn spawn(&self, request: SpawnRequest) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>> {
+    fn spawn(
+        &self,
+        request: SpawnRequest,
+        context: SpawnContext,
+    ) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>> {
         let output = self.output.clone();
         let terminal_size = self.initial_terminal_size;
         Box::pin(async move {
             match request.io {
-                IoMode::Captured => spawn_captured(request, output).await,
-                IoMode::Pty => spawn_pty(request, output, terminal_size).await,
+                IoMode::Captured => spawn_captured(request, context, output).await,
+                IoMode::Pty => spawn_pty(request, context, output, terminal_size).await,
             }
         })
     }
@@ -66,9 +70,10 @@ impl ProcessSpawner for LocalProcessSpawner {
 
 async fn spawn_captured(
     request: SpawnRequest,
+    context: SpawnContext,
     output: Arc<dyn OutputStore>,
 ) -> Result<SpawnedRun, RuntimeError> {
-    let SpawnedPipeline { children, readers } = spawn_pipeline(&request, None).await?;
+    let SpawnedPipeline { children, readers } = spawn_pipeline(&request, &context, None).await?;
     let (failure_tx, failure_rx) = mpsc::channel(1);
     let readers = spawn_readers(request.step, readers, output, failure_tx);
     let (control, control_rx) = control_channel(IoMode::Captured);
@@ -83,6 +88,7 @@ async fn spawn_captured(
 
 async fn spawn_pty(
     request: SpawnRequest,
+    context: SpawnContext,
     output: Arc<dyn OutputStore>,
     terminal_size: TerminalSize,
 ) -> Result<SpawnedRun, RuntimeError> {
@@ -106,7 +112,7 @@ async fn spawn_pty(
     let SpawnedPipeline {
         mut children,
         readers: unexpected_readers,
-    } = spawn_pipeline(&request, Some(&slave)).await?;
+    } = spawn_pipeline(&request, &context, Some(&slave)).await?;
     if !unexpected_readers.is_empty() {
         terminate_children(&mut children, CancelMode::Force);
         wait_children(&mut children).await;
@@ -156,6 +162,7 @@ struct SpawnedPipeline {
 
 async fn spawn_pipeline(
     request: &SpawnRequest,
+    context: &SpawnContext,
     terminal: Option<&std::fs::File>,
 ) -> Result<SpawnedPipeline, RuntimeError> {
     let processes = request.pipeline.processes().collect::<Vec<_>>();
@@ -164,82 +171,85 @@ async fn spawn_pipeline(
     let mut next_stdin: Option<std::fs::File> = None;
 
     for (index, process) in processes.iter().enumerate() {
-        let mut command = configured_command(
-            process,
-            &request.scope,
-            terminal,
-            terminal.is_some() && index == 0,
-        )?;
-        if index == 0 {
-            command.stdin(match terminal {
-                Some(terminal) => Stdio::from(clone_file(terminal, "clone PTY stdin")?),
-                None => Stdio::null(),
-            });
-        } else {
-            command.stdin(Stdio::from(next_stdin.take().ok_or_else(|| {
-                RuntimeError::infrastructure("pipeline successor has no stdin link")
-            })?));
-        }
+        let prepared = (|| {
+            let mut command = configured_command(
+                process,
+                &request.scope,
+                context,
+                terminal,
+                terminal.is_some() && index == 0,
+            )?;
+            if index == 0 {
+                command.stdin(match terminal {
+                    Some(terminal) => Stdio::from(clone_file(terminal, "clone PTY stdin")?),
+                    None => Stdio::null(),
+                });
+            } else {
+                command.stdin(Stdio::from(next_stdin.take().ok_or_else(|| {
+                    RuntimeError::infrastructure("pipeline successor has no stdin link")
+                })?));
+            }
 
-        let link = request.pipeline.rest().get(index).map(|link| link.link());
-        match (link, terminal) {
-            (Some(PipeLink::StdoutToStdin), _) => {
-                let (read, write) = create_pipe()?;
-                command.stdout(Stdio::from(write));
-                next_stdin = Some(read);
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stderr,
-                    terminal,
-                    &mut readers,
-                )?;
+            let link = request.pipeline.rest().get(index).map(|link| link.link());
+            match (link, terminal) {
+                (Some(PipeLink::StdoutToStdin), _) => {
+                    let (read, write) = create_pipe()?;
+                    command.stdout(Stdio::from(write));
+                    next_stdin = Some(read);
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stderr,
+                        terminal,
+                        &mut readers,
+                    )?;
+                }
+                (Some(PipeLink::StderrToStdin), _) => {
+                    let (read, write) = create_pipe()?;
+                    command.stderr(Stdio::from(write));
+                    next_stdin = Some(read);
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stdout,
+                        terminal,
+                        &mut readers,
+                    )?;
+                }
+                (Some(PipeLink::StdoutAndStderrToStdin), _) => {
+                    let (read, write) = create_pipe()?;
+                    command.stdout(Stdio::from(clone_file(&write, "clone combined pipe")?));
+                    command.stderr(Stdio::from(write));
+                    next_stdin = Some(read);
+                }
+                (None, _) => {
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stdout,
+                        terminal,
+                        &mut readers,
+                    )?;
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stderr,
+                        terminal,
+                        &mut readers,
+                    )?;
+                }
             }
-            (Some(PipeLink::StderrToStdin), _) => {
-                let (read, write) = create_pipe()?;
-                command.stderr(Stdio::from(write));
-                next_stdin = Some(read);
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stdout,
-                    terminal,
-                    &mut readers,
-                )?;
-            }
-            (Some(PipeLink::StdoutAndStderrToStdin), _) => {
-                let (read, write) = create_pipe()?;
-                command.stdout(Stdio::from(clone_file(&write, "clone combined pipe")?));
-                command.stderr(Stdio::from(write));
-                next_stdin = Some(read);
-            }
-            (None, _) => {
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stdout,
-                    terminal,
-                    &mut readers,
-                )?;
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stderr,
-                    terminal,
-                    &mut readers,
-                )?;
-            }
-        }
 
-        let mut child = match command.spawn() {
+            command.spawn().map_err(|error| {
+                RuntimeError::infrastructure(format!(
+                    "spawn {} for {}: {error}",
+                    process.argv().program(),
+                    request.step
+                ))
+            })
+        })();
+        let mut child = match prepared {
             Ok(child) => child,
             Err(error) => {
                 terminate_children(&mut children, CancelMode::Force);
                 wait_children(&mut children).await;
-                return Err(RuntimeError::new(
-                    RuntimeErrorKind::Infrastructure,
-                    format!(
-                        "spawn {} for {}: {error}",
-                        process.argv().program(),
-                        request.step
-                    ),
-                ));
+                return Err(error);
             }
         };
         if terminal.is_none() {
@@ -285,13 +295,14 @@ fn configure_unlinked_stream(
 fn configured_command(
     process: &Process,
     scope: &Scope,
+    context: &SpawnContext,
     terminal: Option<&std::fs::File>,
     terminal_leader: bool,
 ) -> Result<Command, RuntimeError> {
     let mut command = Command::new(process.argv().program());
     command
         .args(process.argv().arguments())
-        .current_dir(scope.cwd().as_path())
+        .current_dir(context.cwd.as_path())
         .env_clear()
         .kill_on_drop(true);
     for (key, value) in process.effective_env(scope.env()) {
@@ -549,9 +560,6 @@ fn child_exit_pending_without_reaping(child: &Child) -> std::io::Result<bool> {
 }
 
 fn classify_exit(statuses: &[Option<ExitStatus>], cancelled: bool) -> RunExit {
-    if cancelled {
-        return RunExit::Cancelled;
-    }
     let Some(status) = statuses.last().and_then(Option::as_ref) else {
         return RunExit::InfrastructureFailure("pipeline had no process status".into());
     };
@@ -560,7 +568,11 @@ fn classify_exit(statuses: &[Option<ExitStatus>], cancelled: bool) -> RunExit {
     } else if let Some(code) = status.code() {
         RunExit::ExitCode(code)
     } else if let Some(signal) = status.signal() {
-        RunExit::Signalled { signal }
+        if cancelled && matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+            RunExit::Cancelled
+        } else {
+            RunExit::Signalled { signal }
+        }
     } else {
         RunExit::InfrastructureFailure("process exited without code or signal".into())
     }
@@ -814,12 +826,15 @@ mod tests {
             )],
         );
         let run = spawner
-            .spawn(SpawnRequest {
-                step: step(),
-                pipeline,
-                io: IoMode::Captured,
-                scope: scope(),
-            })
+            .spawn(
+                SpawnRequest {
+                    step: step(),
+                    pipeline,
+                    io: IoMode::Captured,
+                    scope: scope(),
+                },
+                SpawnContext::local(&scope()),
+            )
             .await
             .unwrap();
         assert_eq!(run.wait().await, RunExit::Success);
@@ -835,12 +850,15 @@ mod tests {
         let output = Arc::new(MemoryOutputStore::new(1024));
         let spawner = LocalProcessSpawner::new(output.clone());
         let run = spawner
-            .spawn(SpawnRequest {
-                step: step(),
-                pipeline: Pipeline::simple(process("/bin/echo", &["pty-ok"])),
-                io: IoMode::Pty,
-                scope: scope(),
-            })
+            .spawn(
+                SpawnRequest {
+                    step: step(),
+                    pipeline: Pipeline::simple(process("/bin/echo", &["pty-ok"])),
+                    io: IoMode::Pty,
+                    scope: scope(),
+                },
+                SpawnContext::local(&scope()),
+            )
             .await
             .unwrap();
         run.control
@@ -867,12 +885,15 @@ mod tests {
         let output = Arc::new(MemoryOutputStore::new(1024));
         let spawner = LocalProcessSpawner::new(output);
         let run = spawner
-            .spawn(SpawnRequest {
-                step: step(),
-                pipeline: Pipeline::simple(process("/bin/sleep", &["10"])),
-                io: IoMode::Captured,
-                scope: scope(),
-            })
+            .spawn(
+                SpawnRequest {
+                    step: step(),
+                    pipeline: Pipeline::simple(process("/bin/sleep", &["10"])),
+                    io: IoMode::Captured,
+                    scope: scope(),
+                },
+                SpawnContext::local(&scope()),
+            )
             .await
             .unwrap();
         run.control.terminate(CancelMode::Force).await.unwrap();
@@ -883,12 +904,15 @@ mod tests {
     async fn output_failure_terminates_a_pty_writer_instead_of_deadlocking() {
         let spawner = LocalProcessSpawner::new(Arc::new(FailingOutputStore));
         let run = spawner
-            .spawn(SpawnRequest {
-                step: step(),
-                pipeline: Pipeline::simple(process("/usr/bin/yes", &[])),
-                io: IoMode::Pty,
-                scope: scope(),
-            })
+            .spawn(
+                SpawnRequest {
+                    step: step(),
+                    pipeline: Pipeline::simple(process("/usr/bin/yes", &[])),
+                    io: IoMode::Pty,
+                    scope: scope(),
+                },
+                SpawnContext::local(&scope()),
+            )
             .await
             .unwrap();
         let exit = tokio::time::timeout(Duration::from_secs(2), run.wait())
@@ -896,6 +920,27 @@ mod tests {
             .expect("output failure must terminate the writer");
         assert!(
             matches!(exit, RunExit::InfrastructureFailure(message) if message.contains("output unavailable"))
+        );
+    }
+    #[test]
+    fn cancellation_does_not_overwrite_a_natural_exit() {
+        assert_eq!(
+            classify_exit(&[Some(ExitStatus::from_raw(0))], true),
+            RunExit::Success
+        );
+        assert_eq!(
+            classify_exit(&[Some(ExitStatus::from_raw(7 << 8))], true),
+            RunExit::ExitCode(7)
+        );
+        assert_eq!(
+            classify_exit(&[Some(ExitStatus::from_raw(libc::SIGKILL))], true),
+            RunExit::Cancelled
+        );
+        assert_eq!(
+            classify_exit(&[Some(ExitStatus::from_raw(libc::SIGSEGV))], true),
+            RunExit::Signalled {
+                signal: libc::SIGSEGV
+            }
         );
     }
 }

@@ -145,7 +145,7 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
     };
 
     drop(listener);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    service.drain().await?;
     while tokio::time::timeout(
         std::time::Duration::from_millis(100),
         connections.join_next(),

@@ -107,7 +107,7 @@ pub trait OutputStore: Send + Sync {
     ) -> Result<OutputSlice, RuntimeError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnRequest {
     pub step: StepId,
     pub pipeline: Pipeline,
@@ -115,20 +115,46 @@ pub struct SpawnRequest {
     pub scope: Scope,
 }
 
+/// Physical workspace placement, separate from immutable execution semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnContext {
+    pub cwd: cue_core::AbsolutePath,
+}
+
+impl SpawnContext {
+    pub fn local(scope: &Scope) -> Self {
+        Self {
+            cwd: scope.cwd().clone(),
+        }
+    }
+}
+
 pub trait ProcessSpawner: Send + Sync {
-    fn spawn(&self, request: SpawnRequest) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>>;
+    fn spawn(
+        &self,
+        request: SpawnRequest,
+        context: SpawnContext,
+    ) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>>;
 }
 
 pub trait Workspace: Send + Sync {
-    fn materialize(&self, request: &mut SpawnRequest) -> Result<(), RuntimeError>;
+    fn materialize(
+        &self,
+        request: &SpawnRequest,
+        context: &mut SpawnContext,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub trait SpawnTransform: Send + Sync {
-    fn transform(&self, request: &mut SpawnRequest) -> Result<(), RuntimeError>;
+    fn transform(
+        &self,
+        request: &SpawnRequest,
+        context: &mut SpawnContext,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub trait SpawnGuard: Send + Sync {
-    fn check(&self, request: &SpawnRequest) -> Result<(), RuntimeError>;
+    fn check(&self, request: &SpawnRequest, context: &SpawnContext) -> Result<(), RuntimeError>;
 }
 
 pub trait ExecutionObserver: Send + Sync {
@@ -143,6 +169,7 @@ pub enum RunExit {
     Cancelled,
     SpawnFailed(String),
     InfrastructureFailure(String),
+    OwnershipLost(String),
 }
 
 pub struct SpawnedRun {
@@ -163,7 +190,9 @@ impl SpawnedRun {
 
     pub async fn wait(self) -> RunExit {
         self.completion.await.unwrap_or_else(|_| {
-            RunExit::InfrastructureFailure("runner completion channel closed".into())
+            RunExit::OwnershipLost(
+                "runner completion channel closed before quiescence was reported".into(),
+            )
         })
     }
 }
@@ -356,22 +385,23 @@ impl RuntimeAssembly {
         &self.manifest
     }
 
-    pub fn prepare_spawn(&self, mut request: SpawnRequest) -> Result<SpawnRequest, RuntimeError> {
+    pub fn prepare_spawn(&self, request: &SpawnRequest) -> Result<SpawnContext, RuntimeError> {
+        let mut context = SpawnContext::local(&request.scope);
         if let Some(workspace) = &self.workspace {
-            workspace.materialize(&mut request)?;
+            workspace.materialize(request, &mut context)?;
         }
         for transform in &self.spawn_transforms {
-            transform.transform(&mut request)?;
+            transform.transform(request, &mut context)?;
         }
         for guard in &self.spawn_guards {
-            guard.check(&request)?;
+            guard.check(request, &context)?;
         }
-        Ok(request)
+        Ok(context)
     }
 
     pub fn spawn(&self, request: SpawnRequest) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>> {
-        match self.prepare_spawn(request) {
-            Ok(request) => self.process_spawner.spawn(request),
+        match self.prepare_spawn(&request) {
+            Ok(context) => self.process_spawner.spawn(request, context),
             Err(error) => Box::pin(async move { Err(error) }),
         }
     }
@@ -542,7 +572,11 @@ mod tests {
     struct NullSpawner;
 
     impl ProcessSpawner for NullSpawner {
-        fn spawn(&self, _request: SpawnRequest) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>> {
+        fn spawn(
+            &self,
+            _request: SpawnRequest,
+            _context: SpawnContext,
+        ) -> RuntimeFuture<Result<SpawnedRun, RuntimeError>> {
             Box::pin(async { Err(RuntimeError::infrastructure("not called")) })
         }
     }
@@ -553,7 +587,11 @@ mod tests {
     }
 
     impl SpawnTransform for RecordingTransform {
-        fn transform(&self, _request: &mut SpawnRequest) -> Result<(), RuntimeError> {
+        fn transform(
+            &self,
+            _request: &SpawnRequest,
+            _context: &mut SpawnContext,
+        ) -> Result<(), RuntimeError> {
             self.calls.lock().unwrap().push(self.name);
             Ok(())
         }
@@ -591,7 +629,7 @@ mod tests {
                     [RuntimePort::SpawnTransform.port_id()],
                 )
                 .unwrap()
-                .before(provider("second")),
+                .before(RuntimePort::SpawnTransform.port_id(), provider("second")),
             )
             .unwrap();
         composition
@@ -657,7 +695,10 @@ mod tests {
         }
 
         let runtime = RuntimeAssembly::bind(resolved(), registry).unwrap();
-        runtime.prepare_spawn(request()).unwrap();
+        let input = request();
+        let before = input.clone();
+        runtime.prepare_spawn(&input).unwrap();
+        assert_eq!(input, before);
         assert_eq!(*calls.lock().unwrap(), vec!["first", "second"]);
         assert_eq!(runtime.manifest().providers.len(), 3);
     }

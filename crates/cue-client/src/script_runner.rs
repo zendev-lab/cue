@@ -79,8 +79,8 @@ pub(crate) fn execution_exit_code(execution: &cue_protocol::ExecutionView) -> i3
                 _ => None,
             })
             .unwrap_or(1),
-        ExecutionState::Cancelled { .. } => 130,
-        ExecutionState::Pending | ExecutionState::Running => 1,
+        ExecutionState::Cancelled => 130,
+        ExecutionState::Pending | ExecutionState::Running | ExecutionState::Cancelling => 1,
     }
 }
 

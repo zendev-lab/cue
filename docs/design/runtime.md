@@ -19,7 +19,9 @@ string. The retained manifest is non-sensitive inspection data only.
 ## Local process runner
 
 `LocalProcessSpawner` takes an already resolved `SpawnRequest` containing a
-Core Pipeline, IoMode, StepId, and full Scope. It clears the ambient process
+Core Pipeline, IoMode, StepId, and full Scope. Workspace/transform providers
+receive these semantic inputs by shared reference and can only change a separate
+SpawnContext containing physical directory placement. It clears the ambient process
 environment, applies each Process-local EnvPatch independently, sets cwd and
 umask, and spawns every pipeline segment directly without an implicit shell.
 
@@ -39,8 +41,17 @@ OutputStore uses absolute monotonically increasing byte offsets. The memory
 provider bounds retained bytes per `(StepId, OutputStream)` without resetting
 offsets when old bytes are discarded, so readers can detect truncation.
 
-On daemon restart, `recover_interrupted` converts only previously Running
-Steps into structured infrastructure failures and emits the matching ordered
-facts. It does not advance pending branches in the same function: recovery is
-persisted first, then the normal reducer advance/mark-running transaction may
-start a Failure or Always continuation.
+Builtin and Run use the same committed Step lifecycle. `realize_builtin` observes
+Cd's resolved directory or reports Env/Umask success; it changes no ambient state
+and leaves no physical ownership, so uncommitted builtin completion is replayable.
+
+The host must persist a Run attempt marker before spawning. Unstarted work can be
+requeued, but an active marked attempt cannot be replayed or reported terminal
+without independent proof of quiescence or unique control. The local provider
+cannot regain that control after a crash, so the store/host fail closed. The
+runtime does not automatically turn every Running snapshot into an infrastructure
+failure. Loss of a runner completion channel reports OwnershipLost, not a false
+terminal result.
+
+Cancellation is best effort: natural success and nonzero exit remain normal
+completion; a termination signal caused by cancellation reports Cancelled.

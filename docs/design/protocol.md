@@ -50,14 +50,15 @@ the side effect is never routed a second time.
 
 ## Fresh persistence schema
 
-The provider owns four tables only:
+The provider owns five tables:
 
 - content-addressed full Scope snapshots;
 - complete reducer Execution snapshots and aggregate state;
 - ordered durable facts;
-- operation replay records/tombstones.
+- operation replay records/tombstones;
+- StepId runtime follow-up with delivery generations, claims, and an attempt marker.
 
-Execution projection and its facts commit in one SQLite transaction. For a
+Execution projection, facts, and runtime follow-up commit in one SQLite transaction. For a
 Command, the operation claim, replay response, projection, and facts share that
 same transaction. The store reconstructs the Core reducer on every read and
 requires facts to transform the previous Step/Execution projection into the
@@ -65,10 +66,22 @@ new one in order; a fact cannot invent its previous state or omit a durable
 state change. Scope rows are rehashed on read, and every ScopeHash referenced
 by a durable execution must exist in the same store.
 
-Credential-shaped environment keys make a Scope volatile: it remains eligible
-for the daemon's memory cache but is never serialized to SQLite. Consequently,
-an execution that references such a Scope is also volatile and cannot be
-committed as a restart-recoverable execution.
+Environment values carry explicit Sensitivity. This store rejects Sensitive
+Scope values and plan environment patches; it does not infer classification from
+variable names or offer an incomplete volatile execution protocol.
+
+A worker claims one StepId generation, then reads the latest committed snapshot.
+Acknowledging an older generation leaves newer work pending. Before physical Run
+spawn, the worker persists an attempt marker while verifying Running state and
+its current claim. Duplicate delivery cannot create another attempt. Recovery
+requeues unstarted work and replayable builtins; an active marked Run fails closed
+because this implementation cannot prove its old attempt quiescent or retake it.
+It neither repeats spawn nor invents a terminal fact.
+
+New Scope values are written before the execution transaction. A failure may
+leave an unreferenced Scope but cannot commit a dangling reference or candidate
+Fact. No Scope reclamation is implemented. Schema 2 rejects pre-FP IPC v4 schema 1
+without translating its incompatible snapshot or ownership semantics.
 
 This is a new schema, not an extension of the IPC v3 database. The daemon
 creates the v4 store and archives the old database read-only;
