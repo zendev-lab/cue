@@ -220,100 +220,7 @@ impl VnextClient {
         let hash = scope.compute_hash();
         let command =
             compile_vnext_command(source, mode, hash).context("compile Cue command for IPC v4")?;
-        let result = match command {
-            VnextCommand::Submit(spec) => {
-                self.put_scope(scope).await?;
-                ResultPayload::ExecutionSubmitted {
-                    execution: Box::new(self.submit(spec).await?),
-                }
-            }
-            VnextCommand::ListExecutions => {
-                self.query(Query::ListExecutions {
-                    before: None,
-                    limit: 100,
-                })
-                .await?
-            }
-            VnextCommand::GetExecution { id } => self.query(Query::GetExecution { id }).await?,
-            VnextCommand::WaitExecution { id } => self.query(Query::WaitExecution { id }).await?,
-            VnextCommand::ReadOutput {
-                target,
-                stream,
-                tail_bytes,
-            } => {
-                let step = resolve_output_step(self, target).await?;
-                if let Some(maximum) = tail_bytes {
-                    let result = self
-                        .query(Query::TailOutput {
-                            step,
-                            stream: match stream {
-                                cue_language::OutputSelection::Stdout => OutputStream::Stdout,
-                                cue_language::OutputSelection::Stderr => OutputStream::Stderr,
-                            },
-                            max_bytes: maximum.min(u32::MAX as usize) as u32,
-                        })
-                        .await?;
-                    return Ok(SurfaceOutcome::Response(result));
-                }
-                let maximum = 1024 * 1024;
-                let range = OutputRange {
-                    offset: 0,
-                    max_bytes: maximum,
-                };
-                let empty = OutputRange {
-                    offset: 0,
-                    max_bytes: 0,
-                };
-                self.query(Query::ReadOutput {
-                    step,
-                    stdout: if matches!(stream, cue_language::OutputSelection::Stdout) {
-                        range.clone()
-                    } else {
-                        empty.clone()
-                    },
-                    stderr: if matches!(stream, cue_language::OutputSelection::Stderr) {
-                        range
-                    } else {
-                        empty.clone()
-                    },
-                    terminal: empty,
-                })
-                .await?
-            }
-            VnextCommand::CancelExecution { id, force } => {
-                self.command(Command::CancelExecution {
-                    id,
-                    mode: if force {
-                        CancelMode::Force
-                    } else {
-                        CancelMode::Graceful
-                    },
-                })
-                .await?
-            }
-            VnextCommand::AttachPty {
-                step,
-                claim_control,
-            } => {
-                let attached = self
-                    .command(Command::AttachPty {
-                        step,
-                        replay_bytes: 64 * 1024,
-                    })
-                    .await?;
-                if claim_control {
-                    let ResultPayload::PtyAttached { attachment, .. } = attached else {
-                        bail!("daemon returned an unexpected AttachPty response: {attached:?}");
-                    };
-                    self.command(Command::ClaimPtyControl { attachment })
-                        .await?
-                } else {
-                    attached
-                }
-            }
-            VnextCommand::Frontend(action) => return Ok(SurfaceOutcome::Frontend(action)),
-        };
-        Ok(SurfaceOutcome::Response(result))
+        dispatch_surface(self, scope, command).await
     }
 
     pub async fn next_event(&mut self) -> Result<EventPayload> {
@@ -421,6 +328,27 @@ impl VnextMultiplexedClient {
             capabilities,
             reader_task,
         }
+    }
+
+    pub async fn execute_surface(
+        &self,
+        scope: Scope,
+        source: &str,
+        mode: Mode,
+    ) -> Result<SurfaceOutcome> {
+        let command = compile_vnext_command(source, mode, scope.compute_hash())
+            .context("compile Cue command for IPC v4")?;
+        self.execute_compiled(scope, command).await
+    }
+
+    /// Execute a locally compiled command through the shared surface mapping.
+    pub async fn execute_compiled(
+        &self,
+        scope: Scope,
+        command: VnextCommand,
+    ) -> Result<SurfaceOutcome> {
+        let mut client = self;
+        dispatch_surface(&mut client, scope, command).await
     }
 
     pub fn supports(&self, capability: Capability) -> bool {
@@ -652,8 +580,163 @@ fn current_umask() -> Result<FileModeMask> {
     FileModeMask::new(mask as u16).context("validate process umask")
 }
 
+trait SurfaceTransport: Send {
+    fn query(
+        &mut self,
+        query: Query,
+    ) -> impl std::future::Future<Output = Result<ResultPayload>> + Send;
+    fn command(
+        &mut self,
+        command: Command,
+    ) -> impl std::future::Future<Output = Result<ResultPayload>> + Send;
+}
+
+impl SurfaceTransport for VnextClient {
+    async fn query(&mut self, query: Query) -> Result<ResultPayload> {
+        VnextClient::query(self, query).await
+    }
+    async fn command(&mut self, command: Command) -> Result<ResultPayload> {
+        VnextClient::command(self, command).await
+    }
+}
+
+impl SurfaceTransport for &VnextMultiplexedClient {
+    async fn query(&mut self, query: Query) -> Result<ResultPayload> {
+        VnextMultiplexedClient::query(self, query).await
+    }
+    async fn command(&mut self, command: Command) -> Result<ResultPayload> {
+        VnextMultiplexedClient::command(self, command).await
+    }
+}
+
+async fn dispatch_surface(
+    client: &mut impl SurfaceTransport,
+    scope: Scope,
+    command: VnextCommand,
+) -> Result<SurfaceOutcome> {
+    let result = match command {
+        VnextCommand::Submit(spec) => {
+            let expected = scope.compute_hash();
+            if spec.scope() != expected {
+                bail!("submission Scope differs from compiled Scope");
+            }
+            match client
+                .command(Command::PutScope {
+                    scope: Box::new(scope),
+                })
+                .await?
+            {
+                ResultPayload::ScopeStored {
+                    hash,
+                    durable: true,
+                } if hash == expected => {}
+                other => bail!("daemon returned an unexpected PutScope response: {other:?}"),
+            }
+            let result = client
+                .command(Command::SubmitExecution {
+                    spec: Box::new(spec),
+                })
+                .await?;
+            if !matches!(result, ResultPayload::ExecutionSubmitted { .. }) {
+                bail!("daemon returned an unexpected Submit response: {result:?}");
+            }
+            result
+        }
+        VnextCommand::ListExecutions => {
+            client
+                .query(Query::ListExecutions {
+                    before: None,
+                    limit: 100,
+                })
+                .await?
+        }
+        VnextCommand::GetExecution { id } => client.query(Query::GetExecution { id }).await?,
+        VnextCommand::WaitExecution { id } => client.query(Query::WaitExecution { id }).await?,
+        VnextCommand::ReadOutput {
+            target,
+            stream,
+            tail_bytes,
+        } => {
+            let step = resolve_output_step(client, target).await?;
+            if let Some(maximum) = tail_bytes {
+                let result = client
+                    .query(Query::TailOutput {
+                        step,
+                        stream: match stream {
+                            cue_language::OutputSelection::Stdout => OutputStream::Stdout,
+                            cue_language::OutputSelection::Stderr => OutputStream::Stderr,
+                        },
+                        max_bytes: maximum.min(u32::MAX as usize) as u32,
+                    })
+                    .await?;
+                return Ok(SurfaceOutcome::Response(result));
+            }
+            let maximum = 1024 * 1024;
+            let range = OutputRange {
+                offset: 0,
+                max_bytes: maximum,
+            };
+            let empty = OutputRange {
+                offset: 0,
+                max_bytes: 0,
+            };
+            client
+                .query(Query::ReadOutput {
+                    step,
+                    stdout: if matches!(stream, cue_language::OutputSelection::Stdout) {
+                        range.clone()
+                    } else {
+                        empty.clone()
+                    },
+                    stderr: if matches!(stream, cue_language::OutputSelection::Stderr) {
+                        range
+                    } else {
+                        empty.clone()
+                    },
+                    terminal: empty,
+                })
+                .await?
+        }
+        VnextCommand::CancelExecution { id, force } => {
+            client
+                .command(Command::CancelExecution {
+                    id,
+                    mode: if force {
+                        CancelMode::Force
+                    } else {
+                        CancelMode::Graceful
+                    },
+                })
+                .await?
+        }
+        VnextCommand::AttachPty {
+            step,
+            claim_control,
+        } => {
+            let attached = client
+                .command(Command::AttachPty {
+                    step,
+                    replay_bytes: 64 * 1024,
+                })
+                .await?;
+            if claim_control {
+                let ResultPayload::PtyAttached { attachment, .. } = attached else {
+                    bail!("daemon returned an unexpected AttachPty response: {attached:?}");
+                };
+                client
+                    .command(Command::ClaimPtyControl { attachment })
+                    .await?
+            } else {
+                attached
+            }
+        }
+        VnextCommand::Frontend(action) => return Ok(SurfaceOutcome::Frontend(action)),
+    };
+    Ok(SurfaceOutcome::Response(result))
+}
+
 async fn resolve_output_step(
-    client: &mut VnextClient,
+    client: &mut impl SurfaceTransport,
     target: cue_language::OutputTarget,
 ) -> Result<StepId> {
     match target {
@@ -719,6 +802,95 @@ mod tests {
 
     fn client_id() -> ClientId {
         ClientId::new("client-test").unwrap()
+    }
+
+    #[tokio::test]
+    async fn multiplexed_surface_shares_read_only_tail_and_concurrent_wait_semantics() {
+        let service = VnextService::in_memory().unwrap();
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(serve_stream(service, server_stream));
+        let client = VnextClient::connect_stream(client_stream, client_id())
+            .await
+            .unwrap()
+            .into_multiplexed();
+        for source in [
+            ":log",
+            ":help",
+            ":log E999",
+            ":wait E999",
+            ":out E999",
+            ":cancel",
+        ] {
+            let _ = client.execute_surface(scope(), source, Mode::Job).await;
+            assert!(
+                client
+                    .query(Query::GetScope {
+                        hash: scope().compute_hash()
+                    })
+                    .await
+                    .is_err(),
+                "{source}"
+            );
+        }
+        let SurfaceOutcome::Response(ResultPayload::ExecutionSubmitted { execution }) = client
+            .execute_surface(scope(), "/usr/bin/printf abcdefghij", Mode::Job)
+            .await
+            .unwrap()
+        else {
+            panic!("submission")
+        };
+        client
+            .query(Query::WaitExecution {
+                id: execution.snapshot.id,
+            })
+            .await
+            .unwrap();
+        let SurfaceOutcome::Response(ResultPayload::Output { chunks }) = client
+            .execute_surface(
+                scope(),
+                &format!(":tail {} 4", execution.snapshot.id),
+                Mode::Job,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("tail")
+        };
+        assert_eq!(chunks[0].offset, 6);
+        assert_eq!(output_bytes(&chunks, OutputStream::Stdout), b"ghij");
+        let SurfaceOutcome::Response(ResultPayload::ExecutionSubmitted { execution }) = client
+            .execute_surface(scope(), "/bin/sleep 30", Mode::Job)
+            .await
+            .unwrap()
+        else {
+            panic!("submission")
+        };
+        {
+            let wait = client.query(Query::WaitExecution {
+                id: execution.snapshot.id,
+            });
+            tokio::pin!(wait);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut wait)
+                    .await
+                    .is_err()
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.command(Command::CancelExecution {
+                    id: execution.snapshot.id,
+                    mode: CancelMode::Force,
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(tokio::time::timeout(std::time::Duration::from_secs(3), wait).await.unwrap().unwrap(), ResultPayload::Execution { execution } if execution.state == cue_core::vnext::ExecutionState::Cancelled)
+            );
+        }
+        drop(client);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
