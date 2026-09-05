@@ -48,3 +48,8 @@ fail_if_match \
     'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
     'the vNext language compiler must not depend on IPC v3 or legacy execution policy' \
     "${repo_root}/crates/cue-language/src/vnext_compiler.rs"
+
+fail_if_match \
+    'crate::(actor|storage)|cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
+    'the vNext daemon service must not depend on the IPC v3 actor tree or legacy execution policy' \
+    "${repo_root}/crates/cue-daemon/src/vnext.rs"

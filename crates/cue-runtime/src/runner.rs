@@ -171,83 +171,85 @@ async fn spawn_pipeline(
     let mut next_stdin: Option<std::fs::File> = None;
 
     for (index, process) in processes.iter().enumerate() {
-        let mut command = configured_command(
-            process,
-            &request.scope,
-            context,
-            terminal,
-            terminal.is_some() && index == 0,
-        )?;
-        if index == 0 {
-            command.stdin(match terminal {
-                Some(terminal) => Stdio::from(clone_file(terminal, "clone PTY stdin")?),
-                None => Stdio::null(),
-            });
-        } else {
-            command.stdin(Stdio::from(next_stdin.take().ok_or_else(|| {
-                RuntimeError::infrastructure("pipeline successor has no stdin link")
-            })?));
-        }
+        let prepared = (|| {
+            let mut command = configured_command(
+                process,
+                &request.scope,
+                context,
+                terminal,
+                terminal.is_some() && index == 0,
+            )?;
+            if index == 0 {
+                command.stdin(match terminal {
+                    Some(terminal) => Stdio::from(clone_file(terminal, "clone PTY stdin")?),
+                    None => Stdio::null(),
+                });
+            } else {
+                command.stdin(Stdio::from(next_stdin.take().ok_or_else(|| {
+                    RuntimeError::infrastructure("pipeline successor has no stdin link")
+                })?));
+            }
 
-        let link = request.pipeline.rest().get(index).map(|link| link.link());
-        match (link, terminal) {
-            (Some(PipeLink::StdoutToStdin), _) => {
-                let (read, write) = create_pipe()?;
-                command.stdout(Stdio::from(write));
-                next_stdin = Some(read);
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stderr,
-                    terminal,
-                    &mut readers,
-                )?;
+            let link = request.pipeline.rest().get(index).map(|link| link.link());
+            match (link, terminal) {
+                (Some(PipeLink::StdoutToStdin), _) => {
+                    let (read, write) = create_pipe()?;
+                    command.stdout(Stdio::from(write));
+                    next_stdin = Some(read);
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stderr,
+                        terminal,
+                        &mut readers,
+                    )?;
+                }
+                (Some(PipeLink::StderrToStdin), _) => {
+                    let (read, write) = create_pipe()?;
+                    command.stderr(Stdio::from(write));
+                    next_stdin = Some(read);
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stdout,
+                        terminal,
+                        &mut readers,
+                    )?;
+                }
+                (Some(PipeLink::StdoutAndStderrToStdin), _) => {
+                    let (read, write) = create_pipe()?;
+                    command.stdout(Stdio::from(clone_file(&write, "clone combined pipe")?));
+                    command.stderr(Stdio::from(write));
+                    next_stdin = Some(read);
+                }
+                (None, _) => {
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stdout,
+                        terminal,
+                        &mut readers,
+                    )?;
+                    configure_unlinked_stream(
+                        &mut command,
+                        OutputStream::Stderr,
+                        terminal,
+                        &mut readers,
+                    )?;
+                }
             }
-            (Some(PipeLink::StderrToStdin), _) => {
-                let (read, write) = create_pipe()?;
-                command.stderr(Stdio::from(write));
-                next_stdin = Some(read);
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stdout,
-                    terminal,
-                    &mut readers,
-                )?;
-            }
-            (Some(PipeLink::StdoutAndStderrToStdin), _) => {
-                let (read, write) = create_pipe()?;
-                command.stdout(Stdio::from(clone_file(&write, "clone combined pipe")?));
-                command.stderr(Stdio::from(write));
-                next_stdin = Some(read);
-            }
-            (None, _) => {
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stdout,
-                    terminal,
-                    &mut readers,
-                )?;
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stderr,
-                    terminal,
-                    &mut readers,
-                )?;
-            }
-        }
 
-        let mut child = match command.spawn() {
+            command.spawn().map_err(|error| {
+                RuntimeError::infrastructure(format!(
+                    "spawn {} for {}: {error}",
+                    process.argv().program(),
+                    request.step
+                ))
+            })
+        })();
+        let mut child = match prepared {
             Ok(child) => child,
             Err(error) => {
                 terminate_children(&mut children, CancelMode::Force);
                 wait_children(&mut children).await;
-                return Err(RuntimeError::new(
-                    RuntimeErrorKind::Infrastructure,
-                    format!(
-                        "spawn {} for {}: {error}",
-                        process.argv().program(),
-                        request.step
-                    ),
-                ));
+                return Err(error);
             }
         };
         if terminal.is_none() {
@@ -595,13 +597,14 @@ fn classify_exit(statuses: &[Option<ExitStatus>], cancelled: bool) -> RunExit {
         RunExit::Success
     } else if let Some(code) = status.code() {
         RunExit::ExitCode(code)
-    } else {
-        let signal = status.signal().unwrap_or(0);
+    } else if let Some(signal) = status.signal() {
         if cancelled && matches!(signal, libc::SIGTERM | libc::SIGKILL) {
             RunExit::Cancelled
         } else {
             RunExit::Signalled { signal }
         }
+    } else {
+        RunExit::InfrastructureFailure("process exited without code or signal".into())
     }
 }
 

@@ -16,6 +16,8 @@ until their corresponding migration lands.
   pipeline realization, output offsets, control, and restart recovery.
 - [vNext language](vnext-language.md): explicit Scope input, three builtins,
   process-local assignments, per-Run PTY, and external-owner diagnostics.
+- [vNext daemon](vnext-daemon.md): runtime assembly, v4 serving, atomic
+  commands, event replay, volatile secrets, and PTY attachment ownership.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.
