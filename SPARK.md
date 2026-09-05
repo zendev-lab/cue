@@ -131,6 +131,9 @@ process 的可观察性。
 
 ## 修订记录
 
+- 2026-08-30：新增独立 `cue-protocol` v4 和 `cue-store-sqlite` provider；wire 从类型上
+  区分幂等 Command 与只读 Query，持久化只保存 vNext Scope/Execution/fact/operation，
+  不继承 v3 session/schedule/resource schema。
 - 2026-08-30：固化 vNext 纯 reducer；每个 Builtin/Run Step 持久记录输入/输出
   ScopeHash，Sequence 传递、Parallel fork/no-merge、Skipped/Cancelled 和重启中断语义
   均由 Core 决定。

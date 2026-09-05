@@ -1,17 +1,17 @@
 use std::{error::Error, fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Unified execution sequence number, displayed as E1, E2, ...
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ExecutionId(pub u64);
 
 /// Durable trigger sequence number, displayed as T1, T2, ...
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ScheduleId(pub u64);
 
 /// Stable process-step identity within one execution, displayed as E1/S1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct StepId {
     pub execution: ExecutionId,
     pub index: u32,
@@ -82,7 +82,9 @@ impl FromStr for ExecutionId {
     type Err = ParseIdError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        parse_prefixed_u64(input, "E", "execution").map(Self)
+        parse_prefixed_u64(input, "E", "execution")
+            .and_then(|value| nonzero_id(value, "execution", input))
+            .map(Self)
     }
 }
 
@@ -90,7 +92,9 @@ impl FromStr for ScheduleId {
     type Err = ParseIdError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        parse_prefixed_u64(input, "T", "schedule").map(Self)
+        parse_prefixed_u64(input, "T", "schedule")
+            .and_then(|value| nonzero_id(value, "schedule", input))
+            .map(Self)
     }
 }
 
@@ -121,6 +125,61 @@ fn parse_prefixed_u64(input: &str, prefix: &str, kind: &'static str) -> Result<u
         return Err(ParseIdError::new(kind, input));
     }
     digits.parse().map_err(|_| ParseIdError::new(kind, input))
+}
+
+fn nonzero_id(value: u64, kind: &'static str, input: &str) -> Result<u64, ParseIdError> {
+    (value > 0)
+        .then_some(value)
+        .ok_or_else(|| ParseIdError::new(kind, input))
+}
+
+impl<'de> Deserialize<'de> for ExecutionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 {
+            return Err(serde::de::Error::custom("execution id must be non-zero"));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for ScheduleId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 {
+            return Err(serde::de::Error::custom("schedule id must be non-zero"));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for StepId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireStepId {
+            execution: ExecutionId,
+            index: u32,
+        }
+
+        let wire = WireStepId::deserialize(deserializer)?;
+        if wire.index == 0 {
+            return Err(serde::de::Error::custom("step index must be non-zero"));
+        }
+        Ok(Self {
+            execution: wire.execution,
+            index: wire.index,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -157,7 +216,19 @@ mod tests {
     #[test]
     fn parse_ids_reject_wrong_prefixes_and_non_digits() {
         assert!("E-1".parse::<ExecutionId>().is_err());
+        assert!("E0".parse::<ExecutionId>().is_err());
+        assert!("T0".parse::<ScheduleId>().is_err());
         assert!("E1/S0".parse::<StepId>().is_err());
+    }
+
+    #[test]
+    fn json_rejects_zero_and_unknown_identity_fields() {
+        assert!(serde_json::from_str::<ExecutionId>("0").is_err());
+        assert!(serde_json::from_str::<ScheduleId>("0").is_err());
+        assert!(serde_json::from_str::<StepId>(r#"{"execution":1,"index":0}"#).is_err());
+        assert!(
+            serde_json::from_str::<StepId>(r#"{"execution":1,"index":1,"extra":true}"#).is_err()
+        );
     }
 
     #[test]

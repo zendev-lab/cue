@@ -8,6 +8,10 @@ until their corresponding migration lands.
 
 - [vNext foundation](vnext-foundation.md): target boundary, closed execution ADT,
   explicit Scope, and bootstrap Composition.
+- [vNext reducer](vnext-reducer.md): durable Step state, Scope propagation,
+  condition/parallel semantics, cancellation, and restart interruption.
+- [vNext protocol and store](vnext-protocol.md): v4 command/query separation,
+  fact replay, operation idempotency, and fresh SQLite provider schema.
 - [Core types](core-types.md): `ExecutionSpec`, plan composition, IDs, states.
 - [Daemon architecture](daemon-architecture.md): state ownership, actors, spawn path, persistence.
 - [IPC protocol](ipc-protocol.md): framing, handshake, requests, responses, events.

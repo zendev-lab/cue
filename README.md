@@ -164,10 +164,16 @@ just pre-commit
 The workspace is split by responsibility:
 
 - `cue-core`: IPC v3 and typed execution/scope/schedule state;
+- `cue-protocol`: strict vNext command/query, fact event, PTY, and framing contract;
+- `cue-store-sqlite`: fresh vNext Scope/Execution/fact/idempotency store provider;
 - `cue-language`: tokenizer, parser, resolver, compiler, completion, highlighting;
 - `cue-daemon`: the single execution/session/resource/PTY/persistence owner;
 - `cue-client`: transport, reconnect, SSH, version checks, and daemon lifecycle;
 - `cue-tui`: an interactive client built on `cue-client` and `cue-language`;
 - `cue-cli`: the installed command aggregator and Maturin companion binaries.
+
+The vNext crates are intentionally isolated while the hard cut is in progress;
+the current binaries still speak IPC v3 until daemon and clients switch as one
+stacked migration.
 
 See [testing](docs/testing.md) and the [design index](docs/design/README.md).
