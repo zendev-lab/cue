@@ -11,11 +11,11 @@ mod plan;
 mod process;
 mod scope;
 
-pub use env::{Env, EnvEdit, EnvKey, EnvPatch, EnvValue};
+pub use env::{Env, EnvEdit, EnvKey, EnvPatch, EnvValue, Sensitivity};
 pub use execution::{
-    BuiltinSuccess, CancelMode, Execution, ExecutionCancelReason, ExecutionError,
-    ExecutionSnapshot, ExecutionState, ExecutionTransition, ReadyStep, SkipReason, StepAction,
-    StepCancelReason, StepFailure, StepRecord, StepState,
+    BuiltinSuccess, CancelMode, Execution, ExecutionError, ExecutionSnapshot, ExecutionState,
+    ExecutionTransition, RunCompletion, SkipReason, StepAction, StepCancelCause, StepFailure,
+    StepRecord, StepState,
 };
 pub use fact::{ExecutionProjection, Fact, FactDraft, FactEvent, OutputStream};
 pub use plan::{
