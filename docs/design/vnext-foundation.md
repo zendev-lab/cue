@@ -104,7 +104,10 @@ canonical ports and combine laws are:
 Extensions may add private ports used by their own providers. Providers depend
 on ports rather than named implementations. Missing, ambiguous, unknown, or
 cyclic dependencies fail composition before the daemon opens admission.
-Multi-provider ports have a deterministic topological order.
+Multi-provider ports have a deterministic topological order. Before/after
+constraints name the port contribution explicitly; ordering one port neither
+requires contributions to other ports nor changes global initialization order.
+Provider initialization follows required-port dependencies.
 
 The resolved Assembly is only a bootstrap artifact. The daemon converts it to
 typed runtime fields and retains a non-sensitive manifest for inspection; the
