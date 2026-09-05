@@ -1,10 +1,9 @@
 # Cue vNext foundation
 
-This document freezes the target contract used to migrate the current IPC v3
-runtime. It is deliberately smaller than the complete delivery plan: dependent
-slices add the reducer, protocol, storage, runner, clients, and external
-producers without reopening these boundaries. The reducer contract is recorded
-in [vnext-reducer.md](vnext-reducer.md).
+This document describes the foundation used to migrate the current IPC v3
+runtime. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the
+public contract; later stack layers implement its reducer, protocol, storage,
+runtime, and clients.
 
 ## Product boundary
 
@@ -52,7 +51,8 @@ Scope is the full immutable snapshot:
 Scope = absolute cwd × Env × umask
 ```
 
-Its identity uses a versioned canonical hash. Parent/delta relationships may be
+Each environment value carries an explicit Normal or Sensitive classification.
+Its identity uses a versioned canonical hash that includes that classification. Parent/delta relationships may be
 recorded as execution history, but are not part of Scope identity.
 
 The Core builtin families are Cd, Env, and Umask. Env uses a map from EnvKey to
@@ -104,7 +104,10 @@ canonical ports and combine laws are:
 Extensions may add private ports used by their own providers. Providers depend
 on ports rather than named implementations. Missing, ambiguous, unknown, or
 cyclic dependencies fail composition before the daemon opens admission.
-Multi-provider ports have a deterministic topological order.
+Multi-provider ports have a deterministic topological order. Before/after
+constraints name the port contribution explicitly; ordering one port neither
+requires contributions to other ports nor changes global initialization order.
+Provider initialization follows required-port dependencies.
 
 The resolved Assembly is only a bootstrap artifact. The daemon converts it to
 typed runtime fields and retains a non-sensitive manifest for inspection; the

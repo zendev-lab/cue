@@ -1,10 +1,10 @@
 # Cue design index
 
-Cue vNext is being built as a hard cut from the current IPC v3 runtime. The
-vNext contract is frozen in the first document below; the remaining documents
-describe the implementation being replaced until their corresponding migration
-lands. Source types and strict wire validators remain authoritative when prose
-and code disagree.
+Cue vNext is being built as a hard cut from the current IPC v3 runtime.
+[FP-0001](../../fps/FP-0001-structured-execution-kernel.md) defines the public
+execution contract under [FP-0000](../../fps/FP-0000-governance.md).
+The vNext documents describe its implementation; the IPC v3 documents remain
+until their corresponding migration lands.
 
 - [vNext foundation](vnext-foundation.md): target boundary, closed execution ADT,
   explicit Scope, and bootstrap Composition.

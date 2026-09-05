@@ -5,11 +5,11 @@
 //! resulting [`Assembly`] is a bootstrap artifact; execution code receives
 //! typed fields built from it rather than looking services up dynamically.
 
+mod builtin;
 mod composition;
 mod output;
 mod ports;
 mod provider;
-mod recovery;
 mod runner;
 
 pub use composition::{
@@ -22,7 +22,8 @@ pub use provider::{
     AssemblyBindingError, ExecutionObserver, ExecutionStore, OutputAppend, OutputSlice,
     OutputStore, ProcessSpawner, ProviderBundle, ProviderRegistry, RunControl, RunExit,
     RuntimeAssembly, RuntimeError, RuntimeErrorKind, RuntimeFuture, ScopeDurability, ScopeStore,
-    SpawnGuard, SpawnRequest, SpawnTransform, SpawnedRun, TerminalSize, Workspace,
+    SpawnContext, SpawnGuard, SpawnRequest, SpawnTransform, SpawnedRun, TerminalSize, Workspace,
 };
-pub use recovery::{RecoveryCommit, recover_interrupted};
 pub use runner::LocalProcessSpawner;
+
+pub use builtin::realize_builtin;

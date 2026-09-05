@@ -11,9 +11,10 @@ At startup the daemon resolves the canonical runtime ports through
 resolved scope store, execution store, output store, and process spawner; it
 does not query a service locator while executing work.
 
-Recovery reads every non-terminal projection. Any step persisted as `Running`
-is first failed as an infrastructure interruption, committed as facts, and
-then passed back through normal reducer advancement.
+Recovery reclaims durable runtime work only after exclusive host ownership.
+Unstarted Runs and replayable builtins may resume. A persisted physical Run
+attempt with unknown ownership rejects startup before replay or new facts;
+losing the supervisor does not establish process quiescence.
 
 ## Command boundary
 
@@ -26,8 +27,8 @@ store together with their effect:
 - replay returns the original response without repeating the effect;
 - reuse with a different typed command is a conflict;
 - expired response bodies leave permanent at-most-once tombstones;
-- secret-bearing scopes, executions, facts, and operation responses remain in
-  memory and disappear on restart.
+- explicitly Sensitive environment values are rejected as unsupported before
+  persistence; names never infer sensitivity.
 
 The wire format is strict IPC v4 framing: a four-byte big-endian payload length
 followed by one validated message. Unknown fields, wrong message roles, and
@@ -36,8 +37,11 @@ oversized frames are rejected.
 ## Execution and observation
 
 Submission persists `ExecutionCreated` before scheduling. The daemon asks the
-pure reducer for ready leaves, marks them running, commits the projection and
-facts, and only then realizes builtins or processes. Builtins are exactly
+pure reducer to atomically transition ready leaves to Running and return their
+StepIds. It commits the candidate snapshot, facts, and durable follow-up work
+before updating live state or publishing. Claimed workers read the latest
+snapshot, and persist an attempt marker before physically starting a Run.
+Generation-aware acknowledgements preserve newer cancellation work. Builtins are exactly
 `Cd`, `Env`, and `Umask`; runs use the typed local pipeline runner. Completion
 returns to the reducer, including Sequence scope threading and Parallel
 fork/no-merge behavior.
