@@ -442,6 +442,7 @@ dependencies = [
  "crossterm",
  "cue-client",
  "cue-core",
+ "cue-daemon",
  "cue-language",
  "cue-protocol",
  "ratatui",

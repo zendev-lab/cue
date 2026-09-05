@@ -3,16 +3,14 @@
 pub mod cli;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use cue_client::{VnextClient, VnextMultiplexedClient, process_scope};
-use cue_core::vnext::{CancelMode, Fact, OutputStream};
-use cue_core::{ExecutionId, StepId};
-use cue_language::{
-    Mode, OutputSelection, OutputTarget, VnextCommand, VnextFrontendAction, compile_vnext_command,
-};
-use cue_protocol::{Command, EventPayload, ExecutionView, OutputRange, Query, ResultPayload};
+use cue_client::{SurfaceOutcome, VnextClient, VnextMultiplexedClient, process_scope};
+use cue_core::vnext::Fact;
+use cue_language::{Mode, VnextCommand, VnextFrontendAction, compile_vnext_command};
+use cue_protocol::{Command, EventPayload, ExecutionView, Query, ResultPayload};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -23,11 +21,14 @@ pub fn run_cli() -> Result<()> {
 }
 
 pub async fn run(socket: PathBuf) -> Result<()> {
-    let client = VnextClient::connect(&socket)
-        .await
-        .with_context(|| format!("connect to {}", socket.display()))?
-        .into_multiplexed();
+    let client = Arc::new(
+        VnextClient::connect(&socket)
+            .await
+            .with_context(|| format!("connect to {}", socket.display()))?
+            .into_multiplexed(),
+    );
     let mut state = State::default();
+    let mut pending = tokio::task::JoinSet::<Result<ResultPayload>>::new();
     refresh(&client, &mut state).await?;
 
     let mut terminal = ratatui::init();
@@ -44,11 +45,18 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, &state))?;
         tokio::select! {
+            completed = pending.join_next(), if !pending.is_empty() => {
+                match completed.unwrap() {
+                    Ok(Ok(result)) => apply_result(&client, &mut state, result).await?,
+                    Ok(Err(error)) => state.log.push(error.to_string()),
+                    Err(error) => state.log.push(format!("request failed: {error}")),
+                }
+            }
             event = key_rx.recv() => {
                 let Some(event) = event else {
                     break;
                 };
-                if handle_event(event, &client, &mut state).await? {
+                if handle_event(event, &client, &mut state, &mut pending)? {
                     break;
                 }
             }
@@ -81,10 +89,11 @@ struct State {
     notice: String,
 }
 
-async fn handle_event(
+fn handle_event(
     event: Event,
-    client: &VnextMultiplexedClient,
+    client: &Arc<VnextMultiplexedClient>,
     state: &mut State,
+    pending: &mut tokio::task::JoinSet<Result<ResultPayload>>,
 ) -> Result<bool> {
     let Event::Key(key) = event else {
         return Ok(false);
@@ -104,7 +113,7 @@ async fn handle_event(
         }
         KeyCode::Enter => {
             let source = std::mem::take(&mut state.input);
-            if !source.trim().is_empty() && dispatch(client, state, &source).await? {
+            if !source.trim().is_empty() && dispatch(client, state, &source, pending)? {
                 return Ok(true);
             }
         }
@@ -113,21 +122,14 @@ async fn handle_event(
     Ok(false)
 }
 
-async fn dispatch(
-    client: &VnextMultiplexedClient,
+fn dispatch(
+    client: &Arc<VnextMultiplexedClient>,
     state: &mut State,
     source: &str,
+    pending: &mut tokio::task::JoinSet<Result<ResultPayload>>,
 ) -> Result<bool> {
     let scope = process_scope()?;
-    let stored = client
-        .command(Command::PutScope {
-            scope: Box::new(scope),
-        })
-        .await?;
-    let ResultPayload::ScopeStored { hash, .. } = stored else {
-        bail!("daemon returned an unexpected PutScope response")
-    };
-    let command = match compile_vnext_command(source, Mode::Job, hash) {
+    let command = match compile_vnext_command(source, Mode::Job, scope.compute_hash()) {
         Ok(command) => command,
         Err(error) => {
             state.log.push(error.to_string());
@@ -135,66 +137,79 @@ async fn dispatch(
         }
     };
     match command {
-        VnextCommand::Submit(spec) => {
-            let submitted = client
-                .command(Command::SubmitExecution {
-                    spec: Box::new(spec),
-                })
-                .await?;
-            let ResultPayload::ExecutionSubmitted { execution } = submitted else {
-                bail!("daemon returned an unexpected SubmitExecution response")
-            };
-            client
-                .command(Command::WatchExecution {
-                    id: execution.snapshot.id,
-                    after_event: None,
-                })
-                .await?;
-            state
-                .log
-                .push(format!("submitted {}", execution.snapshot.id));
-            refresh(client, state).await?;
-        }
-        VnextCommand::ListExecutions => refresh(client, state).await?,
-        VnextCommand::GetExecution { id } => {
-            append_json(state, client.query(Query::GetExecution { id }).await?)?;
-        }
-        VnextCommand::WaitExecution { id } => {
-            append_json(state, client.query(Query::WaitExecution { id }).await?)?;
-            refresh(client, state).await?;
-        }
-        VnextCommand::ReadOutput {
-            target,
-            stream,
-            tail_bytes,
-        } => read_output(client, state, target, stream, tail_bytes).await?,
-        VnextCommand::CancelExecution { id, force } => {
-            client
-                .command(Command::CancelExecution {
-                    id,
-                    mode: if force {
-                        CancelMode::Force
-                    } else {
-                        CancelMode::Graceful
-                    },
-                })
-                .await?;
-            refresh(client, state).await?;
-        }
         VnextCommand::AttachPty { step, .. } => state.log.push(format!(
             "PTY {step} needs terminal passthrough; run `cue fg {step}`"
         )),
         VnextCommand::Frontend(VnextFrontendAction::Clear) => state.log.clear(),
         VnextCommand::Frontend(VnextFrontendAction::Quit) => return Ok(true),
-        VnextCommand::Frontend(VnextFrontendAction::Restart) => {
-            append_json(state, client.command(Command::Restart).await?)?;
-        }
         VnextCommand::Frontend(VnextFrontendAction::Help { .. }) => state.log.push(
             "run commands directly; :jobs, :log E1, :wait E1, :out E1/S1, :cancel E1, :fg E1/S1"
                 .into(),
         ),
+        command => {
+            if pending.len() >= 64 {
+                state
+                    .log
+                    .push("too many pending requests; wait for one to finish".into());
+                return Ok(false);
+            }
+            let client = client.clone();
+            pending.spawn(async move {
+                if matches!(
+                    command,
+                    VnextCommand::Frontend(VnextFrontendAction::Restart)
+                ) {
+                    return client.command(Command::Restart).await;
+                }
+                let SurfaceOutcome::Response(result) =
+                    client.execute_compiled(scope, command).await?
+                else {
+                    bail!("unexpected frontend action");
+                };
+                if let ResultPayload::ExecutionSubmitted { execution } = &result {
+                    client
+                        .command(Command::WatchExecution {
+                            id: execution.snapshot.id,
+                            after_event: None,
+                        })
+                        .await?;
+                }
+                Ok(result)
+            });
+        }
     }
     Ok(false)
+}
+
+async fn apply_result(
+    client: &VnextMultiplexedClient,
+    state: &mut State,
+    result: ResultPayload,
+) -> Result<()> {
+    match result {
+        ResultPayload::Executions { executions, .. } => state.executions = executions,
+        ResultPayload::ExecutionSubmitted { execution } => {
+            state
+                .log
+                .push(format!("submitted {}", execution.snapshot.id));
+            refresh(client, state).await?;
+        }
+        result @ ResultPayload::Execution { .. } => {
+            append_json(state, result)?;
+            refresh(client, state).await?;
+        }
+        ResultPayload::Output { chunks } => {
+            let bytes = chunks
+                .into_iter()
+                .flat_map(|chunk| chunk.data)
+                .collect::<Vec<_>>();
+            state
+                .log
+                .extend(String::from_utf8_lossy(&bytes).lines().map(str::to_owned));
+        }
+        result => append_json(state, result)?,
+    }
+    Ok(())
 }
 
 async fn refresh(client: &VnextMultiplexedClient, state: &mut State) -> Result<()> {
@@ -209,69 +224,6 @@ async fn refresh(client: &VnextMultiplexedClient, state: &mut State) -> Result<(
     };
     state.executions = executions;
     Ok(())
-}
-
-async fn read_output(
-    client: &VnextMultiplexedClient,
-    state: &mut State,
-    target: OutputTarget,
-    stream: OutputSelection,
-    tail_bytes: Option<usize>,
-) -> Result<()> {
-    let step = match target {
-        OutputTarget::Step(step) => step,
-        OutputTarget::Execution(id) => last_step(client, id).await?,
-    };
-    let range = OutputRange {
-        offset: 0,
-        max_bytes: tail_bytes.unwrap_or(1024 * 1024).min(u32::MAX as usize) as u32,
-    };
-    let empty = OutputRange {
-        offset: 0,
-        max_bytes: 0,
-    };
-    let result = client
-        .query(Query::ReadOutput {
-            step,
-            stdout: if stream == OutputSelection::Stdout {
-                range.clone()
-            } else {
-                empty.clone()
-            },
-            stderr: if stream == OutputSelection::Stderr {
-                range
-            } else {
-                empty.clone()
-            },
-            terminal: empty,
-        })
-        .await?;
-    let ResultPayload::Output { chunks } = result else {
-        bail!("daemon returned an unexpected ReadOutput response")
-    };
-    let selected = if stream == OutputSelection::Stdout {
-        OutputStream::Stdout
-    } else {
-        OutputStream::Stderr
-    };
-    let bytes = cue_client::vnext::output_bytes(&chunks, selected);
-    state
-        .log
-        .extend(String::from_utf8_lossy(&bytes).lines().map(str::to_owned));
-    Ok(())
-}
-
-async fn last_step(client: &VnextMultiplexedClient, id: ExecutionId) -> Result<StepId> {
-    let ResultPayload::Execution { execution } = client.query(Query::GetExecution { id }).await?
-    else {
-        bail!("daemon returned an unexpected GetExecution response")
-    };
-    execution
-        .snapshot
-        .steps
-        .last()
-        .map(|step| step.id())
-        .ok_or_else(|| anyhow::anyhow!("execution {id} has no steps"))
 }
 
 fn append_json(state: &mut State, value: impl serde::Serialize) -> Result<()> {
@@ -363,6 +315,117 @@ impl Drop for TerminalRestore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cue_core::ExecutionId;
+    use std::time::Duration;
+
+    async fn client() -> (
+        Arc<VnextMultiplexedClient>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let service = cue_daemon::vnext::VnextService::in_memory().unwrap();
+        let (stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            cue_daemon::vnext::serve_stream(service, server_stream)
+                .await
+                .map_err(anyhow::Error::from)
+        });
+        let client = VnextClient::connect_stream(
+            stream,
+            cue_protocol::ClientId::new("tui-regression").unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_multiplexed();
+        (Arc::new(client), server)
+    }
+
+    async fn completed(pending: &mut tokio::task::JoinSet<Result<ResultPayload>>) -> ResultPayload {
+        tokio::time::timeout(Duration::from_secs(3), pending.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dispatch_keeps_queries_help_and_errors_read_only_and_tails_the_suffix() {
+        let (client, server) = client().await;
+        let mut state = State::default();
+        let mut pending = tokio::task::JoinSet::new();
+        let hash = process_scope().unwrap().compute_hash();
+        for source in [
+            ":jobs",
+            ":help",
+            ":log E999",
+            ":wait E999",
+            ":out E999",
+            ":cancel",
+        ] {
+            assert!(!dispatch(&client, &mut state, source, &mut pending).unwrap());
+            while !pending.is_empty() {
+                let _ = tokio::time::timeout(Duration::from_secs(3), pending.join_next())
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                client.query(Query::GetScope { hash }).await.is_err(),
+                "{source}"
+            );
+        }
+        dispatch(
+            &client,
+            &mut state,
+            "/usr/bin/printf abcdefghij",
+            &mut pending,
+        )
+        .unwrap();
+        let result = completed(&mut pending).await;
+        let ResultPayload::ExecutionSubmitted { ref execution } = result else {
+            panic!("submit")
+        };
+        let id = execution.snapshot.id;
+        apply_result(&client, &mut state, result).await.unwrap();
+        client.query(Query::WaitExecution { id }).await.unwrap();
+        state.log.clear();
+        dispatch(&client, &mut state, &format!(":tail {id} 4"), &mut pending).unwrap();
+        apply_result(&client, &mut state, completed(&mut pending).await)
+            .await
+            .unwrap();
+        assert_eq!(state.log, vec!["ghij"]);
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_leaves_editing_cancel_and_escape_responsive() {
+        let (client, server) = client().await;
+        let mut state = State::default();
+        let mut pending = tokio::task::JoinSet::new();
+        dispatch(&client, &mut state, "/bin/sleep 30", &mut pending).unwrap();
+        let ResultPayload::ExecutionSubmitted { execution } = completed(&mut pending).await else {
+            panic!("submit")
+        };
+        let id = execution.snapshot.id;
+        state.input = format!(":wait {id}");
+        let key = |code| Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE));
+        assert!(!handle_event(key(KeyCode::Enter), &client, &mut state, &mut pending).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), pending.join_next())
+                .await
+                .is_err()
+        );
+        assert!(!handle_event(key(KeyCode::Char('x')), &client, &mut state, &mut pending).unwrap());
+        assert_eq!(state.input, "x");
+        assert!(handle_event(key(KeyCode::Esc), &client, &mut state, &mut pending).unwrap());
+        state.input = format!(":cancel {id}");
+        assert!(!handle_event(key(KeyCode::Enter), &client, &mut state, &mut pending).unwrap());
+        for _ in 0..2 {
+            let _ = completed(&mut pending).await;
+        }
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
 
     #[test]
     fn fact_summary_uses_vnext_execution_identity() {
