@@ -8,6 +8,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -175,16 +176,14 @@ fn import_layout_context(destination: &Connection, layout: &LegacyLayout) -> Res
         write_marker(&layout.marker, "legacy archive had no database\n")?;
         return Ok(());
     }
-    let source = Connection::open_with_flags(&source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let source_uri = immutable_sqlite_uri(&source_path);
+    let source = open_immutable_archive_db(&source_uri)
         .with_context(|| format!("open archived database {}", source_path.display()))?;
     validate_legacy_schema(&source)?;
 
     drop(source);
-    destination.execute(
-        "ATTACH DATABASE ?1 AS legacy",
-        [source_path.to_string_lossy().as_ref()],
-    )?;
-    destination.execute_batch("BEGIN IMMEDIATE")?;
+    destination.execute("ATTACH DATABASE ?1 AS legacy", [&source_uri])?;
+    destination.execute_batch("BEGIN")?;
     let imported = destination
         .execute_batch(
             "INSERT OR IGNORE INTO scopes (hash, parent, delta_json, snap_json)
@@ -196,9 +195,14 @@ fn import_layout_context(destination: &Connection, layout: &LegacyLayout) -> Res
              SELECT id, name, scope_hash, pty_default, wrapper_enabled, created_at_ms, updated_at_ms
              FROM legacy.sessions;",
         )
-        .context("copy archived context rows");
+        .context("copy archived context rows")
+        .and_then(|()| {
+            destination
+                .execute_batch("COMMIT")
+                .context("commit archived context rows")
+        });
     match imported {
-        Ok(()) => destination.execute_batch("COMMIT")?,
+        Ok(()) => {}
         Err(error) => {
             let _ = destination.execute_batch("ROLLBACK");
             let _ = destination.execute_batch("DETACH DATABASE legacy");
@@ -207,6 +211,26 @@ fn import_layout_context(destination: &Connection, layout: &LegacyLayout) -> Res
     }
     destination.execute_batch("DETACH DATABASE legacy")?;
     write_marker(&layout.marker, "scopes and sessions imported\n")
+}
+
+fn open_immutable_archive_db(uri: &str) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    Connection::open_with_flags(uri, flags).map_err(Into::into)
+}
+
+fn immutable_sqlite_uri(path: &Path) -> String {
+    let mut uri = b"file:".to_vec();
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(*byte);
+        } else {
+            uri.extend_from_slice(format!("%{byte:02X}").as_bytes());
+        }
+    }
+    uri.extend_from_slice(b"?mode=ro&immutable=1");
+    String::from_utf8(uri).expect("percent-encoded SQLite URI must be ASCII")
 }
 
 fn ensure_legacy_daemon_stopped(runtime: &Path) -> Result<()> {
@@ -550,6 +574,38 @@ mod tests {
             .query_row("SELECT snap_json FROM scopes", [], |row| row.get(0))
             .expect("volatile scope");
         assert!(volatile.is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn imports_read_only_archive_into_disk_database() {
+        let root = test_root("read only #?% disk import");
+        let layout = test_layout(&root);
+        let legacy_db = layout.data.join("cued.db");
+        create_legacy_db(&legacy_db, false);
+        let source = Connection::open(&legacy_db).expect("reopen legacy database");
+        source
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable legacy WAL mode");
+        drop(source);
+        prepare_layout(&layout).expect("prepare read-only archive");
+
+        let destination_path = root.join("new-data/cue/cued.db");
+        let destination =
+            crate::storage::open_db(&destination_path).expect("open disk destination");
+
+        import_layout_context(&destination, &layout)
+            .expect("import read-only archive into disk destination");
+
+        let scopes: u32 = destination
+            .query_row("SELECT COUNT(*) FROM scopes", [], |row| row.get(0))
+            .expect("scope count");
+        let sessions: u32 = destination
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("session count");
+        assert_eq!((scopes, sessions), (1, 1));
+        assert!(layout.marker.exists());
+        drop(destination);
         cleanup(&root);
     }
 
