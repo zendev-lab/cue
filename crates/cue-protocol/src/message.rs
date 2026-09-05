@@ -58,6 +58,11 @@ pub enum Query {
     WaitExecution {
         id: ExecutionId,
     },
+    TailOutput {
+        step: StepId,
+        stream: OutputStream,
+        max_bytes: u32,
+    },
     ReadOutput {
         step: StepId,
         stdout: OutputRange,
