@@ -853,7 +853,10 @@ mod tests {
             .spawn(
                 SpawnRequest {
                     step: step(),
-                    pipeline: Pipeline::simple(process("/bin/echo", &["pty-ok"])),
+                    pipeline: Pipeline::simple(process(
+                        "/bin/sh",
+                        &["-c", "read line; /bin/stty size; printf '%s\\n' \"$line\""],
+                    )),
                     io: IoMode::Pty,
                     scope: scope(),
                 },
@@ -865,12 +868,14 @@ mod tests {
             .resize(TerminalSize::new(100, 30).unwrap())
             .await
             .unwrap();
+        run.control.input(b"pty-ok\n".to_vec()).await.unwrap();
         assert_eq!(run.wait().await, RunExit::Success);
         let terminal = output
             .tail(step(), OutputStream::Terminal, 1024)
             .unwrap()
             .data;
         assert!(String::from_utf8_lossy(&terminal).contains("pty-ok"));
+        assert!(String::from_utf8_lossy(&terminal).contains("30 100"));
         assert!(
             output
                 .tail(step(), OutputStream::Stdout, 1024)
