@@ -881,6 +881,25 @@ impl VnextConnection {
                             execution: Box::new(view(&execution)),
                         }))
                     }
+                    Query::TailOutput {
+                        step,
+                        stream,
+                        max_bytes,
+                    } => {
+                        let maximum = usize::try_from(max_bytes)
+                            .unwrap_or(OUTPUT_READ_LIMIT)
+                            .min(OUTPUT_READ_LIMIT);
+                        let slice = self.service.output.tail(step, stream, maximum)?;
+                        Ok(ResponsePayload::Ok(ResultPayload::Output {
+                            chunks: vec![OutputChunk {
+                                step,
+                                stream,
+                                offset: slice.offset,
+                                data: slice.data,
+                                eof: true,
+                            }],
+                        }))
+                    }
                     Query::ReadOutput {
                         step,
                         stdout,
