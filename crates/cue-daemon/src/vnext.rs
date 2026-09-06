@@ -1424,7 +1424,17 @@ impl VnextConnection {
             next_offset: snapshot.next_offset,
         });
         match self.record_plain(client, operation, command, &response)? {
-            replay if replay != response => Ok(replay),
+            replay if replay != response => {
+                if let ResponsePayload::Ok(ResultPayload::PtyAttached { attachment, .. }) = &replay
+                {
+                    let attachments = self.service.lock_attachments()?;
+                    if require_attachment_owner(&attachments, *attachment, client, self.id).is_err()
+                    {
+                        return Err(operation_expired());
+                    }
+                }
+                Ok(replay)
+            }
             _ => {
                 self.service.lock_attachments()?.insert(
                     attachment,
