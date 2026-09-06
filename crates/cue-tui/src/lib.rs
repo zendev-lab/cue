@@ -28,8 +28,13 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             .into_multiplexed(),
     );
     let mut state = State::default();
-    let mut pending = tokio::task::JoinSet::<Result<ResultPayload>>::new();
-    refresh(&client, &mut state).await?;
+    let mut pending = PendingRequests::default();
+    apply_result(
+        &client,
+        &mut state,
+        &mut pending,
+        list_executions(&client).await?,
+    )?;
 
     let mut terminal = ratatui::init();
     let _restore = TerminalRestore;
@@ -46,10 +51,14 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         terminal.draw(|frame| draw(frame, &state))?;
         tokio::select! {
             completed = pending.join_next(), if !pending.is_empty() => {
-                match completed.unwrap() {
-                    Ok(Ok(result)) => apply_result(&client, &mut state, result).await?,
+                let (refresh, completed) = completed.unwrap();
+                match completed {
+                    Ok(Ok(result)) => apply_result(&client, &mut state, &mut pending, result)?,
                     Ok(Err(error)) => state.log.push(error.to_string()),
                     Err(error) => state.log.push(format!("request failed: {error}")),
+                }
+                if refresh && pending.refresh_again {
+                    pending.request_refresh(&client);
                 }
             }
             event = key_rx.recv() => {
@@ -64,7 +73,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
                 match event {
                     Some(EventPayload::Fact(fact)) => {
                         state.notice = fact_summary(&fact.fact);
-                        refresh(&client, &mut state).await?;
+                        pending.request_refresh(&client);
                     }
                     Some(EventPayload::ServerDraining { reason }) => {
                         state.notice = format!("daemon draining: {reason}");
@@ -81,6 +90,44 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     Ok(())
 }
 
+type CompletedRequest = Result<Result<ResultPayload>, tokio::task::JoinError>;
+
+#[derive(Default)]
+struct PendingRequests {
+    commands: tokio::task::JoinSet<Result<ResultPayload>>,
+    waits: tokio::task::JoinSet<Result<ResultPayload>>,
+    refreshes: tokio::task::JoinSet<Result<ResultPayload>>,
+    refresh_again: bool,
+}
+
+impl PendingRequests {
+    fn is_empty(&self) -> bool {
+        self.commands.is_empty() && self.waits.is_empty() && self.refreshes.is_empty()
+    }
+
+    async fn join_next(&mut self) -> Option<(bool, CompletedRequest)> {
+        if self.is_empty() {
+            return None;
+        }
+        tokio::select! {
+            result = self.commands.join_next(), if !self.commands.is_empty() => result.map(|result| (false, result)),
+            result = self.waits.join_next(), if !self.waits.is_empty() => result.map(|result| (false, result)),
+            result = self.refreshes.join_next(), if !self.refreshes.is_empty() => result.map(|result| (true, result)),
+        }
+    }
+
+    fn request_refresh(&mut self, client: &Arc<MultiplexedClient>) {
+        if !self.refreshes.is_empty() {
+            self.refresh_again = true;
+            return;
+        }
+        self.refresh_again = false;
+        let client = client.clone();
+        self.refreshes
+            .spawn(async move { list_executions(&client).await });
+    }
+}
+
 #[derive(Default)]
 struct State {
     input: String,
@@ -93,7 +140,7 @@ fn handle_event(
     event: Event,
     client: &Arc<MultiplexedClient>,
     state: &mut State,
-    pending: &mut tokio::task::JoinSet<Result<ResultPayload>>,
+    pending: &mut PendingRequests,
 ) -> Result<bool> {
     let Event::Key(key) = event else {
         return Ok(false);
@@ -126,7 +173,7 @@ fn dispatch(
     client: &Arc<MultiplexedClient>,
     state: &mut State,
     source: &str,
-    pending: &mut tokio::task::JoinSet<Result<ResultPayload>>,
+    pending: &mut PendingRequests,
 ) -> Result<bool> {
     let scope = process_scope()?;
     let command = match compile_command(source, Mode::Job, scope.compute_hash()) {
@@ -147,14 +194,19 @@ fn dispatch(
                 .into(),
         ),
         command => {
-            if pending.len() >= 64 {
+            let requests = if matches!(command, SurfaceCommand::WaitExecution { .. }) {
+                &mut pending.waits
+            } else {
+                &mut pending.commands
+            };
+            if requests.len() >= 64 {
                 state
                     .log
                     .push("too many pending requests; wait for one to finish".into());
                 return Ok(false);
             }
             let client = client.clone();
-            pending.spawn(async move {
+            requests.spawn(async move {
                 if matches!(command, SurfaceCommand::Frontend(FrontendAction::Restart)) {
                     return client.command(Command::Restart).await;
                 }
@@ -178,9 +230,10 @@ fn dispatch(
     Ok(false)
 }
 
-async fn apply_result(
-    client: &MultiplexedClient,
+fn apply_result(
+    client: &Arc<MultiplexedClient>,
     state: &mut State,
+    pending: &mut PendingRequests,
     result: ResultPayload,
 ) -> Result<()> {
     match result {
@@ -189,11 +242,11 @@ async fn apply_result(
             state
                 .log
                 .push(format!("submitted {}", execution.snapshot.id));
-            refresh(client, state).await?;
+            pending.request_refresh(client);
         }
         result @ ResultPayload::Execution { .. } => {
             append_json(state, result)?;
-            refresh(client, state).await?;
+            pending.request_refresh(client);
         }
         ResultPayload::Output { chunks } => {
             let bytes = chunks
@@ -209,18 +262,13 @@ async fn apply_result(
     Ok(())
 }
 
-async fn refresh(client: &MultiplexedClient, state: &mut State) -> Result<()> {
-    let result = client
+async fn list_executions(client: &MultiplexedClient) -> Result<ResultPayload> {
+    client
         .query(Query::ListExecutions {
             before: None,
             limit: 100,
         })
-        .await?;
-    let ResultPayload::Executions { executions, .. } = result else {
-        bail!("daemon returned an unexpected ListExecutions response")
-    };
-    state.executions = executions;
-    Ok(())
+        .await
 }
 
 fn append_json(state: &mut State, value: impl serde::Serialize) -> Result<()> {
@@ -333,11 +381,12 @@ mod tests {
         (Arc::new(client), server)
     }
 
-    async fn completed(pending: &mut tokio::task::JoinSet<Result<ResultPayload>>) -> ResultPayload {
+    async fn completed(pending: &mut PendingRequests) -> ResultPayload {
         tokio::time::timeout(Duration::from_secs(3), pending.join_next())
             .await
             .unwrap()
             .unwrap()
+            .1
             .unwrap()
             .unwrap()
     }
@@ -346,7 +395,7 @@ mod tests {
     async fn dispatch_keeps_queries_help_and_errors_read_only_and_tails_the_suffix() {
         let (client, server) = client().await;
         let mut state = State::default();
-        let mut pending = tokio::task::JoinSet::new();
+        let mut pending = PendingRequests::default();
         let hash = process_scope().unwrap().compute_hash();
         for source in [
             ":jobs",
@@ -379,13 +428,15 @@ mod tests {
             panic!("submit")
         };
         let id = execution.snapshot.id;
-        apply_result(&client, &mut state, result).await.unwrap();
+        apply_result(&client, &mut state, &mut pending, result).unwrap();
+        while !pending.is_empty() {
+            let _ = completed(&mut pending).await;
+        }
         client.query(Query::WaitExecution { id }).await.unwrap();
         state.log.clear();
         dispatch(&client, &mut state, &format!(":tail {id} 4"), &mut pending).unwrap();
-        apply_result(&client, &mut state, completed(&mut pending).await)
-            .await
-            .unwrap();
+        let result = completed(&mut pending).await;
+        apply_result(&client, &mut state, &mut pending, result).unwrap();
         assert_eq!(state.log, vec!["ghij"]);
         drop(client);
         server.await.unwrap().unwrap();
@@ -395,7 +446,7 @@ mod tests {
     async fn waiting_leaves_editing_cancel_and_escape_responsive() {
         let (client, server) = client().await;
         let mut state = State::default();
-        let mut pending = tokio::task::JoinSet::new();
+        let mut pending = PendingRequests::default();
         dispatch(&client, &mut state, "/bin/sleep 30", &mut pending).unwrap();
         let ResultPayload::ExecutionSubmitted { execution } = completed(&mut pending).await else {
             panic!("submit")
@@ -417,6 +468,36 @@ mod tests {
         for _ in 0..2 {
             let _ = completed(&mut pending).await;
         }
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_wait_queue_still_accepts_cancel_and_refresh() {
+        let (client, server) = client().await;
+        let mut state = State::default();
+        let mut pending = PendingRequests::default();
+        dispatch(&client, &mut state, "/bin/sleep 30", &mut pending).unwrap();
+        let ResultPayload::ExecutionSubmitted { execution } = completed(&mut pending).await else {
+            panic!("submit")
+        };
+        let id = execution.snapshot.id;
+        for _ in 0..64 {
+            dispatch(&client, &mut state, &format!(":wait {id}"), &mut pending).unwrap();
+        }
+        assert_eq!(pending.waits.len(), 64);
+        pending.request_refresh(&client);
+        dispatch(&client, &mut state, &format!(":cancel {id}"), &mut pending).unwrap();
+        assert_eq!(pending.commands.len(), 1);
+        while !pending.is_empty() {
+            let _ = completed(&mut pending).await;
+        }
+        let ResultPayload::Execution { execution } =
+            client.query(Query::GetExecution { id }).await.unwrap()
+        else {
+            panic!("execution")
+        };
+        assert_eq!(execution.state, cue_core::ExecutionState::Cancelled);
         drop(client);
         server.await.unwrap().unwrap();
     }

@@ -432,6 +432,7 @@ struct Attachment {
     client: ClientId,
     step: StepId,
     role: PtyRole,
+    input_cancel: tokio::sync::watch::Sender<()>,
 }
 
 impl DaemonService {
@@ -1118,49 +1119,22 @@ impl DaemonConnection {
             Command::DetachPty { .. }
                 | Command::ClaimPtyControl { .. }
                 | Command::ReleasePtyControl { .. }
-                | Command::PtyInput { .. }
                 | Command::PtyResize { .. }
         );
         if !external {
             return self.handle_command_effect(operation, command).await;
         }
         let client = self.require_client()?.clone();
-        match self
-            .service
-            .store
-            .lock_store()?
-            .record_operation(&client, &operation, &command, None, now_ms())
-            .map_err(store_error)?
+        if let Some(response) =
+            claim_external_operation(&self.service.store, &client, &operation, &command)?
         {
-            OperationRecord::Inserted => {}
-            OperationRecord::Replay {
-                response: Some(response),
-            } => return Ok(response),
-            OperationRecord::Replay { response: None } => return Err(operation_expired()),
-            OperationRecord::Conflict { .. } => return Err(operation_conflict()),
+            return Ok(response);
         }
         let response = self
             .handle_command_effect(operation.clone(), command.clone())
             .await
             .unwrap_or_else(protocol_error);
-        if !self
-            .service
-            .store
-            .lock_store()?
-            .finish_claimed_operation(OperationCommit {
-                client: &client,
-                operation: &operation,
-                command: &command,
-                response: Some(&response),
-                completed_at_ms: now_ms(),
-            })
-            .map_err(store_error)?
-        {
-            return Err(RuntimeError::infrastructure(
-                "external operation claim was lost",
-            ));
-        }
-        Ok(response)
+        finish_external_operation(&self.service.store, &client, &operation, &command, response)
     }
 
     async fn handle_command_effect(
@@ -1264,10 +1238,13 @@ impl DaemonConnection {
                 Ok(response)
             }
             Command::PtyInput { attachment, data } => {
-                let control = self.pty_control(&client, *attachment).await?;
-                control.input(data.clone()).await?;
-                let response = ResponsePayload::ack();
-                Ok(response)
+                match self
+                    .prepare_pty_input(operation, *attachment, data.clone(), true)
+                    .await?
+                {
+                    PreparedPtyInput::Complete(response) => Ok(response),
+                    PreparedPtyInput::Pending(input) => input.await,
+                }
             }
             Command::PtyResize {
                 attachment,
@@ -1554,6 +1531,7 @@ impl DaemonConnection {
                         client: client.clone(),
                         step,
                         role: PtyRole::Observer,
+                        input_cancel: tokio::sync::watch::channel(()).0,
                     },
                 );
                 Ok(response)
@@ -1590,12 +1568,76 @@ impl DaemonConnection {
         let attachment = attachments.get_mut(&id).ok_or_else(|| {
             RuntimeError::new(RuntimeErrorKind::NotFound, "PTY attachment disappeared")
         })?;
+        if !claim {
+            attachment.input_cancel.send_replace(());
+        }
         attachment.role = if claim {
             PtyRole::Controller
         } else {
             PtyRole::Observer
         };
         Ok(())
+    }
+
+    async fn prepare_pty_input(
+        &self,
+        operation: OperationId,
+        attachment: AttachmentId,
+        data: Vec<u8>,
+        available: bool,
+    ) -> Result<PreparedPtyInput, RuntimeError> {
+        let client = self.require_client()?.clone();
+        let command = Command::PtyInput {
+            attachment,
+            data: data.clone(),
+        };
+        if let Some(response) =
+            claim_external_operation(&self.service.store, &client, &operation, &command)?
+        {
+            return Ok(PreparedPtyInput::Complete(response));
+        }
+        let prepared = async {
+            let control = self.pty_control(&client, attachment).await?;
+            let revoked = {
+                let attachments = self.service.lock_attachments()?;
+                require_attachment_owner(&attachments, attachment, &client, self.id)?
+                    .input_cancel
+                    .subscribe()
+            };
+            if !available {
+                return Err(RuntimeError::new(
+                    RuntimeErrorKind::Conflict,
+                    "PTY input is already pending",
+                ));
+            }
+            Ok((control, revoked))
+        }
+        .await;
+        let (control, mut revoked) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return finish_external_operation(
+                    &self.service.store,
+                    &client,
+                    &operation,
+                    &command,
+                    protocol_error(error),
+                )
+                .map(PreparedPtyInput::Complete);
+            }
+        };
+        let service = self.service.clone();
+        Ok(PreparedPtyInput::Pending(Box::pin(async move {
+            let response = tokio::select! {
+                biased;
+                _ = revoked.changed() => protocol_error(RuntimeError::new(
+                    RuntimeErrorKind::Conflict, "PTY controller lease ended before input completed",
+                )),
+                result = control.input(data) => result
+                    .map(|()| ResponsePayload::ack()).unwrap_or_else(protocol_error),
+            };
+            finish_external_operation(&service.store, &client, &operation, &command, response)
+        })))
     }
 
     async fn pty_control(
@@ -1633,6 +1675,56 @@ impl DaemonConnection {
     }
 }
 
+enum PreparedPtyInput {
+    Complete(ResponsePayload),
+    Pending(RuntimeFuture<Result<ResponsePayload, RuntimeError>>),
+}
+
+fn claim_external_operation(
+    store: &StoreProvider,
+    client: &ClientId,
+    operation: &OperationId,
+    command: &Command,
+) -> Result<Option<ResponsePayload>, RuntimeError> {
+    match store
+        .lock_store()?
+        .record_operation(client, operation, command, None, now_ms())
+        .map_err(store_error)?
+    {
+        OperationRecord::Inserted => Ok(None),
+        OperationRecord::Replay {
+            response: Some(response),
+        } => Ok(Some(response)),
+        OperationRecord::Replay { response: None } => Err(operation_expired()),
+        OperationRecord::Conflict { .. } => Err(operation_conflict()),
+    }
+}
+
+fn finish_external_operation(
+    store: &StoreProvider,
+    client: &ClientId,
+    operation: &OperationId,
+    command: &Command,
+    response: ResponsePayload,
+) -> Result<ResponsePayload, RuntimeError> {
+    if !store
+        .lock_store()?
+        .finish_claimed_operation(OperationCommit {
+            client,
+            operation,
+            command,
+            response: Some(&response),
+            completed_at_ms: now_ms(),
+        })
+        .map_err(store_error)?
+    {
+        return Err(RuntimeError::infrastructure(
+            "external operation claim was lost",
+        ));
+    }
+    Ok(response)
+}
+
 /// Serve one strict IPC v4 stream. Fact events are emitted only after the
 /// connection successfully watches their ExecutionId.
 pub async fn serve_stream<S>(service: Arc<DaemonService>, stream: S) -> Result<(), RuntimeError>
@@ -1648,8 +1740,17 @@ where
     let mut lifecycle = service.subscribe_lifecycle();
     let mut frames = WireReader::default();
     let mut waits = tokio::task::JoinSet::new();
+    let mut inputs = tokio::task::JoinSet::new();
+    let mut input_attachments = std::collections::BTreeSet::new();
     loop {
         tokio::select! {
+            completed = inputs.join_next(), if !inputs.is_empty() => {
+                let (attachment, response) = completed.unwrap().map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
+                input_attachments.remove(&attachment);
+                writer.write_all(&encode_message(&response).map_err(|error| RuntimeError::infrastructure(error.to_string()))?)
+                    .await.map_err(|error| RuntimeError::infrastructure(format!("write input response: {error}")))?;
+                writer.flush().await.map_err(|error| RuntimeError::infrastructure(format!("flush input response: {error}")))?;
+            }
             completed = waits.join_next(), if !waits.is_empty() => {
                 let response = completed.unwrap().map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
                 writer.write_all(&encode_message(&response).map_err(|error| RuntimeError::infrastructure(error.to_string()))?)
@@ -1661,6 +1762,21 @@ where
                     return Ok(());
                 };
                 let response = match message {
+                    Message::Command { request_id, operation_id, command: Command::PtyInput { attachment, data } } => {
+                        match connection.prepare_pty_input(operation_id, attachment, data,
+                            inputs.len() < 64 && !input_attachments.contains(&attachment)).await {
+                            Ok(PreparedPtyInput::Complete(payload)) => Message::Response { request_id, payload },
+                            Ok(PreparedPtyInput::Pending(input)) => {
+                                input_attachments.insert(attachment);
+                                inputs.spawn(async move {
+                                    (attachment, Message::Response { request_id,
+                                        payload: input.await.unwrap_or_else(protocol_error) })
+                                });
+                                continue;
+                            }
+                            Err(error) => Message::Response { request_id, payload: protocol_error(error) },
+                        }
+                    }
                     Message::Query { request_id, query: Query::WaitExecution { id } }
                         if connection.client.is_some() => {
                         if waits.len() < 64 {
