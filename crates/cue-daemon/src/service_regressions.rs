@@ -501,7 +501,13 @@ async fn recovery_walks_past_a_full_page_of_newer_terminal_executions() {
         .state,
         ExecutionState::Succeeded
     );
-    assert_eq!(service.tasks.lock().await.len(), 1);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !service.tasks.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
