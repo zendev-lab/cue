@@ -144,7 +144,7 @@ fn compile_resolved(
                 message: "`:umask` requires the Cue vNext execution compiler".into(),
             }))
         }
-        ResolvedCommand::Env { subcommand } => match compile_env_delta(subcommand.as_deref())? {
+        ResolvedCommand::Env { arguments } => match compile_env_delta(&arguments)? {
             Some(delta) => Ok(CompiledCommand::Daemon(RequestPayload::ApplyScopeDelta {
                 base: None,
                 delta,
@@ -382,8 +382,8 @@ fn compile_script_item(
         ResolvedCommand::Umask { .. } => Err(CompileError::Invalid(
             "`:umask` requires the Cue vNext execution compiler".into(),
         )),
-        ResolvedCommand::Env { subcommand } => {
-            let delta = compile_env_delta(subcommand.as_deref())?.ok_or_else(|| {
+        ResolvedCommand::Env { arguments } => {
+            let delta = compile_env_delta(&arguments)?.ok_or_else(|| {
                 CompileError::Invalid("`:env` without set/unset is not executable in a .cue file".into())
             })?;
             Ok((
@@ -505,25 +505,22 @@ fn compile_scope_command(words: &[String]) -> Result<Option<EnvDelta>, CompileEr
             unset: Vec::new(),
             cwd: Some(PathBuf::from(path)),
         })),
-        [command, subcommand, rest @ ..] if command == "env" && subcommand == "set" => {
-            let text = format!("set {}", rest.join(" "));
-            compile_env_delta(Some(&text))
-        }
-        [command, subcommand, rest @ ..] if command == "env" && subcommand == "unset" => {
-            let text = format!("unset {}", rest.join(" "));
-            compile_env_delta(Some(&text))
+        [command, subcommand, ..]
+            if command == "env" && matches!(subcommand.as_str(), "set" | "unset") =>
+        {
+            compile_env_delta(&words[1..])
         }
         _ => Ok(None),
     }
 }
 
-fn compile_env_delta(subcommand: Option<&str>) -> Result<Option<EnvDelta>, CompileError> {
-    let Some(subcommand) = subcommand.map(str::trim).filter(|value| !value.is_empty()) else {
+fn compile_env_delta(arguments: &[String]) -> Result<Option<EnvDelta>, CompileError> {
+    let Some((subcommand, arguments)) = arguments.split_first() else {
         return Ok(None);
     };
-    if let Some(assignments) = subcommand.strip_prefix("set ") {
+    if subcommand == "set" {
         let mut set = BTreeMap::new();
-        for assignment in assignments.split_whitespace() {
+        for assignment in arguments {
             let Some((key, value)) = assignment.split_once('=') else {
                 return Err(CompileError::Invalid(format!(
                     "`:env set` expects KEY=VALUE, got `{assignment}`"
@@ -543,9 +540,9 @@ fn compile_env_delta(subcommand: Option<&str>) -> Result<Option<EnvDelta>, Compi
             cwd: None,
         }));
     }
-    if let Some(keys) = subcommand.strip_prefix("unset ") {
-        let unset = keys
-            .split_whitespace()
+    if subcommand == "unset" {
+        let unset = arguments
+            .iter()
             .map(|key| {
                 validate_env_name(key)?;
                 Ok(key.to_string())
