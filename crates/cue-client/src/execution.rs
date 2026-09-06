@@ -1162,10 +1162,10 @@ mod tests {
     }
     #[tokio::test]
     async fn local_encoding_failure_does_not_close_the_connection() {
-        let service = VnextService::in_memory().unwrap();
+        let service = DaemonService::in_memory().unwrap();
         let (stream, peer) = tokio::io::duplex(4096);
         let server = tokio::spawn(serve_stream(service, peer));
-        let client = VnextClient::connect_stream(stream, client_id())
+        let client = ExecutionClient::connect_stream(stream, client_id())
             .await
             .unwrap()
             .into_multiplexed();
