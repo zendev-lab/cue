@@ -121,15 +121,9 @@ fn compile_resolved(
             execution(scope, plan)
         }
         ResolvedCommand::Cd { path } => execution(scope, builtin_cd(&["cd".into(), path])?),
-        ResolvedCommand::Env { subcommand } => {
-            let subcommand = subcommand.ok_or_else(|| {
-                CompileError::Invalid(
-                    "`:env` is not a kernel query; use `:env set KEY=VALUE` or `:env unset KEY`"
-                        .into(),
-                )
-            })?;
+        ResolvedCommand::Env { arguments } => {
             let mut words = vec!["env".to_owned()];
-            words.extend(subcommand.split_whitespace().map(str::to_owned));
+            words.extend(arguments);
             execution(scope, builtin_env(&words)?)
         }
         ResolvedCommand::Umask { mask } => {
@@ -247,14 +241,9 @@ fn compile_script_item(command: ResolvedCommand) -> Result<ExecutionPlan, Compil
             compile_chain(chain, io)
         }
         ResolvedCommand::Cd { path } => builtin_cd(&["cd".into(), path]),
-        ResolvedCommand::Env { subcommand } => {
-            let subcommand = subcommand.ok_or_else(|| {
-                CompileError::Invalid(
-                    "`:env` without set/unset is not executable in a .cue file".into(),
-                )
-            })?;
+        ResolvedCommand::Env { arguments } => {
             let mut words = vec!["env".to_owned()];
-            words.extend(subcommand.split_whitespace().map(str::to_owned));
+            words.extend(arguments);
             builtin_env(&words)
         }
         ResolvedCommand::Umask { mask } => builtin_umask(&["umask".into(), mask]),
@@ -735,6 +724,39 @@ mod tests {
                 compile_command(input, Mode::Job, SCOPE),
                 Err(CompileError::ExternalOwner { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn env_arguments_preserve_quotes_empty_values_and_whitespace_in_all_surfaces() {
+        for (arguments, expected) in [
+            (r#"set GREETING="hello world" EMPTY="""#, "hello world"),
+            (r#"set GREETING='  hello  world  '"#, "  hello  world  "),
+        ] {
+            let bare = format!("env {arguments}");
+            let explicit = format!(":{bare}");
+            let compiled = plan(&explicit);
+            assert_eq!(compiled, plan(&bare));
+            assert_eq!(compile_file(&explicit, SCOPE).unwrap().plan(), &compiled);
+            let ExecutionPlan::Builtin {
+                command: BuiltinCommand::Env(mutation),
+            } = compiled
+            else {
+                panic!("expected environment builtin");
+            };
+            let Some(EnvEdit::Set(value)) = mutation.patch().get(&EnvKey::new("GREETING").unwrap())
+            else {
+                panic!("expected greeting assignment");
+            };
+            assert_eq!(value.as_str(), expected);
+            if arguments.contains("EMPTY") {
+                let Some(EnvEdit::Set(value)) =
+                    mutation.patch().get(&EnvKey::new("EMPTY").unwrap())
+                else {
+                    panic!("expected empty assignment");
+                };
+                assert_eq!(value.as_str(), "");
+            }
         }
     }
 }

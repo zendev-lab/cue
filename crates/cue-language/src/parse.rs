@@ -495,6 +495,14 @@ impl Parser {
 
             CommandArgKind::Empty => Ok(Argument::Empty),
 
+            CommandArgKind::OptionalWords => {
+                let mut words = Vec::new();
+                while !self.at_end() {
+                    words.push(self.advance().token.to_string());
+                }
+                Ok(Argument::Words(words))
+            }
+
             CommandArgKind::OptionalText => {
                 let text = self.consume_remaining_text();
                 if text.is_empty() {

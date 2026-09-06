@@ -75,7 +75,7 @@ pub(crate) enum ResolvedCommand {
     /// Show resource provider capacity snapshots.
     Resources,
     /// Environment operations.
-    Env { subcommand: Option<String> },
+    Env { arguments: Vec<String> },
     /// Change directory.
     Cd { path: String },
     /// Change the file-creation mask.
@@ -261,7 +261,10 @@ impl Resolver {
             "providers" => ResolvedCommand::Providers,
             "resources" => ResolvedCommand::Resources,
             "env" => ResolvedCommand::Env {
-                subcommand: extract_optional_text(argument),
+                arguments: match argument {
+                    Argument::Words(words) => words,
+                    _ => unreachable!("parser preserves env arguments"),
+                },
             },
             "cd" => ResolvedCommand::Cd {
                 path: extract_text(argument),
@@ -1095,8 +1098,8 @@ mod tests {
     fn resolve_env_set() {
         let cmd = resolve(":env set FOO=bar FOO=baz", Mode::Job);
         match cmd {
-            ResolvedCommand::Env { subcommand } => {
-                assert_eq!(subcommand.as_deref(), Some("set FOO=bar FOO=baz"));
+            ResolvedCommand::Env { arguments } => {
+                assert_eq!(arguments, ["set", "FOO=bar", "FOO=baz"]);
             }
             _ => panic!("expected Env"),
         }
@@ -1158,7 +1161,9 @@ mod tests {
                 CommandArgKind::OptionalId(allowed) => {
                     format!(":{} {}", spec.name, allowed.first_example())
                 }
-                CommandArgKind::OptionalText => format!(":{} status", spec.name),
+                CommandArgKind::OptionalText | CommandArgKind::OptionalWords => {
+                    format!(":{} status", spec.name)
+                }
                 CommandArgKind::Empty => format!(":{}", spec.name),
             };
             let ast = CueParser::parse(&input).unwrap_or_else(|error| {
