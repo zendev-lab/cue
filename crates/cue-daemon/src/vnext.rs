@@ -597,7 +597,16 @@ impl VnextService {
             }
         }
         task.changed.notify_waiters();
-        self.schedule_runtime(task)
+        self.schedule_runtime(task.clone())?;
+        self.retire_terminal_task(&task).await;
+        Ok(())
+    }
+
+    async fn retire_terminal_task(&self, task: &Arc<ExecutionTask>) {
+        let state = task.state.lock().await;
+        if state.execution.state().is_terminal() && task.controls.lock().await.is_empty() {
+            self.tasks.lock().await.remove(&task.id);
+        }
     }
 
     fn schedule_runtime(self: &Arc<Self>, task: Arc<ExecutionTask>) -> Result<(), RuntimeError> {
@@ -711,6 +720,7 @@ impl VnextService {
                 task.changed.notify_waiters();
                 retry_runtime_store(step, || self.schedule_runtime(task.clone())).await?;
             }
+            self.retire_terminal_task(&task).await;
             Ok(())
         })
     }
@@ -1287,19 +1297,28 @@ impl VnextConnection {
             }
             return saved.response.ok_or_else(operation_expired);
         }
-        let task = self
-            .service
-            .tasks
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorKind::NotFound,
-                    format!("execution {id} has no active task"),
-                )
-            })?;
+        let task = self.service.tasks.lock().await.get(&id).cloned();
+        let task = match task {
+            Some(task) => task,
+            None => {
+                let stored = self.service.store.load_execution(id)?.ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorKind::NotFound,
+                        format!("execution {id} was not found"),
+                    )
+                })?;
+                if !stored.state.is_terminal() {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorKind::Conflict,
+                        format!("execution {id} has no active owner"),
+                    ));
+                }
+                let response = ResponsePayload::Ok(ResultPayload::Execution {
+                    execution: Box::new(view(&stored)),
+                });
+                return self.record_plain(client, operation, command, &response);
+            }
+        };
         let response = {
             let mut state = task.state.lock().await;
             let mut candidate = state.execution.clone();
@@ -1353,6 +1372,27 @@ impl VnextConnection {
         step: StepId,
         replay_bytes: u32,
     ) -> Result<ResponsePayload, RuntimeError> {
+        if let Some(saved) = self
+            .service
+            .store
+            .lock_store()?
+            .get_operation(client, operation)
+            .map_err(store_error)?
+        {
+            if saved.fingerprint
+                != cue_store_sqlite::command_fingerprint(command).map_err(store_error)?
+            {
+                return Err(operation_conflict());
+            }
+            let response = saved.response.ok_or_else(operation_expired)?;
+            if let ResponsePayload::Ok(ResultPayload::PtyAttached { attachment, .. }) = &response {
+                let attachments = self.service.lock_attachments()?;
+                if require_attachment_owner(&attachments, *attachment, client, self.id).is_err() {
+                    return Err(operation_expired());
+                }
+            }
+            return Ok(response);
+        }
         let task = self
             .service
             .tasks
@@ -2335,6 +2375,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_tasks_are_retired_but_remain_queryable_and_cancellable() {
+        let service = VnextService::in_memory().unwrap();
+        let mut connection = service.connection();
+        hello(&mut connection).await;
+        let (scope, _) = put_scope(&mut connection, scope(false)).await;
+        for index in 0..32 {
+            let submitted = submit(
+                &mut connection,
+                index + 3,
+                &format!("retire:{index}"),
+                spec(scope, "/usr/bin/true", &[]),
+            )
+            .await;
+            let id = submitted_id(&submitted);
+            assert_eq!(
+                service.wait_execution(id).await.unwrap().state,
+                ExecutionState::Succeeded
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while service.tasks.lock().await.contains_key(&id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let operation = OperationId::new(format!("cancel-retired:{index}")).unwrap();
+            let command = Command::CancelExecution {
+                id,
+                mode: cue_core::vnext::CancelMode::Force,
+            };
+            let response = connection
+                .handle_command(operation.clone(), command.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(&response, ResponsePayload::Ok(ResultPayload::Execution { execution })
+                if execution.state == ExecutionState::Succeeded)
+            );
+            assert_eq!(
+                connection.handle_command(operation, command).await.unwrap(),
+                response
+            );
+        }
+        assert!(service.tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn submit_operation_replay_does_not_allocate_a_second_execution() {
         let service = VnextService::in_memory().unwrap();
         let mut connection = service.connection();
@@ -2520,6 +2607,35 @@ mod tests {
         else {
             panic!("unexpected attach response: {attached:?}");
         };
+        let next_id = service.next_attachment.load(Ordering::Relaxed);
+        let replay_command = Command::AttachPty {
+            step,
+            replay_bytes: 4096,
+        };
+        let replay_operation = OperationId::new("attach:pty").unwrap();
+        let replay = connection
+            .handle_command(replay_operation.clone(), replay_command.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(replay, ResponsePayload::Ok(ResultPayload::PtyAttached { attachment: id, .. }) if id == attachment)
+        );
+        assert_eq!(service.next_attachment.load(Ordering::Relaxed), next_id);
+        let registered = service
+            .lock_attachments()
+            .unwrap()
+            .remove(&attachment)
+            .unwrap();
+        let lost = connection
+            .handle_command(replay_operation, replay_command)
+            .await
+            .unwrap_err();
+        assert_eq!(lost.kind, operation_expired().kind);
+        assert_eq!(lost.message, operation_expired().message);
+        service
+            .lock_attachments()
+            .unwrap()
+            .insert(attachment, registered);
         for (request, operation, command) in [
             (5, "claim:pty", Command::ClaimPtyControl { attachment }),
             (
