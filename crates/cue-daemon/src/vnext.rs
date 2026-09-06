@@ -421,6 +421,7 @@ struct Attachment {
     client: ClientId,
     step: StepId,
     role: PtyRole,
+    input_cancel: tokio::sync::watch::Sender<()>,
 }
 
 impl VnextService {
@@ -1135,10 +1136,9 @@ impl VnextConnection {
                 self.record_plain(&client, &operation, &command, &response)
             }
             Command::PtyInput { attachment, data } => {
-                let control = self.pty_control(&client, *attachment).await?;
-                control.input(data.clone()).await?;
-                let response = ResponsePayload::ack();
-                self.record_plain(&client, &operation, &command, &response)
+                self.prepare_pty_input(operation, *attachment, data.clone(), true)
+                    .await?
+                    .await
             }
             Command::PtyResize {
                 attachment,
@@ -1374,6 +1374,7 @@ impl VnextConnection {
                         client: client.clone(),
                         step,
                         role: PtyRole::Observer,
+                        input_cancel: tokio::sync::watch::channel(()).0,
                     },
                 );
                 Ok(response)
@@ -1410,12 +1411,65 @@ impl VnextConnection {
         let attachment = attachments.get_mut(&id).ok_or_else(|| {
             RuntimeError::new(RuntimeErrorKind::NotFound, "PTY attachment disappeared")
         })?;
+        if !claim {
+            attachment.input_cancel.send_replace(());
+        }
         attachment.role = if claim {
             PtyRole::Controller
         } else {
             PtyRole::Observer
         };
         Ok(())
+    }
+
+    async fn prepare_pty_input(
+        &self,
+        operation: OperationId,
+        attachment: AttachmentId,
+        data: Vec<u8>,
+        available: bool,
+    ) -> Result<RuntimeFuture<Result<ResponsePayload, RuntimeError>>, RuntimeError> {
+        let client = self.require_client()?.clone();
+        let control = self.pty_control(&client, attachment).await?;
+        let mut revoked = {
+            let attachments = self.service.lock_attachments()?;
+            require_attachment_owner(&attachments, attachment, &client, self.id)?
+                .input_cancel
+                .subscribe()
+        };
+        if !available {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::Conflict,
+                "PTY input is already pending",
+            ));
+        }
+        let service = self.service.clone();
+        Ok(Box::pin(async move {
+            let command = Command::PtyInput {
+                attachment,
+                data: data.clone(),
+            };
+            let response = tokio::select! {
+                biased;
+                _ = revoked.changed() => protocol_error(RuntimeError::new(
+                    RuntimeErrorKind::Conflict, "PTY controller lease ended before input completed",
+                )),
+                result = control.input(data) => result
+                    .map(|()| ResponsePayload::ack()).unwrap_or_else(protocol_error),
+            };
+            match service.store.record_durable_operation(
+                &client,
+                &operation,
+                &command,
+                &response,
+                now_ms(),
+            )? {
+                OperationOutcome::Inserted(_) => Ok(response),
+                OperationOutcome::Replay(response) => Ok(response),
+                OperationOutcome::Conflict => Err(operation_conflict()),
+                OperationOutcome::Expired => Err(operation_expired()),
+            }
+        }))
     }
 
     async fn pty_control(
@@ -1467,8 +1521,17 @@ where
     let mut output = service.subscribe_output();
     let mut frames = WireReader::default();
     let mut waits = tokio::task::JoinSet::new();
+    let mut inputs = tokio::task::JoinSet::new();
+    let mut input_attachments = std::collections::BTreeSet::new();
     loop {
         tokio::select! {
+            completed = inputs.join_next(), if !inputs.is_empty() => {
+                let (attachment, response) = completed.unwrap().map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
+                input_attachments.remove(&attachment);
+                writer.write_all(&encode_message(&response).map_err(|error| RuntimeError::infrastructure(error.to_string()))?)
+                    .await.map_err(|error| RuntimeError::infrastructure(format!("write input response: {error}")))?;
+                writer.flush().await.map_err(|error| RuntimeError::infrastructure(format!("flush input response: {error}")))?;
+            }
             completed = waits.join_next(), if !waits.is_empty() => {
                 let response = completed.unwrap().map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
                 writer.write_all(&encode_message(&response).map_err(|error| RuntimeError::infrastructure(error.to_string()))?)
@@ -1480,6 +1543,20 @@ where
                     return Ok(());
                 };
                 let response = match message {
+                    Message::Command { request_id, operation_id, command: Command::PtyInput { attachment, data } } => {
+                        match connection.prepare_pty_input(operation_id, attachment, data,
+                            inputs.len() < 64 && !input_attachments.contains(&attachment)).await {
+                            Ok(input) => {
+                                input_attachments.insert(attachment);
+                                inputs.spawn(async move {
+                                    (attachment, Message::Response { request_id,
+                                        payload: input.await.unwrap_or_else(protocol_error) })
+                                });
+                                continue;
+                            }
+                            Err(error) => Message::Response { request_id, payload: protocol_error(error) },
+                        }
+                    }
                     Message::Query { request_id, query: Query::WaitExecution { id } }
                         if connection.client.is_some() => {
                         if waits.len() < 64 {
