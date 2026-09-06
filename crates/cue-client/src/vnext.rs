@@ -285,6 +285,12 @@ impl VnextClient {
     }
 }
 
+#[derive(Default)]
+struct PendingResponses {
+    waiters: HashMap<RequestId, oneshot::Sender<Result<ResponsePayload>>>,
+    closed: Option<String>,
+}
+
 /// Concurrent v4 client for TUI and other event-driven frontends.
 pub struct VnextMultiplexedClient {
     client_id: ClientId,
@@ -292,7 +298,7 @@ pub struct VnextMultiplexedClient {
     operation_prefix: String,
     next_request: AtomicU64,
     next_operation: AtomicU64,
-    pending: Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<ResponsePayload>>>>>,
+    pending: Arc<StdMutex<PendingResponses>>,
     events: Mutex<mpsc::UnboundedReceiver<EventPayload>>,
     capabilities: Vec<Capability>,
     reader_task: JoinHandle<()>,
@@ -311,7 +317,7 @@ impl VnextMultiplexedClient {
             ..
         } = client;
         let (reader, writer) = io::split(stream);
-        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let pending = Arc::new(StdMutex::new(PendingResponses::default()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         for event in pending_events {
             let _ = event_tx.send(event);
@@ -398,10 +404,16 @@ impl VnextMultiplexedClient {
 
     async fn call(&self, request_id: RequestId, message: Message) -> Result<ResultPayload> {
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock pending v4 responses"))?
-            .insert(request_id, tx);
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock pending v4 responses"))?;
+            if let Some(reason) = &pending.closed {
+                bail!("IPC v4 connection is closed: {reason}");
+            }
+            pending.waiters.insert(request_id, tx);
+        }
         let send = async {
             let mut writer = self.writer.lock().await;
             writer
@@ -412,9 +424,7 @@ impl VnextMultiplexedClient {
         }
         .await;
         if let Err(error) = send {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(&request_id);
-            }
+            fail_pending(&self.pending, &error.to_string());
             return Err(error);
         }
         let payload = rx
@@ -433,7 +443,7 @@ impl Drop for VnextMultiplexedClient {
 
 async fn run_reader(
     mut reader: io::ReadHalf<BoxedStream>,
-    pending: Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<ResponsePayload>>>>>,
+    pending: Arc<StdMutex<PendingResponses>>,
     events: mpsc::UnboundedSender<EventPayload>,
 ) {
     let reason = loop {
@@ -445,14 +455,14 @@ async fn run_reader(
                 let waiter = pending
                     .lock()
                     .ok()
-                    .and_then(|mut pending| pending.remove(&request_id));
+                    .and_then(|mut pending| pending.waiters.remove(&request_id));
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(Ok(payload));
                 }
             }
             Ok(Message::Event { payload }) => {
                 if events.send(payload).is_err() {
-                    return;
+                    break "IPC v4 event receiver closed".to_owned();
                 }
             }
             Ok(Message::Query { .. } | Message::Command { .. }) => {
@@ -464,14 +474,12 @@ async fn run_reader(
     fail_pending(&pending, &reason);
 }
 
-fn fail_pending(
-    pending: &StdMutex<HashMap<RequestId, oneshot::Sender<Result<ResponsePayload>>>>,
-    reason: &str,
-) {
+fn fail_pending(pending: &StdMutex<PendingResponses>, reason: &str) {
     let Ok(mut pending) = pending.lock() else {
         return;
     };
-    for (_, waiter) in pending.drain() {
+    pending.closed.get_or_insert_with(|| reason.to_owned());
+    for (_, waiter) in pending.waiters.drain() {
         let _ = waiter.send(Err(anyhow::anyhow!(reason.to_owned())));
     }
 }
@@ -1077,5 +1085,74 @@ mod tests {
         assert_eq!(execution.snapshot.spec.scope(), scope().compute_hash());
         drop(client);
         server.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn multiplexed_reader_failure_rejects_pending_and_future_requests() {
+        for malformed_frame in [false, true] {
+            let (client_stream, mut peer) = tokio::io::duplex(4096);
+            let server = tokio::spawn(async move {
+                let Message::Query { request_id, .. } = read_message(&mut peer).await.unwrap()
+                else {
+                    panic!("expected Hello");
+                };
+                let response = Message::Response {
+                    request_id,
+                    payload: ResponsePayload::Ok(ResultPayload::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        server_version: "test".into(),
+                        instance_id: "reader-failure".into(),
+                        capabilities: Vec::new(),
+                    }),
+                };
+                peer.write_all(&encode_message(&response).unwrap())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    read_message(&mut peer).await.unwrap(),
+                    Message::Query {
+                        query: Query::Ping,
+                        ..
+                    }
+                ));
+                if malformed_frame {
+                    peer.write_all(&[0, 0, 0, 2, b'{', b'}']).await.unwrap();
+                } else {
+                    peer.shutdown().await.unwrap();
+                }
+                let mut byte = [0];
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        peer.read(&mut byte)
+                    )
+                    .await
+                    .is_err(),
+                    "closed client sent another request"
+                );
+            });
+            let client = VnextClient::connect_stream(client_stream, client_id())
+                .await
+                .unwrap()
+                .into_multiplexed();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.query(Query::Ping))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(client.next_event().await.is_none());
+            for _ in 0..2 {
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.query(Query::Ping),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert!(error.to_string().contains("connection is closed"));
+            }
+            assert!(client.pending.lock().unwrap().waiters.is_empty());
+            server.await.unwrap();
+        }
     }
 }

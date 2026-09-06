@@ -623,6 +623,7 @@ fn validate_snapshot(snapshot: &ExecutionSnapshot) -> Result<(), ExecutionError>
         snapshot.spec.scope(),
         &snapshot.steps,
         false,
+        false,
         snapshot.cancel_requested,
     )?;
     Ok(())
@@ -634,6 +635,7 @@ fn validate_scope_tree(
     input: ScopeHash,
     steps: &[StepRecord],
     any_success: bool,
+    condition_excluded: bool,
     cancel_requested: Option<CancelMode>,
 ) -> Result<usize, ExecutionError> {
     match plan {
@@ -670,6 +672,9 @@ fn validate_scope_tree(
                     }
                 }
                 StepState::Skipped {
+                    reason: SkipReason::ConditionNotMet,
+                } if !condition_excluded => return Err(ExecutionError::InvalidSnapshot(step.id)),
+                StepState::Skipped {
                     reason: SkipReason::AnySuccessSatisfied,
                 } if !any_success => return Err(ExecutionError::InvalidSnapshot(step.id)),
                 _ => {}
@@ -677,8 +682,15 @@ fn validate_scope_tree(
             Ok(offset + 1)
         }
         ExecutionPlan::Sequence { first, then, when } => {
-            let next =
-                validate_scope_tree(first, offset, input, steps, any_success, cancel_requested)?;
+            let next = validate_scope_tree(
+                first,
+                offset,
+                input,
+                steps,
+                any_success,
+                condition_excluded,
+                cancel_requested,
+            )?;
             let (_, result) = evaluate(first, offset, input, steps);
             if !sequence_runs_then(*when, result.status) {
                 for step in &steps[next..next + plan_leaf_count(then)] {
@@ -693,6 +705,9 @@ fn validate_scope_tree(
                 result.scope.unwrap_or(input),
                 steps,
                 any_success,
+                condition_excluded
+                    || (result.status != SubtreeStatus::Waiting
+                        && !sequence_runs_then(*when, result.status)),
                 cancel_requested,
             )
         }
@@ -707,8 +722,15 @@ fn validate_scope_tree(
             let has_winner = any_success || (*join == ParallelJoin::AnySuccess && winner);
             next = offset;
             for branch in branches.iter() {
-                next =
-                    validate_scope_tree(branch, next, input, steps, has_winner, cancel_requested)?;
+                next = validate_scope_tree(
+                    branch,
+                    next,
+                    input,
+                    steps,
+                    has_winner,
+                    condition_excluded,
+                    cancel_requested,
+                )?;
             }
             Ok(next)
         }
@@ -2056,5 +2078,45 @@ mod tests {
                 .is_err()
         );
         assert_eq!(execution.snapshot(), before);
+    }
+    #[test]
+    fn restore_checks_the_ancestor_condition_for_skipped_leaves() {
+        let initial = scope("/workspace");
+        for plan in [
+            run("root"),
+            sequence(vec![run("first"), run("then")]),
+            ExecutionPlan::parallel(vec![run("left"), run("right")], ParallelJoin::All).unwrap(),
+        ] {
+            let execution = execution(plan, &initial);
+            for index in 0..execution.steps().len() {
+                let mut snapshot = execution.snapshot();
+                snapshot.steps[index].state = StepState::Skipped {
+                    reason: SkipReason::ConditionNotMet,
+                };
+                assert!(Execution::restore(snapshot).is_err());
+            }
+        }
+
+        let nested = ExecutionPlan::parallel(
+            vec![run("left"), sequence(vec![run("right"), run("last")])],
+            ParallelJoin::All,
+        )
+        .unwrap();
+        let mut execution = execution(sequence(vec![run("first"), nested]), &initial);
+        execution.advance().unwrap();
+        execution
+            .complete_run(
+                step(1),
+                RunCompletion::Failed(StepFailure::Exit { code: 1 }),
+            )
+            .unwrap();
+        execution.advance().unwrap();
+        assert!(execution.steps()[1..].iter().all(|step| matches!(
+            step.state(),
+            StepState::Skipped {
+                reason: SkipReason::ConditionNotMet
+            }
+        )));
+        assert_eq!(Execution::restore(execution.snapshot()).unwrap(), execution);
     }
 }
