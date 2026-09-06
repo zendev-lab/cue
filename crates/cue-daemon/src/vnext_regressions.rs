@@ -484,6 +484,25 @@ async fn watch_replays_all_pages_and_deduplicates_the_live_boundary() {
 
 #[tokio::test]
 async fn force_from_another_connection_interrupts_backpressured_pty_input() {
+    backpressured_pty_input("other").await;
+}
+
+#[tokio::test]
+async fn force_on_the_same_connection_interrupts_backpressured_pty_input() {
+    backpressured_pty_input("same").await;
+}
+
+#[tokio::test]
+async fn disconnect_during_backpressured_input_releases_the_controller() {
+    backpressured_pty_input("eof").await;
+}
+
+#[tokio::test]
+async fn releasing_control_cancels_backpressured_input_before_reclaim() {
+    backpressured_pty_input("release").await;
+}
+
+async fn backpressured_pty_input(exit: &str) {
     let service = VnextService::in_memory().unwrap();
     let captured = spec(
         scope(false).compute_hash(),
@@ -555,20 +574,106 @@ async fn force_from_another_connection_interrupts_backpressured_pty_input() {
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(matches!(
-        exchange(
+    let mut a = Some(a);
+    let mut serving_a = Some(serving_a);
+    if exit == "eof" {
+        drop(a.take());
+        tokio::time::timeout(Duration::from_secs(1), serving_a.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(service.lock_attachments().unwrap().is_empty());
+    } else if exit == "same" || exit == "release" {
+        let next = if exit == "same" {
+            Command::CancelExecution {
+                id: task.id,
+                mode: CancelMode::Force,
+            }
+        } else {
+            Command::ReleasePtyControl { attachment }
+        };
+        let a = a.as_mut().unwrap();
+        a.write_all(&encode_message(&command(303, next)).unwrap())
+            .await
+            .unwrap();
+        let mut responses = BTreeMap::new();
+        for _ in 0..2 {
+            let Message::Response {
+                request_id,
+                payload,
+            } = receive(a).await
+            else {
+                panic!("response")
+            };
+            responses.insert(request_id.get(), payload);
+        }
+        assert!(matches!(
+            responses.get(&302),
+            Some(ResponsePayload::Error(_))
+        ));
+        assert!(matches!(responses.get(&303), Some(ResponsePayload::Ok(_))));
+    }
+    if exit == "eof" || exit == "release" {
+        let ResponsePayload::Ok(ResultPayload::PtyAttached {
+            attachment,
+            control_available,
+            ..
+        }) = exchange(
             &mut b,
             command(
-                303,
-                Command::CancelExecution {
-                    id: task.id,
-                    mode: CancelMode::Force
-                }
-            )
+                304,
+                Command::AttachPty {
+                    step,
+                    replay_bytes: 0,
+                },
+            ),
         )
-        .await,
-        ResponsePayload::Ok(_)
-    ));
+        .await
+        else {
+            panic!("reattach")
+        };
+        assert!(control_available);
+        assert!(matches!(
+            exchange(
+                &mut b,
+                command(305, Command::ClaimPtyControl { attachment })
+            )
+            .await,
+            ResponsePayload::Ok(_)
+        ));
+        // Empty input completes immediately only if the abandoned writer no longer owns input.
+        assert!(matches!(
+            exchange(
+                &mut b,
+                command(
+                    306,
+                    Command::PtyInput {
+                        attachment,
+                        data: Vec::new()
+                    }
+                )
+            )
+            .await,
+            ResponsePayload::Ok(_)
+        ));
+    }
+    if exit != "same" {
+        assert!(matches!(
+            exchange(
+                &mut b,
+                command(
+                    307,
+                    Command::CancelExecution {
+                        id: task.id,
+                        mode: CancelMode::Force,
+                    }
+                )
+            )
+            .await,
+            ResponsePayload::Ok(_)
+        ));
+    }
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(3), service.wait_execution(task.id))
             .await
@@ -577,12 +682,18 @@ async fn force_from_another_connection_interrupts_backpressured_pty_input() {
             .state,
         ExecutionState::Cancelled
     );
-    assert!(
-        matches!(receive(&mut a).await, Message::Response { request_id, payload: ResponsePayload::Error(_) } if request_id == RequestId::new(302).unwrap())
-    );
+    if exit == "other" {
+        assert!(
+            matches!(receive(a.as_mut().unwrap()).await, Message::Response {
+            request_id, payload: ResponsePayload::Error(_)
+        } if request_id == RequestId::new(302).unwrap())
+        );
+    }
     drop(a);
     drop(b);
-    serving_a.await.unwrap().unwrap();
+    if let Some(serving_a) = serving_a {
+        serving_a.await.unwrap().unwrap();
+    }
     serving_b.await.unwrap().unwrap();
 }
 
