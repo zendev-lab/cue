@@ -564,8 +564,27 @@ impl VnextService {
         tasks.insert(id, task.clone());
         drop(tasks);
         self.store.publish(&committed);
-        self.clone().drive(task).await?;
+        self.schedule_execution(task);
         Ok(response)
+    }
+
+    fn schedule_execution(self: &Arc<Self>, task: Arc<ExecutionTask>) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match service.clone().drive(task.clone()).await {
+                    Ok(()) => return,
+                    Err(error) if error.kind == RuntimeErrorKind::Infrastructure => {
+                        tracing::warn!(execution = %task.id, %error, "retrying committed execution progress");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(error) => {
+                        tracing::error!(execution = %task.id, %error, "execution progress stopped without asserting completion");
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     async fn drive(self: Arc<Self>, task: Arc<ExecutionTask>) -> Result<(), RuntimeError> {
@@ -1322,7 +1341,7 @@ impl VnextConnection {
             }
         };
         task.changed.notify_waiters();
-        self.service.schedule_runtime(task)?;
+        self.service.schedule_execution(task);
         Ok(response)
     }
 

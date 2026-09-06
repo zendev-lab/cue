@@ -189,6 +189,94 @@ async fn wait_does_not_block_ping_or_cancel_on_the_same_stream() {
 }
 
 #[tokio::test]
+async fn accepted_submission_retries_its_first_transition_without_client_retry() {
+    let uri = format!(
+        "file:initial-drive-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let service = VnextService::from_store(
+        Store::from_connection(rusqlite::Connection::open(&uri).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let injection = rusqlite::Connection::open(&uri).unwrap();
+    let mut connection = service.connection();
+    hello(&mut connection).await;
+    connection
+        .handle(command(
+            400,
+            Command::PutScope {
+                scope: Box::new(scope(false)),
+            },
+        ))
+        .await;
+    injection.execute_batch("CREATE TRIGGER reject_first_transition BEFORE INSERT ON facts WHEN json_extract(NEW.fact_json, '$.kind') = 'step_state_changed' BEGIN SELECT RAISE(ABORT, 'injected initial transition failure'); END").unwrap();
+    let submit = command(
+        401,
+        Command::SubmitExecution {
+            spec: Box::new(spec(
+                scope(false).compute_hash(),
+                "/usr/bin/printf",
+                &["once"],
+            )),
+        },
+    );
+    let accepted = connection.handle(submit.clone()).await;
+    let Message::Response {
+        payload: ResponsePayload::Ok(ResultPayload::ExecutionSubmitted { ref execution }),
+        ..
+    } = accepted
+    else {
+        panic!(
+            "a committed submission must retain responsibility for its first transition: {accepted:?}"
+        )
+    };
+    let id = execution.snapshot.id;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        service.store.load_execution(id).unwrap().unwrap().state,
+        ExecutionState::Pending
+    );
+    assert_eq!(service.store.facts_after(id, None, 100).unwrap().len(), 1);
+    assert!(
+        service
+            .store
+            .lock_store()
+            .unwrap()
+            .pending_runtime_steps()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(connection.handle(submit).await, accepted);
+    injection
+        .execute_batch("DROP TRIGGER reject_first_transition")
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), service.wait_execution(id))
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Succeeded
+    );
+    assert_eq!(
+        service
+            .output
+            .read(
+                StepId {
+                    execution: id,
+                    index: 1
+                },
+                OutputStream::Stdout,
+                0,
+                1024
+            )
+            .unwrap()
+            .data,
+        b"once"
+    );
+}
+
+#[tokio::test]
 async fn worker_retries_builtin_run_completion_and_ack_without_respawning() {
     for phase in ["builtin", "run-completion", "run-ack"] {
         let uri = format!(
