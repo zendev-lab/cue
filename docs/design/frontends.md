@@ -10,6 +10,10 @@ The client offers file and one-line submission, list/show/wait, per-Step
 stdout/stderr/terminal reads, graceful/forced cancellation, PTY attach, and
 daemon lifecycle commands. PTY attach replays the terminal tail, optionally
 claims the sole controller lease, forwards raw input, and detaches on Ctrl-].
+Pending input acknowledgements do not block terminal events, EOF, or detach.
+Unsent input is buffered up to 64 KiB; exceeding that bound detaches with an
+explicit error rather than silently discarding bytes. Blocking terminal reads
+run outside the async runtime so an idle stdin cannot delay process exit.
 
 `cue run` and `cue fg` are direct shortcuts. Session, schedule, retry,
 resource, target, and approval commands are not builtin namespaces; an

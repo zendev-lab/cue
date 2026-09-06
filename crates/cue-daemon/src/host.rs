@@ -126,6 +126,11 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
                     }
                 });
             }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "IPC v4 connection task failed");
+                }
+            }
             signal = lifecycle.recv() => {
                 match signal {
                     Ok(signal) => break signal,
