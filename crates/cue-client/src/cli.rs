@@ -1,18 +1,25 @@
 //! Thin IPC v4 command-line frontend.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::Write as _;
+use std::future::Future;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use cue_core::vnext::{CancelMode, Fact, OutputStream};
 use cue_core::{ExecutionId, StepId};
 use cue_language::Mode;
-use cue_protocol::{Command, EventPayload, OutputRange, Query, ResultPayload};
+use cue_protocol::{AttachmentId, Command, EventPayload, OutputRange, Query, ResultPayload};
 
 use crate::default_socket_path;
 use crate::script_runner::{execution_exit_code, write_execution_output};
-use crate::vnext::{SurfaceOutcome, VnextClient, output_bytes, process_scope, wait_execution};
+use crate::vnext::{
+    SurfaceOutcome, VnextClient, VnextMultiplexedClient, output_bytes, process_scope,
+    wait_execution,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientCommand {
@@ -164,17 +171,68 @@ async fn foreground(mut client: VnextClient, step: StepId, observe: bool) -> Res
         bail!("daemon returned an unexpected PTY attach response")
     };
     std::io::stdout().write_all(&snapshot)?;
+    std::io::stdout().flush()?;
     if !observe {
         client
             .command(Command::ClaimPtyControl { attachment })
             .await?;
     }
-    let client = client.into_multiplexed();
+    let client = Arc::new(client.into_multiplexed());
     let _raw = (!observe).then(TerminalRawMode::enter).transpose()?;
-    let mut stdin = tokio::io::stdin();
-    let mut input = [0u8; 1024];
+    forward_terminal(client, step, attachment, (!observe).then(terminal_input)).await
+}
+
+type TerminalInput = tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>;
+type PendingPtyInput = Pin<Box<dyn Future<Output = Result<ResultPayload>> + Send>>;
+const PENDING_INPUT_LIMIT: usize = 64 * 1024;
+
+fn terminal_input() -> TerminalInput {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    // A blocking stdin read cannot be cancelled. Keep it outside Tokio's
+    // blocking pool so an idle terminal cannot hold runtime shutdown open.
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut bytes = [0; 1024];
+        loop {
+            let result = match stdin.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => Ok(bytes[..count].to_vec()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => Err(error),
+            };
+            let failed = result.is_err();
+            if sender.blocking_send(result).is_err() || failed {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+async fn forward_terminal(
+    client: Arc<VnextMultiplexedClient>,
+    step: StepId,
+    attachment: AttachmentId,
+    mut input: Option<TerminalInput>,
+) -> Result<i32> {
+    let mut queued = VecDeque::<Vec<u8>>::new();
+    let mut queued_bytes = 0;
+    let mut pending: Option<PendingPtyInput> = None;
     loop {
+        if pending.is_none()
+            && let Some(data) = queued.pop_front()
+        {
+            queued_bytes -= data.len();
+            let client = client.clone();
+            pending = Some(Box::pin(async move {
+                client.command(Command::PtyInput { attachment, data }).await
+            }));
+        }
         tokio::select! {
+            result = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
+                pending = None;
+                result?;
+            }
             event = client.next_event() => {
                 match event {
                     Some(EventPayload::PtyOutput { attachment: event_attachment, data, .. })
@@ -192,16 +250,38 @@ async fn foreground(mut client: VnextClient, step: StepId, observe: bool) -> Res
                     None => bail!("daemon disconnected while PTY was attached"),
                 }
             }
-            read = tokio::io::AsyncReadExt::read(&mut stdin, &mut input), if !observe => {
-                let count = read.context("read terminal input")?;
-                if count == 0 || input[..count].contains(&0x1d) {
-                    client.command(Command::DetachPty { attachment }).await?;
+            read = async { input.as_mut().unwrap().recv().await }, if input.is_some() => {
+                let data = read.transpose().context("read terminal input")?;
+                if data.as_ref().is_none_or(|data| data.contains(&0x1d)) {
+                    detach_terminal(&client, attachment, &mut pending).await?;
                     return Ok(0);
                 }
-                client.command(Command::PtyInput {
-                    attachment,
-                    data: input[..count].to_vec(),
-                }).await?;
+                let data = data.unwrap();
+                if data.len() > PENDING_INPUT_LIMIT - queued_bytes {
+                    detach_terminal(&client, attachment, &mut pending).await?;
+                    bail!("PTY input buffer filled; detached because the process is not reading input");
+                }
+                queued_bytes += data.len();
+                queued.push_back(data);
+            }
+        }
+    }
+}
+
+async fn detach_terminal(
+    client: &VnextMultiplexedClient,
+    attachment: AttachmentId,
+    pending: &mut Option<PendingPtyInput>,
+) -> Result<()> {
+    let detach = client.command(Command::DetachPty { attachment });
+    tokio::pin!(detach);
+    loop {
+        tokio::select! {
+            result = &mut detach => return result.map(|_| ()),
+            _ = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
+                // Finish sending any partially written frame before Detach can
+                // acquire the writer; lease revocation releases a blocked reply.
+                *pending = None;
             }
         }
     }
@@ -372,5 +452,122 @@ mod tests {
         assert!(parse_command(args(&["cue-client", "run", "script.cue"])).is_ok());
         assert!(parse_command(args(&["cue-client", "run", "script.sh"])).is_err());
         assert!(parse_command(args(&["cue-client", "run"])).is_err());
+    }
+    #[tokio::test]
+    async fn foreground_can_detach_with_an_unacknowledged_input_write() {
+        use cue_protocol::{
+            ClientId, Message, PROTOCOL_VERSION, ProtocolErrorCode, ResponsePayload, encode_message,
+        };
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        async fn message(peer: &mut tokio::io::DuplexStream) -> Message {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            peer.read_exact(&mut body).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        for exit in ["escape", "eof", "overflow"] {
+            let (stream, mut peer) = tokio::io::duplex(4096);
+            let (seen, input_seen) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let Message::Query { request_id, .. } = message(&mut peer).await else {
+                    panic!("expected Hello")
+                };
+                peer.write_all(
+                    &encode_message(&Message::Response {
+                        request_id,
+                        payload: ResponsePayload::Ok(ResultPayload::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            server_version: "test".into(),
+                            instance_id: "foreground".into(),
+                            capabilities: Vec::new(),
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                let Message::Command {
+                    request_id: input_request,
+                    command: Command::PtyInput { .. },
+                    ..
+                } = message(&mut peer).await
+                else {
+                    panic!("expected PTY input")
+                };
+                seen.send(()).unwrap();
+                let Message::Command {
+                    request_id,
+                    command: Command::DetachPty { .. },
+                    ..
+                } = message(&mut peer).await
+                else {
+                    panic!("detach must arrive before input acknowledgement")
+                };
+                for response in [
+                    Message::Response {
+                        request_id: input_request,
+                        payload: ResponsePayload::error(
+                            ProtocolErrorCode::Conflict,
+                            "control released",
+                        ),
+                    },
+                    Message::Response {
+                        request_id,
+                        payload: ResponsePayload::ack(),
+                    },
+                ] {
+                    peer.write_all(&encode_message(&response).unwrap())
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = Arc::new(
+                VnextClient::connect_stream(stream, ClientId::new("foreground").unwrap())
+                    .await
+                    .unwrap()
+                    .into_multiplexed(),
+            );
+            let (sender, receiver) = tokio::sync::mpsc::channel(8);
+            let foreground = tokio::spawn(forward_terminal(
+                client,
+                "E1/S1".parse().unwrap(),
+                AttachmentId::new(1).unwrap(),
+                Some(receiver),
+            ));
+            sender.send(Ok(vec![b'x'; 1024])).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), input_seen)
+                .await
+                .unwrap()
+                .unwrap();
+            match exit {
+                "escape" => sender.send(Ok(vec![0x1d])).await.unwrap(),
+                "overflow" => {
+                    for _ in 0..=PENDING_INPUT_LIMIT / 1024 {
+                        sender.send(Ok(vec![b'x'; 1024])).await.unwrap();
+                    }
+                }
+                _ => {}
+            }
+            drop(sender);
+            let result = tokio::time::timeout(Duration::from_secs(2), foreground)
+                .await
+                .unwrap()
+                .unwrap();
+            if exit == "overflow" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("input buffer filled")
+                );
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            server.await.unwrap();
+        }
     }
 }
