@@ -15,6 +15,13 @@ Recovery reclaims durable runtime work only after exclusive host ownership.
 Unstarted Runs and replayable builtins may resume. A persisted physical Run
 attempt with unknown ownership rejects startup before replay or new facts;
 losing the supervisor does not establish process quiescence.
+`OwnershipLost` leaves the affected Step Running/Cancelling. Its durable
+attempt marker also prevents the next host from starting. There is currently
+no operator abandon/mark-lost command or supported in-place recovery procedure.
+Do not clear attempt markers or turn an unknown attempt into a terminal outcome:
+that would allow duplicate effects or dependent work without quiescence proof.
+Recovery requires a future ownership-reacquisition or quiescence-proof mechanism;
+a restart alone cannot repair this condition.
 Recovery walks every stored page, including older active executions behind
 newer terminal history.
 
@@ -60,6 +67,10 @@ On a store failure, the worker retains its generation and any known completion,
 retries persistence, and releases the semantic state lock between attempts.
 A physical Run is never respawned to retry its completion or acknowledgement.
 Cancel replay checks the durable operation outcome before requiring a live task.
+Terminal tasks are removed from memory once their process controls are released.
+Their durable projections, facts, and output remain available; fresh cancellation
+of a terminal execution returns its stored projection and records an idempotent
+response.
 
 `WatchExecution` replays facts after the supplied cursor before forwarding
 live facts. Output is addressed by stable `StepId`, stream, and absolute byte
@@ -71,7 +82,9 @@ PTY attachments are connection-owned observer leases. At most one attachment
 per Step is the controller. Only that controller can write input or resize the
 terminal; every attachment may receive the same terminal output stream.
 The lease belongs to the individual connection even when another connection
-uses the same ClientId. EOF, transport errors, and connection task cancellation
+uses the same ClientId. Attachment replay requires the original connection's
+registered lease. A durable response without that lease returns OperationExpired;
+the client must use a new operation to attach again. EOF, transport errors, and connection task cancellation
 release its attachments and controller role. Releasing or losing a controller
 lease also cancels its unfinished input, allowing a new controller to proceed.
 
@@ -91,3 +104,8 @@ If an acknowledgement is lost before flush, the same host retains the pending
 lifecycle outcome across connections. Replaying its OperationId flushes the same
 response before signalling once; a successor does not reapply its predecessor's
 lifecycle commands.
+
+Drain requests Graceful cancellation for up to five seconds, then Force for up
+to five more seconds. If quiescence remains unproven, drain returns an error.
+A host exit after that error can leave startup blocked by the attempt marker;
+the timeout is not evidence that the processes stopped.

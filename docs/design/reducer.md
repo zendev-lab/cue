@@ -32,10 +32,20 @@ Parallel forks and returns its input without merging branches.
 
 Restore checks plan cardinality, Step identity, field presence, cancellation
 consistency, control-flow eligibility, and Scope relationships. Invalid reducer
-inputs leave the prior state intact. Restart interruption applies only to active
-Runs after the host has independently proved their old attempts quiescent;
-builtins can safely be realized again from their committed input.
+inputs leave the prior state intact. Restoring a snapshot preserves active Runs and never infers interruption from
+a restart. The public batch interruption shortcut has been removed. Builtins
+can safely be realized again from their committed input.
 
 The store must make new Scope values durable and atomically commit snapshot,
 facts, and StepId follow-up before updating live state or publishing facts.
 Delivery generations and process ownership belong to the implementation layers.
+
+## Current scaling limits
+
+State projection evaluates the plan tree on each transition. Repeated subtree
+leaf counts and skipped-subtree scans can make a single traversal quadratic for
+skewed plans; repeated commits add further work. Plan validation limits depth
+to 1024, but reducer traversal is still recursive. This is not a large-plan
+performance or stack-safety guarantee. A future optimization should measure
+skewed and balanced plans, cache subtree ranges, and preserve restore validation,
+AnySuccess draining, and Scope propagation before replacing the traversal.

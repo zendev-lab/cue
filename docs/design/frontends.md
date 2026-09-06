@@ -37,3 +37,10 @@ network responses are pending.
 The former session/cron/resource pages, client-side v3 state machine, target
 modal, foreground epoch compatibility, and debug protocol were deleted rather
 than hidden behind flags.
+
+This is a reduced TUI, not feature parity with the previous interface. The old
+card interactions, sidebar/detail layout, completion UI, and clipboard actions
+have not been ported. Shared language completion support does not imply an
+interactive completion menu. Restoring these frontend features can use the v4
+projections without restoring the deleted v3 workflow owners; acceptance of
+this reduced product scope remains a separate decision from the protocol cut.
