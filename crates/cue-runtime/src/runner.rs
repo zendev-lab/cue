@@ -459,7 +459,7 @@ async fn supervise(
         }
 
         tokio::select! {
-            result = async { input.as_mut().unwrap().write.as_mut().await }, if input.is_some() => {
+            result = async { input.as_mut().unwrap().complete().await }, if input.is_some() => {
                 let mut completed = input.take().unwrap();
                 let _ = completed.reply.take().unwrap().send(result);
             }
@@ -478,6 +478,12 @@ async fn supervise(
                     tokio::time::sleep(CHILD_POLL_INTERVAL).await;
                     continue;
                 };
+                if input.as_ref().is_some_and(|input| input.reply.as_ref().unwrap().is_closed()) {
+                    input = None;
+                }
+                if matches!(command.request, RunControlRequest::Input(_)) && command.reply.is_closed() {
+                    continue;
+                }
                 let result = match command.request {
                     RunControlRequest::Terminate(mode) => {
                         input = None;
@@ -515,6 +521,18 @@ async fn supervise(
 struct PtyInput {
     write: RuntimeFuture<Result<(), RuntimeError>>,
     reply: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+}
+
+impl PtyInput {
+    async fn complete(&mut self) -> Result<(), RuntimeError> {
+        tokio::select! {
+            biased;
+            _ = self.reply.as_mut().unwrap().closed() => Err(RuntimeError::new(
+                RuntimeErrorKind::Conflict, "PTY input caller disconnected",
+            )),
+            result = self.write.as_mut() => result,
+        }
+    }
 }
 
 impl Drop for PtyInput {
@@ -946,8 +964,7 @@ mod tests {
         .await
         .unwrap();
         let control = run.control.clone();
-        let input = control.input(vec![b'x'; 1024 * 1024]);
-        tokio::pin!(input);
+        let mut input = Box::pin(control.input(vec![b'x'; 1024 * 1024]));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut input)
                 .await
@@ -963,6 +980,14 @@ mod tests {
         assert_eq!(
             run.control.input(b"more".to_vec()).await.unwrap_err().kind,
             RuntimeErrorKind::Conflict
+        );
+        drop(input);
+        let mut input = Box::pin(control.input(vec![b'y'; 1024 * 1024]));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut input)
+                .await
+                .is_err(),
+            "a disconnected writer must not leave the PTY busy"
         );
         tokio::time::timeout(
             Duration::from_secs(1),
