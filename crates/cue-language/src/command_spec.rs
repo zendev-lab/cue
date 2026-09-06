@@ -18,6 +18,7 @@ pub enum CommandArgKind {
     Tail(CommandIdKind),
     OptionalId(CommandIdKind),
     OptionalText,
+    OptionalWords,
     Empty,
 }
 
@@ -344,7 +345,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "env",
         category: CommandCategory::Scope,
-        arg_kind: CommandArgKind::OptionalText,
+        arg_kind: CommandArgKind::OptionalWords,
         usage: ":env [subcommand]",
         detail: "Inspect or update the current session environment",
         documented: true,

@@ -42,6 +42,8 @@ pub(super) enum Argument {
     IdRef(IdKind, String),
     /// Free-form text for typed scope and frontend configuration commands.
     Text(String),
+    /// Tokenized arguments whose quoting boundaries must survive resolution.
+    Words(Vec<String>),
     /// Entity ID with optional byte count (for `:tail E3/S1 1024`).
     TailRef(IdKind, String, Option<usize>),
     /// No argument (`:executions`, `:schedules`, `:help`).
