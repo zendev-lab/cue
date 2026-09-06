@@ -425,27 +425,6 @@ impl Execution {
         Ok(transition)
     }
 
-    /// Mark all active work interrupted by a daemon restart as failed. Pending
-    /// conditional branches remain eligible to advance from those failures.
-    pub fn interrupt_running(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        for (index, step) in self.steps.iter_mut().enumerate() {
-            if step.state.is_active()
-                && matches!(
-                    action_at(self.spec.plan(), index),
-                    Some(StepAction::Run { .. })
-                )
-            {
-                step.state = StepState::Failed {
-                    failure: StepFailure::Infrastructure {
-                        message: message.clone(),
-                    },
-                };
-                step.output_scope = step.input_scope;
-            }
-        }
-    }
-
     pub fn cancel(&mut self, mode: CancelMode) -> ExecutionTransition {
         if self.state().is_terminal() {
             return ExecutionTransition::default();
@@ -1782,48 +1761,23 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_restore_and_restart_interruption_preserve_reducer_semantics() {
-        let initial = scope("/workspace");
-        let plan =
-            ExecutionPlan::sequence(run("primary"), run("recover"), SequenceCondition::Failure);
-        let mut execution = execution(plan, &initial);
-        execution.advance().unwrap();
-        start(&mut execution, step(1));
-        execution.cancel(CancelMode::Graceful);
-
-        let mut restored = Execution::restore(execution.snapshot()).unwrap();
-        restored.interrupt_running("daemon restarted");
-        assert!(matches!(
-            restored.step(step(1)).unwrap().state(),
-            StepState::Failed {
-                failure: StepFailure::Infrastructure { .. }
+    fn snapshot_restore_preserves_active_attempts_until_completion() {
+        for cancel in [false, true] {
+            let initial = scope("/workspace");
+            let plan =
+                ExecutionPlan::sequence(run("primary"), run("recover"), SequenceCondition::Failure);
+            let mut execution = execution(plan, &initial);
+            execution.advance().unwrap();
+            start(&mut execution, step(1));
+            if cancel {
+                execution.cancel(CancelMode::Graceful);
             }
-        ));
-        assert_eq!(
-            restored.state(),
-            ExecutionState::Cancelled,
-            "the pending recovery branch was cancelled by the user request before restart"
-        );
-    }
-
-    #[test]
-    fn restart_interruption_without_user_cancel_can_select_failure_recovery() {
-        let initial = scope("/workspace");
-        let plan =
-            ExecutionPlan::sequence(run("primary"), run("recover"), SequenceCondition::Failure);
-        let mut execution = execution(plan, &initial);
-        execution.advance().unwrap();
-        start(&mut execution, step(1));
-
-        let mut restored = Execution::restore(execution.snapshot()).unwrap();
-        restored.interrupt_running("daemon restarted");
-        let transition = restored.advance().unwrap();
-
-        assert_eq!(ready_ids(&transition), vec![step(2)]);
-        assert_eq!(
-            restored.step(step(2)).unwrap().input_scope(),
-            Some(initial.compute_hash())
-        );
+            let snapshot = execution.snapshot();
+            let mut restored = Execution::restore(snapshot.clone()).unwrap();
+            assert!(ready_ids(&restored.advance().unwrap()).is_empty());
+            assert_eq!(restored.snapshot(), snapshot);
+            assert!(!restored.state().is_terminal());
+        }
     }
 
     #[test]
