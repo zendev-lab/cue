@@ -404,6 +404,7 @@ impl MultiplexedClient {
     }
 
     async fn call(&self, request_id: RequestId, message: Message) -> Result<ResultPayload> {
+        let frame = encode_message(&message).context("encode IPC v4 message")?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self
@@ -418,7 +419,7 @@ impl MultiplexedClient {
         let send = async {
             let mut writer = self.writer.lock().await;
             writer
-                .write_all(&encode_message(&message).context("encode IPC v4 message")?)
+                .write_all(&frame)
                 .await
                 .context("write IPC v4 message")?;
             writer.flush().await.context("flush IPC v4 message")
@@ -1158,5 +1159,30 @@ mod tests {
             assert!(client.pending.lock().unwrap().waiters.is_empty());
             server.await.unwrap();
         }
+    }
+    #[tokio::test]
+    async fn local_encoding_failure_does_not_close_the_connection() {
+        let service = VnextService::in_memory().unwrap();
+        let (stream, peer) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_stream(service, peer));
+        let client = VnextClient::connect_stream(stream, client_id())
+            .await
+            .unwrap()
+            .into_multiplexed();
+        let error = client
+            .command(Command::PtyInput {
+                attachment: AttachmentId::new(1).unwrap(),
+                data: vec![0; MAX_MESSAGE_SIZE],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("encode IPC v4 message"));
+        assert!(matches!(
+            client.query(Query::Ping).await.unwrap(),
+            ResultPayload::Ack
+        ));
+        assert!(client.pending.lock().unwrap().waiters.is_empty());
+        drop(client);
+        server.await.unwrap().unwrap();
     }
 }
