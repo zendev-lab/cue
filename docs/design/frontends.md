@@ -25,8 +25,10 @@ small activity log. PTY terminal emulation remains the CLI passthrough owner's
 job, so `:fg E1/S1` points to `cue fg E1/S1`.
 The serial and multiplexed clients share the surface-to-protocol mapping.
 Compilation is local, only submissions persist Scope, and tail requests use
-TailOutput. Pending requests run outside the TUI key handler, so waiting leaves
-editing, cancellation, and quit keys responsive.
+TailOutput. Waits have a separate bounded queue from ordinary commands, so a
+full wait queue still permits cancellation. Requests and coalesced list refreshes
+run outside the TUI event loop, keeping editing and quit keys responsive while
+network responses are pending.
 
 The former session/cron/resource pages, client-side v3 state machine, target
 modal, foreground epoch compatibility, and debug protocol were deleted rather

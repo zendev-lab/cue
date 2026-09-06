@@ -37,7 +37,9 @@ captured runs reject terminal input and resize.
 One PTY input write may be in flight at a time; another input request receives
 a busy conflict. Input backpressure does not block resize, process observation,
 or termination. Closing a Run interrupts any remaining input and reports a
-conflict to that writer; an already written prefix is not rolled back.
+conflict to that writer; an already written prefix is not rolled back. Dropping
+the input caller cancels its remaining write and frees the input slot without
+terminating the Run.
 
 ## Output and recovery
 

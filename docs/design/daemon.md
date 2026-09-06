@@ -36,12 +36,18 @@ The wire format is strict IPC v4 framing: a four-byte big-endian payload length
 followed by one validated message. Unknown fields, wrong message roles, and
 oversized frames are rejected.
 Partial frame state survives event delivery. Pending `WaitExecution` queries
-run independently of the connection reader, so the same connection can still
-query or cancel an execution. Mutation commands retain their receive order.
+and PTY input writes run independently of the connection reader, so the same
+connection can still query, cancel, release control, or disconnect. PTY input
+claims its OperationId before writing; pending and completed retries do not
+write again. Other commands are processed in receive order.
 
 ## Execution and observation
 
-Submission persists `ExecutionCreated` before scheduling. The daemon asks the
+Submission persists `ExecutionCreated` before scheduling. Once accepted, the
+daemon retains responsibility for progress even if the first transition or
+work lookup fails. It retries transient store failures independently of the
+request connection; replaying a submission is not required to wake it.
+The daemon asks the
 pure reducer to atomically transition ready leaves to Running and return their
 StepIds. It commits the candidate snapshot, facts, and durable follow-up work
 before updating live state or publishing. Claimed workers read the latest
@@ -66,7 +72,8 @@ per Step is the controller. Only that controller can write input or resize the
 terminal; every attachment may receive the same terminal output stream.
 The lease belongs to the individual connection even when another connection
 uses the same ClientId. EOF, transport errors, and connection task cancellation
-release its attachments and controller role.
+release its attachments and controller role. Releasing or losing a controller
+lease also cancels its unfinished input, allowing a new controller to proceed.
 
 ## Owner boundary
 
