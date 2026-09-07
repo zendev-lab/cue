@@ -4,6 +4,7 @@ mod dirs;
 mod host;
 mod recovery;
 pub mod service;
+mod startup;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

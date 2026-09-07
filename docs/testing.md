@@ -17,6 +17,13 @@ Keep Linux-only process behavior in the integration lane instead of replacing it
 cannot exercise `/proc`, pidfd, signal, socket, or lock semantics. Keep package smoke separate from
 source execution: it must install the produced artifact and invoke the public command names.
 
+Daemon process tests cover default background readiness, explicit foreground
+mode, log-visible startup failure, competing starts, independent database
+ownership, and stop/restart completion. CLI process tests cover surfaced failure
+reasons and retained-output truncation. Package smoke uses the default background
+command without a shell `&` or readiness retry, then verifies immediate use after
+restart. Its explicit `CUE_SOCKET` keeps inherited endpoints outside the test.
+
 ## Tests versus static policy
 
 Code tests assert return values, state transitions, persisted effects, boundary calls, process exit

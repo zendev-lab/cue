@@ -16,17 +16,24 @@ Install the Python distribution (the command names remain Cue):
 uv tool install cue-run
 ```
 
-Start the local daemon in one terminal, then use another terminal:
+Start the local daemon, then continue in the same terminal:
 
 ```bash
 cued start
 
 cue client exec "printf hello"
 cue client list
-cue run examples/hello.cue
+printf 'echo hello from cue\n' > hello.cue
+cue run hello.cue
 cue tui
 cue daemon status
 ```
+
+`cued start` runs in the background and returns only after that new instance
+answers IPC v4 Hello. Logs are appended to `<socket>.log`; the startup command
+prints the path and reports child startup errors. Use `cued start --fg` (or `-f`)
+for foreground logs or a service manager. `cued stop` waits for shutdown and
+`cued restart` waits for the requested replacement to become ready.
 
 The installed commands are `cue`, `cue-client`, `cue-tui`, and `cued`.
 `CUE_SOCKET` selects a non-default local Unix socket. Remote transport, named
@@ -84,7 +91,9 @@ contains explicit Scope, Execution, output, PTY attachment, and daemon
 lifecycle operations—no raw source or ambient session handshake.
 
 The default database is `$XDG_DATA_HOME/cue/cued-v4.db` (or the corresponding
-XDG fallback). A legacy `cued.db` is renamed to a read-only
+XDG fallback). Each running daemon exclusively owns its socket and database;
+use a distinct `--db PATH` for an independent instance with another socket.
+A legacy `cued.db` is renamed to a read-only
 `cued-v3-<timestamp>.db.archive` with its sidecars. Cue does not import or
 dual-read incompatible v3 semantics. Environment values carry explicit
 sensitivity; this host rejects Sensitive values before persistence. Variable
@@ -104,8 +113,25 @@ cue-client fg E7/S2 [--observe]
 cue-client restart|shutdown
 ```
 
-`cue run` and `cue fg` are shortcuts. PTY control uses one controller and any
-number of observers; Ctrl-] detaches the controller CLI.
+`cue run` and `cue fg` are shortcuts. `exec` and `run` wait for completion,
+then print retained output and return the execution exit status. Spawn, builtin,
+and runtime failures include a Step ID and diagnostic on stderr. They currently
+do not stream output or forward stdin during that wait. To run an interactive
+program, submit it in `cue tui`, then attach its Step using `cue fg E7/S2` in a
+terminal. PTY control uses one controller and any number of observers; Ctrl-]
+detaches the controller CLI. Disconnecting the client does not cancel its work;
+use `list`/`show` to find it and `cancel`/`kill` to stop it.
+
+The bundled output store retains only the last 1 MiB per Step stream in memory.
+`exec`, `run`, and stream reads warn when the requested prefix has been evicted.
+All output bytes are lost on daemon restart even though execution history and
+output-range facts remain. These commands are not a complete log archive.
+An abrupt crash with an unresolved Run attempt can block startup; there is no
+supported abandon/repair command yet. See [recovery limits](docs/design/daemon.md#bootstrap).
+
+Cue passes `$VAR` and `~` literally when they reach Cue source; it does not
+perform shell expansion. Changes through `cd`/`env`/`umask` apply only within
+one composed execution, not to the invoking shell or the next TUI submission.
 
 ## Repository structure
 
@@ -149,11 +175,12 @@ cued start
 
 Use the same `--socket PATH` for both commands when using a custom socket.
 `stop --force` sends SIGTERM to the same-user process identified by the socket's
-kernel peer credentials and waits up to five seconds for exit. It does not send
+kernel peer credentials and waits up to fifteen seconds for exit. It does not send
 SIGKILL, delete sockets, or use PID files. A timeout is a failed stop, not a
 success; if a service manager restarts the process, stop that service first.
 Normal v4 shutdown still drains owned Runs when receiving SIGTERM.
-`cued start` runs in the foreground; start it through your supervisor if needed.
+`cued start` returns after background readiness. A service manager should run
+`cued start --fg` and own its restart policy.
 When restarting a custom database, also pass the original `--db PATH` to `start`.
 The first default v4 start archives `cued.db` and creates `cued-v4.db`; old
 sessions and execution history are not imported.

@@ -1,9 +1,8 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
@@ -21,11 +20,24 @@ use crate::service::{DaemonService, LifecycleSignal, serve_stream};
 enum HostCommand {
     Help,
     Version,
-    Start { socket: PathBuf, database: PathBuf },
-    GatewayStdio { socket: PathBuf },
-    Status { socket: PathBuf },
-    Stop { socket: PathBuf, force: bool },
-    Restart { socket: PathBuf },
+    Start {
+        socket: PathBuf,
+        database: PathBuf,
+        foreground: bool,
+    },
+    GatewayStdio {
+        socket: PathBuf,
+    },
+    Status {
+        socket: PathBuf,
+    },
+    Stop {
+        socket: PathBuf,
+        force: bool,
+    },
+    Restart {
+        socket: PathBuf,
+    },
 }
 
 pub fn run_cli() -> Result<i32> {
@@ -57,8 +69,16 @@ pub fn run_cli() -> Result<i32> {
 
 async fn run(command: HostCommand) -> Result<i32> {
     match command {
-        HostCommand::Start { socket, database } => {
-            serve(socket, database).await?;
+        HostCommand::Start {
+            socket,
+            database,
+            foreground,
+        } => {
+            if foreground {
+                serve(socket, database).await?;
+            } else {
+                crate::startup::start(&socket, &database).await?;
+            }
             Ok(0)
         }
         HostCommand::GatewayStdio { socket } => {
@@ -75,11 +95,20 @@ async fn run(command: HostCommand) -> Result<i32> {
                 crate::recovery::stop(&socket).await?;
             } else {
                 control(&socket, Command::Shutdown).await?;
+                wait_stopped(&socket).await?;
+                println!("stopped {}", socket.display());
             }
             Ok(0)
         }
         HostCommand::Restart { socket } => {
             let response = control(&socket, Command::Restart).await?;
+            let ResultPayload::RestartAccepted {
+                target_instance_id, ..
+            } = &response
+            else {
+                bail!("daemon returned an unexpected Restart response: {response:?}")
+            };
+            crate::startup::wait_ready(&socket, target_instance_id).await?;
             println!("{}", serde_json::to_string(&response)?);
             Ok(0)
         }
@@ -95,13 +124,17 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
     let lock_path = sidecar(&socket, ".lock");
     let instance_lock = InstanceLock::acquire(&lock_path)?;
     prepare_socket(&socket).await?;
-    if database == dirs::database_path()?
+    if dirs::database_path().is_ok_and(|default| database == default)
         && let Some(archive) = dirs::archive_legacy_database(now_ms())?
     {
         tracing::warn!(path = %archive.display(), "archived IPC v3 database without importing incompatible semantics");
     }
     let database_file = dirs::create_private_file(&database)?;
     drop(database_file);
+    // SQLite manages its own locks on the database inode. Keep host ownership
+    // on a separate file so it cannot conflict with the SQLite VFS locks.
+    let database_lock =
+        InstanceLock::acquire(&sidecar(&std::fs::canonicalize(&database)?, ".lock"))?;
     let connection = Connection::open(&database)
         .with_context(|| format!("open v4 database {}", database.display()))?;
     let store = cue_store_sqlite::Store::from_connection(connection)?;
@@ -163,14 +196,17 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
     .is_some()
     {}
     connections.abort_all();
+    while connections.join_next().await.is_some() {}
     drop(socket_guard);
+    drop(service);
+    drop(database_lock);
     drop(instance_lock);
 
     if let LifecycleSignal::Restart {
         target_instance_id, ..
     } = signal
     {
-        spawn_successor(&socket, &database, &target_instance_id)?;
+        crate::startup::spawn_daemon(&socket, &database, &target_instance_id)?;
     }
     Ok(())
 }
@@ -246,12 +282,12 @@ fn recovery_hint(socket: &Path) -> String {
          Stop it without IPC, then start the installed version:\n  \
          cued stop --force --socket {quoted}\n  \
          cued start --socket {quoted}\n\
-         start runs in the foreground; preserve any custom --db setting.\n\
+         start runs in the background; preserve any custom --db setting (use --fg for a supervisor).\n\
          First default v4 start archives the legacy database without importing old sessions."
     )
 }
 
-async fn control_hello(stream: &mut UnixStream, socket: &Path) -> Result<()> {
+async fn control_hello(stream: &mut UnixStream, socket: &Path) -> Result<String> {
     tokio::time::timeout(CONTROL_TIMEOUT, hello(stream))
         .await
         .context("IPC v4 handshake timed out")
@@ -268,7 +304,7 @@ async fn control_hello(stream: &mut UnixStream, socket: &Path) -> Result<()> {
 async fn status(socket: &Path) -> (i32, String) {
     match connect_control(socket).await {
         Ok(mut stream) => match control_hello(&mut stream, socket).await {
-            Ok(()) => (0, format!("running {} (IPC v4)", socket.display())),
+            Ok(_) => (0, format!("running {} (IPC v4)", socket.display())),
             Err(error) => (
                 1,
                 format!(
@@ -282,8 +318,7 @@ async fn status(socket: &Path) -> (i32, String) {
     }
 }
 
-#[cfg(test)]
-async fn probe(socket: &Path) -> Result<()> {
+pub(crate) async fn probe(socket: &Path) -> Result<String> {
     let mut stream = connect_control(socket).await?;
     control_hello(&mut stream, socket).await
 }
@@ -335,7 +370,7 @@ async fn send_control(stream: &mut UnixStream, command: Command) -> Result<Resul
     }
 }
 
-async fn hello<S>(stream: &mut S) -> Result<()>
+async fn hello<S>(stream: &mut S) -> Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -361,9 +396,10 @@ where
             payload:
                 ResponsePayload::Ok(ResultPayload::Hello {
                     protocol_version: PROTOCOL_VERSION,
+                    instance_id,
                     ..
                 }),
-        } if actual == request_id => Ok(()),
+        } if actual == request_id => Ok(instance_id),
         message => bail!("unexpected IPC v4 Hello response: {message:?}"),
     }
 }
@@ -394,35 +430,15 @@ where
     Ok(cue_protocol::decode_message(&frame)?)
 }
 
-fn spawn_successor(socket: &Path, database: &Path, instance_id: &str) -> Result<()> {
-    let executable = std::env::current_exe().context("resolve current cued executable")?;
-    std::process::Command::new(executable)
-        .arg("start")
-        .arg("--socket")
-        .arg(socket)
-        .arg("--db")
-        .arg(database)
-        .env("CUE_DAEMON_INSTANCE_ID", instance_id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("spawn replacement cued")?;
-    Ok(())
-}
-
 struct InstanceLock(File);
 
 impl InstanceLock {
     fn acquire(path: &Path) -> Result<Self> {
-        dirs::ensure_private_parent(path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
+        let file = dirs::create_private_file(path)?;
+        Self::from_file(file, path)
+    }
+
+    fn from_file(file: File, path: &Path) -> Result<Self> {
         // SAFETY: flock operates on this owned descriptor for the lifetime of
         // InstanceLock and does not access memory.
         let result = unsafe {
@@ -432,7 +448,8 @@ impl InstanceLock {
             )
         };
         if result != 0 {
-            bail!("another cued instance owns {}", path.display())
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("another cued instance owns {}", path.display()));
         }
         Ok(Self(file))
     }
@@ -444,6 +461,39 @@ impl Drop for InstanceLock {
         unsafe {
             libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.0), libc::LOCK_UN);
         }
+    }
+}
+
+async fn wait_stopped(socket: &Path) -> Result<()> {
+    tokio::time::timeout(crate::startup::COMPLETION_TIMEOUT, async {
+        loop {
+            let released = match OpenOptions::new().read(true).write(true)
+                .custom_flags(libc::O_NOFOLLOW).open(sidecar(socket, ".lock")) {
+                Ok(file) => match InstanceLock::from_file(file, &sidecar(socket, ".lock")) {
+                    Ok(lock) => {
+                        // Keep ownership fenced while checking the endpoint. The
+                        // listener closes before drain, so EOF alone is not enough.
+                        let absent = socket_is_absent(socket).await?;
+                        drop(lock);
+                        absent
+                    }
+                    Err(error) if error.downcast_ref::<io::Error>().is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock) => false,
+                    Err(error) => return Err(error),
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => socket_is_absent(socket).await?,
+                Err(error) => return Err(error).context("inspect daemon ownership lock"),
+            };
+            if released { return Ok(()); }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.with_context(|| format!("shutdown accepted, but {} did not release ownership within 15 seconds; stop is not confirmed", socket.display()))?
+}
+
+async fn socket_is_absent(socket: &Path) -> Result<bool> {
+    match connect_control(socket).await {
+        Ok(_) => Ok(false),
+        Err(error) if not_listening(&error) => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -461,84 +511,76 @@ impl Drop for SocketGuard {
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<HostCommand> {
     let mut args = args.into_iter();
     let _program = args.next();
-    let first = args.next();
-    let command = first.as_deref().and_then(OsStr::to_str).unwrap_or("start");
-    if first.is_some() && first.as_deref().and_then(OsStr::to_str).is_none() {
-        bail!("cued command must be valid UTF-8")
+    let first = args.next().unwrap_or_else(|| OsString::from("start"));
+    let mut command = first
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("cued command must be valid UTF-8"))?;
+    let mut options = args.collect::<Vec<_>>();
+    if matches!(command, "--fg" | "-f" | "--socket" | "--db") {
+        options.insert(0, first.clone());
+        command = "start";
     }
-    match command {
-        "help" | "-h" | "--help" => no_args(args, HostCommand::Help),
-        "version" | "-V" | "--version" => no_args(args, HostCommand::Version),
-        "start" => {
-            let (socket, database) = paths(args, true)?;
-            Ok(HostCommand::Start { socket, database })
-        }
-        "gateway-stdio" => {
-            let (socket, _) = paths(args, false)?;
-            Ok(HostCommand::GatewayStdio { socket })
-        }
-        "status" => {
-            let (socket, _) = paths(args, false)?;
-            Ok(HostCommand::Status { socket })
-        }
-        "stop" => {
-            let mut force = false;
-            let mut options = Vec::new();
-            while let Some(option) = args.next() {
-                if option == "--force" {
-                    if force {
-                        bail!("--force was specified more than once")
-                    }
-                    force = true;
-                } else if option == "--socket" {
-                    options.push(option);
-                    options.push(
-                        args.next()
-                            .ok_or_else(|| anyhow::anyhow!("--socket expects a path"))?,
-                    );
-                } else {
-                    options.push(option);
-                }
-            }
-            let (socket, _) = paths(options, false)?;
-            Ok(HostCommand::Stop { socket, force })
-        }
-        "restart" => {
-            let (socket, _) = paths(args, false)?;
-            Ok(HostCommand::Restart { socket })
-        }
-        other => bail!("unknown cued command `{other}`"),
+    if matches!(command, "help" | "-h" | "--help") {
+        return no_args(options.into_iter(), HostCommand::Help);
     }
-}
-
-fn paths(
-    args: impl IntoIterator<Item = OsString>,
-    allow_database: bool,
-) -> Result<(PathBuf, PathBuf)> {
-    let mut args = args.into_iter();
+    if matches!(command, "version" | "-V" | "--version") {
+        return no_args(options.into_iter(), HostCommand::Version);
+    }
+    if !matches!(
+        command,
+        "start" | "gateway-stdio" | "status" | "stop" | "restart"
+    ) {
+        bail!("unknown cued command `{command}`")
+    }
+    if options.len() == 1 && matches!(options[0].to_str(), Some("--help" | "-h")) {
+        return Ok(HostCommand::Help);
+    }
     let mut socket = std::env::var_os("CUE_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(dirs::socket_path);
-    let mut database = dirs::database_path()?;
-    while let Some(option) = args.next() {
+    let mut database = None;
+    let mut foreground = false;
+    let mut force = false;
+    let mut options = options.into_iter();
+    while let Some(option) = options.next() {
         match option.to_str() {
             Some("--socket") => {
                 socket = PathBuf::from(
-                    args.next()
+                    options
+                        .next()
                         .ok_or_else(|| anyhow::anyhow!("--socket expects a path"))?,
-                );
+                )
             }
-            Some("--db") if allow_database => {
-                database = PathBuf::from(
-                    args.next()
+            Some("--db") if command == "start" => {
+                database = Some(PathBuf::from(
+                    options
+                        .next()
                         .ok_or_else(|| anyhow::anyhow!("--db expects a path"))?,
-                );
+                ))
             }
-            Some(value) => bail!("unknown cued option `{value}`"),
+            Some("--fg" | "-f") if command == "start" && !foreground => foreground = true,
+            Some("--force") if command == "stop" && !force => force = true,
+            Some(value) => bail!("unknown or repeated {command} option `{value}`"),
             None => bail!("cued options must be valid UTF-8"),
         }
     }
-    Ok((socket, database))
+    let socket = std::path::absolute(socket).context("resolve daemon socket path")?;
+    Ok(match command {
+        "start" => HostCommand::Start {
+            socket,
+            database: std::path::absolute(match database {
+                Some(path) => path,
+                None => dirs::database_path()?,
+            })
+            .context("resolve daemon database path")?,
+            foreground,
+        },
+        "gateway-stdio" => HostCommand::GatewayStdio { socket },
+        "status" => HostCommand::Status { socket },
+        "stop" => HostCommand::Stop { socket, force },
+        "restart" => HostCommand::Restart { socket },
+        _ => unreachable!(),
+    })
 }
 
 fn no_args(mut args: impl Iterator<Item = OsString>, command: HostCommand) -> Result<HostCommand> {
@@ -548,7 +590,7 @@ fn no_args(mut args: impl Iterator<Item = OsString>, command: HostCommand) -> Re
     Ok(command)
 }
 
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
@@ -564,7 +606,7 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "cued {}\n\nUsage:\n  cued start [--socket PATH] [--db PATH]\n  cued status|restart [--socket PATH]\n  cued stop [--force] [--socket PATH]\n  cued gateway-stdio [--socket PATH]\n  cued --version\n\nThe daemon serves only strict IPC v4 and uses a fresh v4 SQLite database.\n  stop --force sends SIGTERM to the same-user socket peer without IPC and waits for exit; it never sends SIGKILL.",
+        "cued {}\n\nUsage:\n  cued start [--fg|-f] [--socket PATH] [--db PATH]\n  cued status|restart [--socket PATH]\n  cued stop [--force] [--socket PATH]\n  cued gateway-stdio [--socket PATH]\n  cued --version\n\nstart runs in the background and returns after IPC v4 readiness.\n  --fg/-f runs in the foreground for terminals and service managers.\n  stop waits for shutdown; restart waits for the requested successor to be ready.\n  Background logs are appended to <socket>.log.\n\nThe daemon serves only strict IPC v4 and uses a fresh v4 SQLite database.\n  stop --force sends SIGTERM to the same-user socket peer without IPC and waits for exit; it never sends SIGKILL.",
         crate::version()
     );
 }
@@ -587,11 +629,11 @@ mod tests {
             vec!["cued", "stop", "--socket", "custom.sock", "--force"],
         ] {
             assert!(
-                matches!(parse(args.into_iter().map(OsString::from)).unwrap(), HostCommand::Stop { force: true, socket } if socket == Path::new("custom.sock"))
+                matches!(parse(args.into_iter().map(OsString::from)).unwrap(), HostCommand::Stop { force: true, socket } if socket == std::path::absolute("custom.sock").unwrap())
             );
         }
         assert!(
-            matches!(parse(["cued", "stop", "--socket", "--force"].map(OsString::from)).unwrap(), HostCommand::Stop { force: false, socket } if socket == Path::new("--force"))
+            matches!(parse(["cued", "stop", "--socket", "--force"].map(OsString::from)).unwrap(), HostCommand::Stop { force: false, socket } if socket == std::path::absolute("--force").unwrap())
         );
         for args in [
             vec!["cued", "restart", "--force"],

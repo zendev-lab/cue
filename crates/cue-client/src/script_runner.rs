@@ -3,9 +3,9 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use cue_core::{ExecutionState, OutputStream, StepFailure, StepState};
-use cue_protocol::{OutputRange, Query, ResultPayload};
+use cue_protocol::{OutputChunk, OutputRange, Query, ResultPayload};
 
 use crate::default_socket_path;
 use crate::execution::{ExecutionClient, output_bytes, process_scope, wait_execution};
@@ -48,13 +48,52 @@ pub(crate) async fn write_execution_output(
             })
             .await?;
         let ResultPayload::Output { chunks } = response else {
-            continue;
+            bail!(
+                "daemon returned an unexpected output response for {}",
+                step.id()
+            );
         };
+        warn_missing_output_prefix(&chunks);
         std::io::stdout().write_all(&output_bytes(&chunks, OutputStream::Stdout))?;
         std::io::stderr().write_all(&output_bytes(&chunks, OutputStream::Stderr))?;
         std::io::stdout().write_all(&output_bytes(&chunks, OutputStream::Terminal))?;
     }
+    report_execution_failure(execution);
     Ok(())
+}
+
+/// These reads start at offset zero. A later returned offset proves the prefix
+/// has been evicted; it must not be presented as complete command output.
+pub(crate) fn warn_missing_output_prefix(chunks: &[OutputChunk]) {
+    for chunk in chunks.iter().filter(|chunk| chunk.offset > 0) {
+        eprintln!(
+            "cue: {} {:?} output was truncated; first retained byte is {}",
+            chunk.step, chunk.stream, chunk.offset
+        );
+    }
+}
+
+fn report_execution_failure(execution: &cue_protocol::ExecutionView) {
+    if execution.state != ExecutionState::Failed {
+        return;
+    }
+    for step in &execution.snapshot.steps {
+        match step.state() {
+            StepState::Failed {
+                failure: StepFailure::Spawn { message },
+            } => eprintln!("cue: {} could not start: {message}", step.id()),
+            StepState::Failed {
+                failure: StepFailure::Builtin { message },
+            } => eprintln!("cue: {} builtin failed: {message}", step.id()),
+            StepState::Failed {
+                failure: StepFailure::Infrastructure { message },
+            } => eprintln!("cue: {} runtime failed: {message}", step.id()),
+            StepState::Failed {
+                failure: StepFailure::Signal { signal },
+            } => eprintln!("cue: {} terminated by signal {signal}", step.id()),
+            _ => {}
+        }
+    }
 }
 
 fn full_range() -> OutputRange {

@@ -290,6 +290,7 @@ dependencies = [
  "cue-tui",
  "libc",
  "serde",
+ "tokio",
  "toml",
 ]
 

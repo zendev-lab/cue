@@ -1,5 +1,10 @@
 # Cue Shell 竞品调研报告
 
+> Historical research only. Commands, wrappers, and product capabilities below
+> describe the pre-v4 design, not the current release. Use the
+> [design index](../design/README.md) and [README](../../README.md) for supported behavior.
+
+
 > **调研日期**: 2025-07
 > **调研范围**: Agent 友好型 Shell、进程管理器、任务运行器、现代 Shell、编码 Agent 工具接口、调度器
 > **核心定位**: Cue Shell 是一个异步进程运行时 + TUI + MCP 接口，为人机协作设计，**不是**传统 Shell，**不是**终端复用器，而是带会话/环境管理的异步任务调度器。
