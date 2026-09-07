@@ -131,6 +131,9 @@ process 的可观察性。
 
 ## 修订记录
 
+- 2026-08-31：完成 vNext client transport；frontend 显式 snapshot cwd/env/umask，按
+  PutScope -> compile -> Submit 顺序提交，Hello/ClientId、RequestId/OperationId、strict
+  v4 framing 与并发 response/event multiplexer 不再复用 v3 session cursor。
 - 2026-08-31：完成 vNext daemon service；启动时绑定 typed RuntimeAssembly，IPC v4
   强制 Hello/client identity，PutScope/Submit 与 operation claim 原子提交，fact cursor
   replay、live event、volatile secret store 和 PTY observer/controller attachment 进入主路径。

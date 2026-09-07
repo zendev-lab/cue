@@ -53,3 +53,8 @@ fail_if_match \
     'crate::(actor|storage)|cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
     'the vNext daemon service must not depend on the IPC v3 actor tree or legacy execution policy' \
     "${repo_root}/crates/cue-daemon/src/vnext.rs"
+
+fail_if_match \
+    'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
+    'the vNext client must use only Core vNext and the strict IPC v4 protocol' \
+    "${repo_root}/crates/cue-client/src/vnext.rs"
