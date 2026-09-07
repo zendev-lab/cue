@@ -13,19 +13,16 @@ name = "cue-tui"
 path = "src/main.rs"
 
 [dependencies]
-ansi-to-tui.workspace = true
 anyhow.workspace = true
-base64.workspace = true
 crossterm.workspace = true
 cue-client = { path = "../cue-client" }
 cue-core = { path = "../cue-core" }
 cue-language = { path = "../cue-language" }
+cue-protocol = { path = "../cue-protocol" }
 ratatui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tui-term.workspace = true
 
 [dev-dependencies]
+cue-daemon = { path = "../cue-daemon" }

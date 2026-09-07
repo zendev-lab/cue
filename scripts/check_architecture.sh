@@ -58,3 +58,10 @@ fail_if_match \
     'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
     'the vNext client must use only Core vNext and the strict IPC v4 protocol' \
     "${repo_root}/crates/cue-client/src/vnext.rs"
+
+fail_if_match \
+    'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
+    'vNext executable frontends must not restore IPC v3 or legacy execution policy' \
+    "${repo_root}/crates/cue-client/src/cli.rs" \
+    "${repo_root}/crates/cue-client/src/script_runner.rs" \
+    "${repo_root}/crates/cue-tui/src"
