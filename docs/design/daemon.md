@@ -109,3 +109,19 @@ Drain requests Graceful cancellation for up to five seconds, then Force for up
 to five more seconds. If quiescence remains unproven, drain returns an error.
 A host exit after that error can leave startup blocked by the attempt marker;
 the timeout is not evidence that the processes stopped.
+
+## Local control recovery
+
+The host CLI bounds connection, Hello, and control-response waits. Status keeps
+an absent listener distinct from one that accepts connections but cannot speak
+IPC v4. Failed Hello reports a protocol-independent recovery command; a lost
+control response reports an unknown outcome rather than automatically replaying
+or signalling the daemon.
+
+`cued stop --force` is an explicit local escape hatch. It targets only the
+same-user PID obtained from the selected Unix socket's kernel credentials,
+sends SIGTERM once, and waits for process exit and socket unavailability. It
+rejects non-socket paths, missing peer PID support, and invalid/self PIDs. It
+never escalates to SIGKILL or signals a supervisor's replacement. The host
+handles SIGTERM through the same drain path as its other shutdown signals.
+This facility contains no legacy IPC codec or execution compatibility bridge.
