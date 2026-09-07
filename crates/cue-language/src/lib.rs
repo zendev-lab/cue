@@ -14,6 +14,7 @@ mod parse;
 mod resolver;
 mod token;
 mod tokenizer;
+mod vnext_compiler;
 
 pub use assistance::{
     CompletionItem, CompletionKind, HighlightKind, HighlightSpan, complete_input, highlight_input,
@@ -27,6 +28,10 @@ pub use parse::ParseError;
 pub use parse::ParseErrorKind;
 pub use token::Token;
 pub use tokenizer::Tokenizer;
+pub use vnext_compiler::{
+    OutputSelection, OutputTarget, VnextCommand, VnextCompileError, VnextFrontendAction,
+    compile_vnext_command, compile_vnext_file,
+};
 
 pub(crate) fn parse_command(
     input: &str,

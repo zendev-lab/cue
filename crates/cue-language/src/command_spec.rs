@@ -18,6 +18,7 @@ pub enum CommandArgKind {
     Tail(CommandIdKind),
     OptionalId(CommandIdKind),
     OptionalText,
+    OptionalWords,
     Empty,
 }
 
@@ -344,7 +345,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "env",
         category: CommandCategory::Scope,
-        arg_kind: CommandArgKind::OptionalText,
+        arg_kind: CommandArgKind::OptionalWords,
         usage: ":env [subcommand]",
         detail: "Inspect or update the current session environment",
         documented: true,
@@ -355,6 +356,14 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg_kind: CommandArgKind::OptionalText,
         usage: ":cd <path>",
         detail: "Move the current session working directory",
+        documented: true,
+    },
+    CommandSpec {
+        name: "umask",
+        category: CommandCategory::Scope,
+        arg_kind: CommandArgKind::OptionalText,
+        usage: ":umask <octal-mask>",
+        detail: "Set the file-creation mask for this execution scope",
         documented: true,
     },
     CommandSpec {

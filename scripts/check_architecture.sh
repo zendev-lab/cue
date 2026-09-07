@@ -43,3 +43,8 @@ fail_if_match \
     '^[[:space:]]*cue-language[[:space:]]*=' \
     'cue-daemon must not parse the surface language' \
     "${repo_root}/crates/cue-daemon/Cargo.toml"
+
+fail_if_match \
+    'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
+    'the vNext language compiler must not depend on IPC v3 or legacy execution policy' \
+    "${repo_root}/crates/cue-language/src/vnext_compiler.rs"
