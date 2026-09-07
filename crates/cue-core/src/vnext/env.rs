@@ -45,7 +45,7 @@ pub enum Sensitivity {
     Sensitive,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct EnvValue {
     value: String,
     sensitivity: Sensitivity,
@@ -73,6 +73,12 @@ impl EnvValue {
 
     pub const fn sensitivity(&self) -> Sensitivity {
         self.sensitivity
+    }
+}
+
+impl fmt::Debug for EnvValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EnvValue([REDACTED])")
     }
 }
 
@@ -193,6 +199,7 @@ mod tests {
         assert!(serde_json::from_str::<EnvKey>(r#""A=B""#).is_err());
         assert!(serde_json::from_str::<EnvKey>(r#""A\u0000B""#).is_err());
         assert!(EnvValue::new("a\0b").is_err());
+        assert_eq!(format!("{:?}", value("secret")), "EnvValue([REDACTED])");
     }
 
     #[test]
