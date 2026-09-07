@@ -29,6 +29,8 @@ Captured mode preserves each typed PipeLink and stores every unlinked stdout
 or stderr stream separately. Pipeline success follows the final process after
 all segments are reaped. Every segment owns a process group; partial-spawn
 failure, cancellation, and normal leader exit clean descendant processes.
+A failed, panicked, or timed-out output reader stops and joins the remaining
+readers before completion is reported, releasing their descriptors.
 
 PTY mode retains the same internal PipeLinks but routes all terminal-facing
 stdin/stdout/stderr through one PTY endpoint for the entire Run. Its RunControl
