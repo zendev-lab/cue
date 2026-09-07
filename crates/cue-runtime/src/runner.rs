@@ -142,6 +142,7 @@ async fn spawn_pty(
             Ok(Err(error)) => RunExit::InfrastructureFailure(error.to_string()),
             Err(_) => {
                 pty_reader.abort();
+                let _ = pty_reader.await;
                 RunExit::InfrastructureFailure("PTY output did not close after process exit".into())
             }
         };
@@ -195,23 +196,13 @@ async fn spawn_pipeline(
                 let (read, write) = create_pipe()?;
                 command.stdout(Stdio::from(write));
                 next_stdin = Some(read);
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stderr,
-                    terminal,
-                    &mut readers,
-                )?;
+                configure_unlinked_stream(&mut command, OutputStream::Stderr, terminal)?;
             }
             (Some(PipeLink::StderrToStdin), _) => {
                 let (read, write) = create_pipe()?;
                 command.stderr(Stdio::from(write));
                 next_stdin = Some(read);
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stdout,
-                    terminal,
-                    &mut readers,
-                )?;
+                configure_unlinked_stream(&mut command, OutputStream::Stdout, terminal)?;
             }
             (Some(PipeLink::StdoutAndStderrToStdin), _) => {
                 let (read, write) = create_pipe()?;
@@ -220,18 +211,8 @@ async fn spawn_pipeline(
                 next_stdin = Some(read);
             }
             (None, _) => {
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stdout,
-                    terminal,
-                    &mut readers,
-                )?;
-                configure_unlinked_stream(
-                    &mut command,
-                    OutputStream::Stderr,
-                    terminal,
-                    &mut readers,
-                )?;
+                configure_unlinked_stream(&mut command, OutputStream::Stdout, terminal)?;
+                configure_unlinked_stream(&mut command, OutputStream::Stderr, terminal)?;
             }
         }
 
@@ -267,7 +248,6 @@ fn configure_unlinked_stream(
     command: &mut Command,
     stream: OutputStream,
     terminal: Option<&std::fs::File>,
-    _readers: &mut Vec<(OutputStream, Box<dyn AsyncRead + Unpin + Send>)>,
 ) -> Result<(), RuntimeError> {
     let stdio = match terminal {
         Some(terminal) => Stdio::from(clone_file(terminal, "clone PTY output")?),
@@ -413,22 +393,27 @@ async fn combine_reader_results(
     exit: RunExit,
     readers: Vec<tokio::task::JoinHandle<Result<(), RuntimeError>>>,
 ) -> RunExit {
-    for mut reader in readers {
-        match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut reader).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                return RunExit::InfrastructureFailure(error.to_string());
-            }
-            Ok(Err(error)) => {
-                return RunExit::InfrastructureFailure(error.to_string());
-            }
+    let mut readers = readers.into_iter();
+    while let Some(mut reader) = readers.next() {
+        let message = match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut reader).await {
+            Ok(Ok(Ok(()))) => continue,
+            Ok(Ok(Err(error))) => error.to_string(),
+            Ok(Err(error)) => error.to_string(),
             Err(_) => {
                 reader.abort();
-                return RunExit::InfrastructureFailure(
-                    "captured output did not close after process exit".into(),
-                );
+                let _ = reader.await;
+                "captured output did not close after process exit".into()
             }
+        };
+        // Dropping a JoinHandle detaches its task. Stop and join every reader
+        // before publishing completion so none retain descriptors or append later.
+        for reader in readers.as_slice() {
+            reader.abort();
         }
+        for reader in readers {
+            let _ = reader.await;
+        }
+        return RunExit::InfrastructureFailure(message);
     }
     exit
 }
@@ -801,6 +786,37 @@ mod tests {
 
     use super::*;
     use crate::{MemoryOutputStore, OutputAppend, OutputSlice};
+
+    #[tokio::test]
+    async fn reader_failure_releases_every_remaining_output_reader() {
+        use tokio::io::AsyncWriteExt as _;
+
+        for failure in ["error", "panic", "timeout"] {
+            let first = tokio::spawn(async move {
+                match failure {
+                    "error" => Err(RuntimeError::infrastructure("read failed")),
+                    "panic" => panic!("reader panicked"),
+                    _ => std::future::pending().await,
+                }
+            });
+            let (reader, mut writer) = tokio::io::duplex(16);
+            let second = tokio::spawn(pump_reader(
+                StepId {
+                    execution: ExecutionId(1),
+                    index: 1,
+                },
+                OutputStream::Stdout,
+                Box::new(reader),
+                Arc::new(MemoryOutputStore::new(1024)),
+            ));
+            let exit = combine_reader_results(RunExit::Success, vec![first, second]).await;
+            assert!(matches!(exit, RunExit::InfrastructureFailure(_)));
+            assert!(
+                writer.write_all(b"late output").await.is_err(),
+                "{failure}: failed completion retained another output reader"
+            );
+        }
+    }
 
     struct FailingOutputStore;
 
