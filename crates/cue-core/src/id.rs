@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, str::FromStr};
+use std::{error::Error, fmt, num::NonZeroU64, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -15,6 +15,23 @@ pub struct ScheduleId(pub u64);
 pub struct StepId {
     pub execution: ExecutionId,
     pub index: u32,
+}
+
+/// Monotonic durable fact cursor, scoped by the backing event store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(NonZeroU64);
+
+impl EventId {
+    pub fn new(value: u64) -> Result<Self, ParseIdError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or_else(|| ParseIdError::new("event", "0"))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
 }
 
 /// Content-addressed scope hash (blake3), displayed as S@a3f1...
@@ -53,6 +70,12 @@ impl fmt::Display for ScheduleId {
 impl fmt::Display for StepId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/S{}", self.execution, self.index)
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "V{}", self.get())
     }
 }
 
@@ -225,6 +248,7 @@ mod tests {
     fn json_rejects_zero_and_unknown_identity_fields() {
         assert!(serde_json::from_str::<ExecutionId>("0").is_err());
         assert!(serde_json::from_str::<ScheduleId>("0").is_err());
+        assert!(serde_json::from_str::<EventId>("0").is_err());
         assert!(serde_json::from_str::<StepId>(r#"{"execution":1,"index":0}"#).is_err());
         assert!(
             serde_json::from_str::<StepId>(r#"{"execution":1,"index":1,"extra":true}"#).is_err()

@@ -3,9 +3,10 @@
 //! This provider owns a fresh schema. It never opens, imports, or mutates the
 //! IPC v3 database; the daemon hard cut archives that database separately.
 
-use cue_core::vnext::{Execution, ExecutionSnapshot, ExecutionState, Scope, StepState};
-use cue_core::{ExecutionId, ScopeHash, StepId};
-use cue_protocol::{ClientId, Command, EventId, Fact, FactEvent, OperationId, ResponsePayload};
+use cue_core::vnext::{Execution, ExecutionState, Fact, FactEvent, Scope, StepState};
+pub use cue_core::vnext::{ExecutionProjection as StoredExecution, FactDraft};
+use cue_core::{EventId, ExecutionId, ScopeHash, StepId};
+use cue_protocol::{ClientId, Command, OperationId, ResponsePayload};
 use rusqlite::{Connection, OptionalExtension as _};
 use thiserror::Error;
 
@@ -369,7 +370,7 @@ impl Store {
                         value: event_id,
                     }
                 })?)
-                .map_err(StoreError::InvalidProtocolId)?,
+                .map_err(StoreError::InvalidCoreId)?,
                 occurred_at_ms,
                 fact: serde_json::from_str(&fact_json)?,
             });
@@ -424,20 +425,6 @@ impl Store {
     fn connection(&self) -> &Connection {
         &self.connection
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredExecution {
-    pub snapshot: ExecutionSnapshot,
-    pub state: ExecutionState,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FactDraft {
-    pub occurred_at_ms: i64,
-    pub fact: Fact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1041,7 +1028,7 @@ pub enum StoreError {
     #[error(transparent)]
     InvalidSnapshot(#[from] cue_core::vnext::ExecutionError),
     #[error(transparent)]
-    InvalidProtocolId(#[from] cue_protocol::IdError),
+    InvalidCoreId(#[from] cue_core::id::ParseIdError),
     #[error("database schema {actual} is newer than supported schema {supported}")]
     NewerSchema { actual: u32, supported: u32 },
     #[error("scope row hash mismatch: expected {expected}, computed {actual}")]

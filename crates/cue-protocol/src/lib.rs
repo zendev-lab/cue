@@ -8,12 +8,13 @@ mod framing;
 mod id;
 mod message;
 
+pub use cue_core::EventId;
+pub use cue_core::vnext::{Fact, FactEvent, OutputStream};
 pub use framing::{FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message};
-pub use id::{AttachmentId, ClientId, EventId, IdError, OperationId, RequestId};
+pub use id::{AttachmentId, ClientId, IdError, OperationId, RequestId};
 pub use message::{
-    Capability, Command, EventPayload, ExecutionView, Fact, FactEvent, Hello, Message, OutputChunk,
-    OutputRange, OutputStream, ProtocolError, ProtocolErrorCode, PtyRole, Query, ResponsePayload,
-    ResultPayload,
+    Capability, Command, EventPayload, ExecutionView, Hello, Message, OutputChunk, OutputRange,
+    ProtocolError, ProtocolErrorCode, PtyRole, Query, ResponsePayload, ResultPayload,
 };
 
 pub const PROTOCOL_VERSION: u32 = 4;

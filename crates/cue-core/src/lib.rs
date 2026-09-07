@@ -26,7 +26,7 @@ pub mod vnext;
 
 // Re-export commonly used types at crate root.
 pub use event_channel::EventChannel;
-pub use id::{ExecutionId, ScheduleId, ScopeHash, StepId};
+pub use id::{EventId, ExecutionId, ScheduleId, ScopeHash, StepId};
 pub use launch::{SandboxMode, SandboxSettings, SandboxUpper};
 pub use resource::{
     Grant, Need, ParseQuantityError, ParseQuantityReason, ProviderId, Reject, Reservation,

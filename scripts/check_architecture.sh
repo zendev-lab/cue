@@ -20,8 +20,8 @@ fail_if_match \
     "${repo_root}/crates/cue-core/Cargo.toml"
 
 fail_if_match \
-    '^[[:space:]]*(cue-(client|daemon|language|protocol)|rusqlite|tokio)[[:space:]]*=' \
-    'cue-runtime composition must remain independent of daemon, transport, storage, and frontends' \
+    '^[[:space:]]*(cue-(client|daemon|language|protocol|store-sqlite)|rusqlite)[[:space:]]*=' \
+    'cue-runtime must remain independent of daemon, transport, persistence, and frontends' \
     "${repo_root}/crates/cue-runtime/Cargo.toml"
 
 fail_if_match \
