@@ -2,6 +2,7 @@
 
 mod dirs;
 mod host;
+mod recovery;
 pub mod service;
 
 pub fn version() -> &'static str {

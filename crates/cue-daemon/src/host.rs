@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use cue_protocol::{
@@ -24,7 +24,7 @@ enum HostCommand {
     Start { socket: PathBuf, database: PathBuf },
     GatewayStdio { socket: PathBuf },
     Status { socket: PathBuf },
-    Stop { socket: PathBuf },
+    Stop { socket: PathBuf, force: bool },
     Restart { socket: PathBuf },
 }
 
@@ -65,18 +65,17 @@ async fn run(command: HostCommand) -> Result<i32> {
             relay_stdio(socket).await?;
             Ok(0)
         }
-        HostCommand::Status { socket } => match probe(&socket).await {
-            Ok(()) => {
-                println!("running {}", socket.display());
-                Ok(0)
+        HostCommand::Status { socket } => {
+            let (code, message) = status(&socket).await;
+            println!("{message}");
+            Ok(code)
+        }
+        HostCommand::Stop { socket, force } => {
+            if force {
+                crate::recovery::stop(&socket).await?;
+            } else {
+                control(&socket, Command::Shutdown).await?;
             }
-            Err(error) => {
-                println!("not running {} ({error})", socket.display());
-                Ok(1)
-            }
-        },
-        HostCommand::Stop { socket } => {
-            control(&socket, Command::Shutdown).await?;
             Ok(0)
         }
         HostCommand::Restart { socket } => {
@@ -89,6 +88,8 @@ async fn run(command: HostCommand) -> Result<i32> {
 }
 
 async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
     dirs::ensure_private_parent(&socket)?;
     dirs::ensure_private_parent(&database)?;
     let lock_path = sidecar(&socket, ".lock");
@@ -142,6 +143,7 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
                     }
                 }
             }
+            _ = terminate.recv() => break LifecycleSignal::Shutdown,
             result = tokio::signal::ctrl_c() => {
                 result.context("install Ctrl-C handler")?;
                 break LifecycleSignal::Shutdown;
@@ -219,29 +221,104 @@ async fn relay_stdio(socket: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn probe(socket: &Path) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) async fn connect_control(socket: &Path) -> Result<UnixStream> {
+    tokio::time::timeout(CONTROL_TIMEOUT, UnixStream::connect(socket))
         .await
-        .with_context(|| format!("connect to {}", socket.display()))?;
-    hello(&mut stream).await
+        .context("timed out connecting to daemon")?
+        .with_context(|| format!("connect to {}", socket.display()))
+}
+
+fn not_listening(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        )
+    })
+}
+
+fn recovery_hint(socket: &Path) -> String {
+    let quoted = format!("'{}'", socket.to_string_lossy().replace('\'', "'\"'\"'"));
+    format!(
+        "A daemon from before the upgrade may still be running.\n\
+         Stop it without IPC, then start the installed version:\n  \
+         cued stop --force --socket {quoted}\n  \
+         cued start --socket {quoted}\n\
+         start runs in the foreground; preserve any custom --db setting.\n\
+         First default v4 start archives the legacy database without importing old sessions."
+    )
+}
+
+async fn control_hello(stream: &mut UnixStream, socket: &Path) -> Result<()> {
+    tokio::time::timeout(CONTROL_TIMEOUT, hello(stream))
+        .await
+        .context("IPC v4 handshake timed out")
+        .and_then(|result| result)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "IPC v4 handshake failed at {}: {error:#}\n{}",
+                socket.display(),
+                recovery_hint(socket)
+            )
+        })
+}
+
+async fn status(socket: &Path) -> (i32, String) {
+    match connect_control(socket).await {
+        Ok(mut stream) => match control_hello(&mut stream, socket).await {
+            Ok(()) => (0, format!("running {} (IPC v4)", socket.display())),
+            Err(error) => (
+                1,
+                format!(
+                    "listening {} but IPC v4 unavailable: {error:#}",
+                    socket.display()
+                ),
+            ),
+        },
+        Err(error) if not_listening(&error) => (1, format!("not running {}", socket.display())),
+        Err(error) => (1, format!("cannot determine daemon status: {error:#}")),
+    }
+}
+
+#[cfg(test)]
+async fn probe(socket: &Path) -> Result<()> {
+    let mut stream = connect_control(socket).await?;
+    control_hello(&mut stream, socket).await
 }
 
 async fn control(socket: &Path, command: Command) -> Result<ResultPayload> {
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = match connect_control(socket).await {
+        Ok(stream) => stream,
+        Err(error) if not_listening(&error) && matches!(command, Command::Shutdown) => {
+            println!("not running {}", socket.display());
+            return Ok(ResultPayload::Ack);
+        }
+        Err(error) => return Err(error),
+    };
+    control_hello(&mut stream, socket).await?;
+    tokio::time::timeout(CONTROL_TIMEOUT, send_control(&mut stream, command))
         .await
-        .with_context(|| format!("connect to {}", socket.display()))?;
-    hello(&mut stream).await?;
+        .context("daemon control response timed out; command outcome is unknown")?
+}
+
+async fn send_control(stream: &mut UnixStream, command: Command) -> Result<ResultPayload> {
     let request_id = RequestId::new(2)?;
     write_message(
-        &mut stream,
+        stream,
         &Message::Command {
             request_id,
             operation_id: OperationId::new(format!("cued-control:{}", uuid::Uuid::new_v4()))?,
             command,
         },
     )
-    .await?;
-    match read_message(&mut stream).await? {
+    .await
+    .context("send daemon control command; command outcome is unknown")?;
+    match read_message(stream)
+        .await
+        .context("read daemon control response; command outcome is unknown")?
+    {
         Message::Response {
             request_id: actual,
             payload: ResponsePayload::Ok(result),
@@ -405,8 +482,26 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<HostCommand> {
             Ok(HostCommand::Status { socket })
         }
         "stop" => {
-            let (socket, _) = paths(args, false)?;
-            Ok(HostCommand::Stop { socket })
+            let mut force = false;
+            let mut options = Vec::new();
+            while let Some(option) = args.next() {
+                if option == "--force" {
+                    if force {
+                        bail!("--force was specified more than once")
+                    }
+                    force = true;
+                } else if option == "--socket" {
+                    options.push(option);
+                    options.push(
+                        args.next()
+                            .ok_or_else(|| anyhow::anyhow!("--socket expects a path"))?,
+                    );
+                } else {
+                    options.push(option);
+                }
+            }
+            let (socket, _) = paths(options, false)?;
+            Ok(HostCommand::Stop { socket, force })
         }
         "restart" => {
             let (socket, _) = paths(args, false)?;
@@ -469,7 +564,7 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "cued {}\n\nUsage:\n  cued start [--socket PATH] [--db PATH]\n  cued status|stop|restart [--socket PATH]\n  cued gateway-stdio [--socket PATH]\n  cued --version\n\nThe daemon serves only strict IPC v4 and uses a fresh v4 SQLite database.",
+        "cued {}\n\nUsage:\n  cued start [--socket PATH] [--db PATH]\n  cued status|restart [--socket PATH]\n  cued stop [--force] [--socket PATH]\n  cued gateway-stdio [--socket PATH]\n  cued --version\n\nThe daemon serves only strict IPC v4 and uses a fresh v4 SQLite database.\n  stop --force sends SIGTERM to the same-user socket peer without IPC and waits for exit; it never sends SIGKILL.",
         crate::version()
     );
 }
@@ -483,6 +578,28 @@ mod tests {
         assert!(parse([OsString::from("cued"), OsString::from("start")]).is_ok());
         assert!(parse([OsString::from("cued"), OsString::from("eval")]).is_err());
         assert!(parse([OsString::from("cued"), OsString::from("cron")]).is_err());
+    }
+
+    #[test]
+    fn force_is_only_a_stop_option_and_socket_values_are_not_flags() {
+        for args in [
+            vec!["cued", "stop", "--force", "--socket", "custom.sock"],
+            vec!["cued", "stop", "--socket", "custom.sock", "--force"],
+        ] {
+            assert!(
+                matches!(parse(args.into_iter().map(OsString::from)).unwrap(), HostCommand::Stop { force: true, socket } if socket == Path::new("custom.sock"))
+            );
+        }
+        assert!(
+            matches!(parse(["cued", "stop", "--socket", "--force"].map(OsString::from)).unwrap(), HostCommand::Stop { force: false, socket } if socket == Path::new("--force"))
+        );
+        for args in [
+            vec!["cued", "restart", "--force"],
+            vec!["cued", "stop", "--force", "--force"],
+            vec!["cued", "stop", "--socket"],
+        ] {
+            assert!(parse(args.into_iter().map(OsString::from)).is_err());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

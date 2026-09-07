@@ -135,3 +135,25 @@ just npm-package-smoke
 
 See [architecture](ARCHITECTURE.md), [design](docs/design/README.md),
 [testing](docs/testing.md), and the canonical [agent Skill](skills/cue/SKILL.md).
+
+### Recovering after a daemon upgrade
+
+Replacing the `cued` executable does not replace an already running daemon.
+If `status`, `stop`, or `restart` reports that the socket is listening but the
+IPC v4 handshake failed, stop the old process independently of its protocol:
+
+```sh
+cued stop --force
+cued start
+```
+
+Use the same `--socket PATH` for both commands when using a custom socket.
+`stop --force` sends SIGTERM to the same-user process identified by the socket's
+kernel peer credentials and waits up to five seconds for exit. It does not send
+SIGKILL, delete sockets, or use PID files. A timeout is a failed stop, not a
+success; if a service manager restarts the process, stop that service first.
+Normal v4 shutdown still drains owned Runs when receiving SIGTERM.
+`cued start` runs in the foreground; start it through your supervisor if needed.
+When restarting a custom database, also pass the original `--db PATH` to `start`.
+The first default v4 start archives `cued.db` and creates `cued-v4.db`; old
+sessions and execution history are not imported.
