@@ -9,17 +9,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use cue_core::vnext::{CancelMode, Fact, OutputStream};
+use cue_core::{CancelMode, Fact, OutputStream};
 use cue_core::{ExecutionId, StepId};
 use cue_language::Mode;
 use cue_protocol::{AttachmentId, Command, EventPayload, OutputRange, Query, ResultPayload};
 
 use crate::default_socket_path;
-use crate::script_runner::{execution_exit_code, write_execution_output};
-use crate::vnext::{
-    SurfaceOutcome, VnextClient, VnextMultiplexedClient, output_bytes, process_scope,
-    wait_execution,
+use crate::execution::{
+    ExecutionClient, MultiplexedClient, SurfaceOutcome, output_bytes, process_scope, wait_execution,
 };
+use crate::script_runner::{execution_exit_code, write_execution_output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientCommand {
@@ -60,7 +59,7 @@ async fn run_connected(command: ClientCommand) -> Result<i32> {
     let socket = std::env::var_os("CUE_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
-    let mut client = VnextClient::connect(&socket).await?;
+    let mut client = ExecutionClient::connect(&socket).await?;
     match command {
         ClientCommand::Exec(source) => {
             match client
@@ -149,7 +148,7 @@ fn selected_range(selected: bool) -> OutputRange {
     }
 }
 
-async fn foreground(mut client: VnextClient, step: StepId, observe: bool) -> Result<i32> {
+async fn foreground(mut client: ExecutionClient, step: StepId, observe: bool) -> Result<i32> {
     client
         .command(Command::WatchExecution {
             id: step.execution,
@@ -210,7 +209,7 @@ fn terminal_input() -> TerminalInput {
 }
 
 async fn forward_terminal(
-    client: Arc<VnextMultiplexedClient>,
+    client: Arc<MultiplexedClient>,
     step: StepId,
     attachment: AttachmentId,
     mut input: Option<TerminalInput>,
@@ -269,7 +268,7 @@ async fn forward_terminal(
 }
 
 async fn detach_terminal(
-    client: &VnextMultiplexedClient,
+    client: &MultiplexedClient,
     attachment: AttachmentId,
     pending: &mut Option<PendingPtyInput>,
 ) -> Result<()> {
@@ -431,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_exposes_only_vnext_kernel_commands() {
+    fn parser_exposes_only_kernel_commands() {
         assert_eq!(
             parse_command(args(&["cue-client", "show", "E7"])).unwrap(),
             ClientCommand::Show(ExecutionId(7))
@@ -526,7 +525,7 @@ mod tests {
                 }
             });
             let client = Arc::new(
-                VnextClient::connect_stream(stream, ClientId::new("foreground").unwrap())
+                ExecutionClient::connect_stream(stream, ClientId::new("foreground").unwrap())
                     .await
                     .unwrap()
                     .into_multiplexed(),

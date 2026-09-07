@@ -4,11 +4,11 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use cue_core::vnext::{ExecutionState, OutputStream, StepFailure, StepState};
+use cue_core::{ExecutionState, OutputStream, StepFailure, StepState};
 use cue_protocol::{OutputRange, Query, ResultPayload};
 
 use crate::default_socket_path;
-use crate::vnext::{VnextClient, output_bytes, process_scope, wait_execution};
+use crate::execution::{ExecutionClient, output_bytes, process_scope, wait_execution};
 
 pub fn run(path: PathBuf) -> Result<i32> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -24,7 +24,7 @@ async fn run_async(path: PathBuf) -> Result<i32> {
     let socket = std::env::var_os("CUE_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
-    let mut client = VnextClient::connect(&socket).await?;
+    let mut client = ExecutionClient::connect(&socket).await?;
     let submitted = client
         .submit_file(process_scope()?, &source)
         .await
@@ -35,7 +35,7 @@ async fn run_async(path: PathBuf) -> Result<i32> {
 }
 
 pub(crate) async fn write_execution_output(
-    client: &mut VnextClient,
+    client: &mut ExecutionClient,
     execution: &cue_protocol::ExecutionView,
 ) -> Result<()> {
     for step in &execution.snapshot.steps {
@@ -89,7 +89,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cue_core::ExecutionId;
-    use cue_core::vnext::{
+    use cue_core::{
         AbsolutePath, Argv, Execution, ExecutionPlan, ExecutionSpec, FileModeMask, IoMode,
         Pipeline, Process, Scope,
     };

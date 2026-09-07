@@ -3,16 +3,14 @@ name = "cue-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Core domain types and pure logic for Cue: Job, Cron, Scope, Chain"
+description = "Closed execution semantics and identities for Cue"
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
-base64.workspace = true
 blake3.workspace = true
 serde = { workspace = true }
-serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-insta.workspace = true
+serde_json.workspace = true

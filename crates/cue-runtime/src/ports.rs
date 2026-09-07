@@ -1,6 +1,6 @@
 use crate::{Combine, PortId, PortSpec};
 
-/// Ports required or optionally consumed by the vNext runtime root.
+/// Ports required or optionally consumed by the runtime root.
 ///
 /// Extensions may register additional private ports for their own dependency
 /// graphs. Only this closed set is projected into Cue's typed runtime Assembly.

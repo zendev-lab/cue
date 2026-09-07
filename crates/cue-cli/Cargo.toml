@@ -3,7 +3,7 @@ name = "cue-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "CLI entry point for Cue: command parsing, mode dispatch"
+description = "Installed Cue command aggregator and extension dispatcher"
 repository.workspace = true
 license.workspace = true
 
@@ -33,7 +33,6 @@ required-features = ["cue-daemon"]
 [dependencies]
 anyhow.workspace = true
 cue-client = { path = "../cue-client" }
-cue-core = { path = "../cue-core" }
 cue-daemon = { path = "../cue-daemon", optional = true }
 cue-tui = { path = "../cue-tui", optional = true }
 serde.workspace = true

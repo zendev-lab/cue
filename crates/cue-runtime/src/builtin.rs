@@ -1,5 +1,5 @@
 use cue_core::StepId;
-use cue_core::vnext::{AbsolutePath, BuiltinCommand, BuiltinSuccess, Scope};
+use cue_core::{AbsolutePath, BuiltinCommand, BuiltinSuccess, Scope};
 
 use crate::{RuntimeError, RuntimeErrorKind};
 
@@ -39,7 +39,7 @@ pub fn realize_builtin(
 mod tests {
     use super::*;
     use cue_core::ExecutionId;
-    use cue_core::vnext::{EnvEdit, EnvKey, EnvPatch, FileModeMask};
+    use cue_core::{EnvEdit, EnvKey, EnvPatch, FileModeMask};
     use std::collections::BTreeMap;
 
     #[test]

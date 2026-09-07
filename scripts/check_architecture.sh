@@ -36,8 +36,8 @@ fail_if_match \
 
 fail_if_match \
     'crate::(command|cron|ipc|launch|resource|scope|spawn_adapter|tui_debug)' \
-    'cue_core::vnext must not depend on IPC v3 or policy modules' \
-    "${repo_root}/crates/cue-core/src/vnext"
+    'cue-core must not depend on removed transport or policy modules' \
+    "${repo_root}/crates/cue-core/src/kernel"
 
 fail_if_match \
     '^[[:space:]]*cue-language[[:space:]]*=' \
@@ -46,22 +46,44 @@ fail_if_match \
 
 fail_if_match \
     'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
-    'the vNext language compiler must not depend on IPC v3 or legacy execution policy' \
-    "${repo_root}/crates/cue-language/src/vnext_compiler.rs"
+    'the language compiler must not depend on removed execution policy' \
+    "${repo_root}/crates/cue-language/src/compiler.rs"
 
 fail_if_match \
     'crate::(actor|storage)|cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
-    'the vNext daemon service must not depend on the IPC v3 actor tree or legacy execution policy' \
-    "${repo_root}/crates/cue-daemon/src/vnext.rs"
+    'the daemon service must not depend on the removed actor tree or execution policy' \
+    "${repo_root}/crates/cue-daemon/src/service.rs"
 
 fail_if_match \
     'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
-    'the vNext client must use only Core vNext and the strict IPC v4 protocol' \
-    "${repo_root}/crates/cue-client/src/vnext.rs"
+    'the client must use only Core and the strict IPC v4 protocol' \
+    "${repo_root}/crates/cue-client/src/execution.rs"
 
 fail_if_match \
     'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
-    'vNext executable frontends must not restore IPC v3 or legacy execution policy' \
+    'executable frontends must not restore removed execution policy' \
     "${repo_root}/crates/cue-client/src/cli.rs" \
     "${repo_root}/crates/cue-client/src/script_runner.rs" \
     "${repo_root}/crates/cue-tui/src"
+
+fail_if_match \
+    'cue_core::(command|cron|execution|ipc|launch|pipeline|process_status|resource|scope|spawn_adapter|tui_debug)' \
+    'workspace source must not import removed cue-core modules' \
+    "${repo_root}/crates"
+
+legacy_paths=(
+    "crates/cue-core/src/ipc.rs"
+    "crates/cue-core/src/execution.rs"
+    "crates/cue-core/src/resource.rs"
+    "crates/cue-language/src/vnext_compiler.rs"
+    "crates/cue-daemon/src/actor/mod.rs"
+    "crates/cue-daemon/src/vnext.rs"
+    "crates/cue-client/src/vnext.rs"
+    "crates/cue-client/src/transport_config.rs"
+)
+for path in "${legacy_paths[@]}"; do
+    if [[ -f "${repo_root}/${path}" ]]; then
+        echo "architecture check failed: removed compatibility path returned: ${path}" >&2
+        exit 1
+    fi
+done

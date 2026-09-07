@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use cue_core::process_status::exit_code_from_status;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedExtensionCommand {
@@ -172,7 +171,20 @@ fn exec_program(program: &OsStr, args: &[OsString]) -> anyhow::Result<i32> {
         .args(args)
         .status()
         .with_context(|| format!("failed to run extension `{}`", program.to_string_lossy()))?;
-    Ok(exit_code_from_status(status, 1))
+    Ok(process_exit_code(status))
+}
+
+fn process_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code.max(0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal().map(|signal| 128 + signal).unwrap_or(1)
+    }
+    #[cfg(not(unix))]
+    1
 }
 
 #[cfg(test)]

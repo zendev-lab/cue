@@ -3,7 +3,7 @@ name = "cue-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Strict transport contract for Cue vNext"
+description = "Strict IPC v4 transport contract for Cue"
 repository.workspace = true
 license.workspace = true
 

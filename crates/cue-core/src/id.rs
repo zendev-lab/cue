@@ -6,10 +6,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ExecutionId(pub u64);
 
-/// Durable trigger sequence number, displayed as T1, T2, ...
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct ScheduleId(pub u64);
-
 /// Stable process-step identity within one execution, displayed as E1/S1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct StepId {
@@ -61,12 +57,6 @@ impl fmt::Display for ExecutionId {
     }
 }
 
-impl fmt::Display for ScheduleId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "T{}", self.0)
-    }
-}
-
 impl fmt::Display for StepId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/S{}", self.execution, self.index)
@@ -107,16 +97,6 @@ impl FromStr for ExecutionId {
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         parse_prefixed_u64(input, "E", "execution")
             .and_then(|value| nonzero_id(value, "execution", input))
-            .map(Self)
-    }
-}
-
-impl FromStr for ScheduleId {
-    type Err = ParseIdError;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        parse_prefixed_u64(input, "T", "schedule")
-            .and_then(|value| nonzero_id(value, "schedule", input))
             .map(Self)
     }
 }
@@ -169,19 +149,6 @@ impl<'de> Deserialize<'de> for ExecutionId {
     }
 }
 
-impl<'de> Deserialize<'de> for ScheduleId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = u64::deserialize(deserializer)?;
-        if value == 0 {
-            return Err(serde::de::Error::custom("schedule id must be non-zero"));
-        }
-        Ok(Self(value))
-    }
-}
-
 impl<'de> Deserialize<'de> for StepId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -212,7 +179,6 @@ mod tests {
     #[test]
     fn display_ids() {
         assert_eq!(ExecutionId(11).to_string(), "E11");
-        assert_eq!(ScheduleId(5).to_string(), "T5");
         assert_eq!(
             StepId {
                 execution: ExecutionId(11),
@@ -226,7 +192,6 @@ mod tests {
     #[test]
     fn parse_ids() {
         assert_eq!("E11".parse::<ExecutionId>(), Ok(ExecutionId(11)));
-        assert_eq!("T5".parse::<ScheduleId>(), Ok(ScheduleId(5)));
         assert_eq!(
             "E11/S3".parse::<StepId>(),
             Ok(StepId {
@@ -240,14 +205,12 @@ mod tests {
     fn parse_ids_reject_wrong_prefixes_and_non_digits() {
         assert!("E-1".parse::<ExecutionId>().is_err());
         assert!("E0".parse::<ExecutionId>().is_err());
-        assert!("T0".parse::<ScheduleId>().is_err());
         assert!("E1/S0".parse::<StepId>().is_err());
     }
 
     #[test]
     fn json_rejects_zero_and_unknown_identity_fields() {
         assert!(serde_json::from_str::<ExecutionId>("0").is_err());
-        assert!(serde_json::from_str::<ScheduleId>("0").is_err());
         assert!(serde_json::from_str::<EventId>("0").is_err());
         assert!(serde_json::from_str::<StepId>(r#"{"execution":1,"index":0}"#).is_err());
         assert!(

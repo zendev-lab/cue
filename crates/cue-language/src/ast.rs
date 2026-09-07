@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use cue_core::pipeline::PipeOp;
+use crate::surface::PipeOp;
 
 use super::token::{IdKind, Span, Value};
 
