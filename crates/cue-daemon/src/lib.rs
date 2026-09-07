@@ -20,6 +20,7 @@ mod service;
 mod spawn_adapter;
 mod storage;
 mod upgrade;
+pub mod vnext;
 mod word_expansion;
 
 pub fn version() -> &'static str {

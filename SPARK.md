@@ -2,7 +2,7 @@
 description: Cue 是持久、可观察的本地结构化进程执行内核；closed execution semantics 通过启动时 Composition 连接到可替换的运行机制。
 owner: zrr1999
 created: 2026-04-26
-updated: 2026-08-30
+updated: 2026-08-31
 inspired_by:
   - bash
   - zsh
@@ -131,6 +131,9 @@ process 的可观察性。
 
 ## 修订记录
 
+- 2026-08-31：完成 vNext daemon service；启动时绑定 typed RuntimeAssembly，IPC v4
+  强制 Hello/client identity，PutScope/Submit 与 operation claim 原子提交，fact cursor
+  replay、live event、volatile secret store 和 PTY observer/controller attachment 进入主路径。
 - 2026-08-30：完成 vNext surface compiler；初始 Scope 通过 `PutScope -> ScopeHash`
   显式传入，Core builtin 固定为 Cd/Env/Umask，assignment 只作用于单个 Process，PTY
   在每个 Run 上 resolve；schedule/resource/retry/session 命令不再 lower 到内核。
