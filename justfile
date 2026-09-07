@@ -8,9 +8,13 @@ format:
     cargo fmt
 
 # Run all static checks (fmt check + clippy)
-check:
+check: architecture
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
+
+# Enforce crate and migration boundaries that keep vNext semantics closed.
+architecture:
+    ./scripts/check_architecture.sh
 
 # Run tests
 test *ARGS:

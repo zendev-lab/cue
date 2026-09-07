@@ -17,6 +17,12 @@ pub mod resource;
 pub mod scope;
 pub mod spawn_adapter;
 pub mod tui_debug;
+/// Target execution contract under construction for the IPC v4 hard cut.
+///
+/// The current daemon continues to use the v3 root modules until every caller
+/// has migrated. This namespace is removed when vNext becomes the sole public
+/// contract; it is not a second daemon protocol.
+pub mod vnext;
 
 // Re-export commonly used types at crate root.
 pub use event_channel::EventChannel;
