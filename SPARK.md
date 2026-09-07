@@ -74,7 +74,7 @@ process 的可观察性。
 - I/O：Captured stdout/stderr、单 terminal PTY、有界 output 与绝对 offset、attachment lease。
 - Durability：execution/step facts、operation idempotency、drain-first restart 和 crash reconciliation。
 - Composition：Port、Provider、Combine law、依赖解析、lifecycle 与 Assembly manifest。
-- Frontend：Cue surface 编译、argv 展开、completion/highlight、CLI/TUI projection。
+- Frontend：Cue surface 编译、literal argv 构造、completion/highlight、CLI/TUI projection。
 - Producer：cron、workflow、agent 或 queue 通过 `ExecutionSubmitter` 创建独立 Execution。
 
 ## 成功信号
@@ -120,8 +120,9 @@ process 的可观察性。
   再证明静态语义，因此 extension 只扩 implementation。
 - 为 v3 数据逐项语义迁移：旧 Scope identity、session cursor 和 schedule contract
   与 IPC v4 不等价，因此选择在硬切时整体只读归档。
-- daemon 运行时展开 `$VAR`/`~`：会让 plain argv 携带隐藏语义，因此展开移到
-  surface，并只读取提交时的初始 Scope。
+- daemon 运行时展开 `$VAR`/`~`：会让 plain argv 携带隐藏语义，因此当前只传递
+  literal argv；compiler 也尚未实现这类展开。若未来增加，应由 frontend 从显式
+  Scope 解析，不由 daemon 读取 ambient environment。
 
 ## 后续问题（不阻塞内核）
 

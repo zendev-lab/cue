@@ -15,6 +15,12 @@ Unsent input is buffered up to 64 KiB; exceeding that bound detaches with an
 explicit error rather than silently discarding bytes. Blocking terminal reads
 run outside the async runtime so an idle stdin cannot delay process exit.
 
+File and one-line runners wait for completion before printing retained bytes;
+they do not yet provide live output or stdin forwarding. Non-process failures
+include the failed Step and stored reason on stderr. Reads from offset zero
+warn when the provider returns a later retained offset. The default retention
+is 1 MiB per stream and is lost on daemon restart.
+
 `cue run` and `cue fg` are direct shortcuts. Session, schedule, retry,
 resource, target, and approval commands are not builtin namespaces; an
 external producer may still be installed through the extension mechanism.
@@ -33,6 +39,13 @@ TailOutput. Waits have a separate bounded queue from ordinary commands, so a
 full wait queue still permits cancellation. Requests and coalesced list refreshes
 run outside the TUI event loop, keeping editing and quit keys responsive while
 network responses are pending.
+
+Only executions submitted by this TUI connection are automatically watched.
+Use `:jobs` to refresh work submitted elsewhere or executions that were already
+running when the TUI opened. There is currently no global live list subscription
+or periodic refresh. Each submission snapshots the frontend's original process
+context; a standalone `cd`/`env` does not move the next prompt's context. Compose
+such changes with the command in one execution.
 
 The former session/cron/resource pages, client-side v3 state machine, target
 modal, foreground epoch compatibility, and debug protocol were deleted rather

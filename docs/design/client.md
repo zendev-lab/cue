@@ -24,7 +24,10 @@ immutable `PreparedCommand` with its ClientId, OperationId, and payload. Socket
 reconnection retries it with the original identity. Stream and multiplexed
 callers can retain and reuse prepared commands across connection replacement. The
 client uses the same strict length-prefixed IPC v4 framing as the daemon and
-surfaces typed protocol errors without retrying a rejected effect.
+surfaces typed protocol errors without retrying a rejected effect. Local socket
+connection and Hello waits, including reconnect Hello, are bounded to two
+seconds. A missing daemon points to `cued start`; a failed Hello points to
+`cued status` for diagnosis. Execution waits are not subject to that timeout.
 
 The sequential client buffers events that arrive while it waits for a matching
 response. Interactive frontends convert it to `MultiplexedClient`, whose

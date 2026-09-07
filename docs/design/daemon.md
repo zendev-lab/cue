@@ -4,6 +4,29 @@ The daemon is the composition root and protocol host for the closed Core
 semantics. It does not parse Cue source and does not reuse the IPC v3 actor,
 session, schedule, resource, retry, or persistence owners.
 
+## Host lifecycle
+
+`cued start` (also bare `cued`) launches a detached background child with
+`--fg`, no terminal descriptors, and logs appended to `<socket>.log`. The caller
+waits up to fifteen seconds for a Hello from that specific new instance; another
+listener cannot satisfy readiness. Child exit includes its startup log tail in
+the error. A timeout is a failure to confirm readiness, not successful startup;
+the diagnostic identifies the still-starting process and log. `--fg`/`-f` keeps
+the serving process in the foreground for terminals and service managers.
+
+The host holds exclusive locks for both its socket and canonical database path.
+Independent sockets require independent databases. Custom paths are resolved
+before spawning. Cue creates new private directories but preserves permissions
+on existing user directories. Database, lock, socket, and log files are private.
+
+`cued stop` waits for both listener unavailability and ownership-lock release,
+because the listener closes before drain finishes. `cued restart` waits for the
+instance named in RestartAccepted to answer Hello. Each completion wait is
+bounded to fifteen seconds, covering the host's normal drain budget. IPC
+Shutdown/Restart acknowledgements remain acceptance receipts; callers of raw
+protocol commands, including `cue-client shutdown/restart`, must separately
+observe completion. No kernel schema or lifecycle acknowledgement ordering changes.
+
 ## Bootstrap
 
 At startup the daemon resolves the canonical runtime ports through
@@ -120,7 +143,8 @@ or signalling the daemon.
 
 `cued stop --force` is an explicit local escape hatch. It targets only the
 same-user PID obtained from the selected Unix socket's kernel credentials,
-sends SIGTERM once, and waits for process exit and socket unavailability. It
+sends SIGTERM once, and waits up to fifteen seconds for process exit and socket
+unavailability. It
 rejects non-socket paths, missing peer PID support, and invalid/self PIDs. It
 never escalates to SIGKILL or signals a supervisor's replacement. The host
 handles SIGTERM through the same drain path as its other shutdown signals.

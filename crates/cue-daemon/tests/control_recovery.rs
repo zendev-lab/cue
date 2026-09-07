@@ -20,6 +20,7 @@ impl Fixture {
         let child = if mode == "v4" {
             Command::new(BINARY)
                 .arg("start")
+                .arg("--fg")
                 .arg("--socket")
                 .arg(&socket)
                 .arg("--db")
@@ -69,7 +70,7 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(9);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             // Reap our fixture so the CLI can verify exit rather than a zombie.
             let _ = self.child.try_wait().unwrap();

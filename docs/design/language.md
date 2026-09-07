@@ -14,6 +14,10 @@ client Scope --PutScope--> ScopeHash
 surface source --compile------+--> ExecutionSpec --SubmitExecution--> daemon
 ```
 
+Arguments that reach the compiler are literal: there is currently no `$VAR` or
+`~` expansion. Shell quoting outside Cue may expand values before invocation;
+that is the caller shell's behavior, not a daemon or compiler feature.
+
 ## Builtins
 
 Core has exactly three builtin families:

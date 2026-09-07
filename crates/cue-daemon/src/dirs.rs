@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -38,26 +38,58 @@ pub fn ensure_private_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent", path.display()))?;
-    std::fs::create_dir_all(parent)
+    // Only directories created by Cue receive Cue's private mode. A custom
+    // socket/database may live in a shared project directory owned by the user.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(PRIVATE_DIR_MODE)
+        .create(parent)
         .with_context(|| format!("create directory {}", parent.display()))?;
-    reject_symlink(parent)?;
-    std::fs::set_permissions(parent, Permissions::from_mode(PRIVATE_DIR_MODE))
-        .with_context(|| format!("secure directory {}", parent.display()))
+    reject_symlink(parent)
 }
 
 pub fn create_private_file(path: &Path) -> Result<File> {
+    open_private_file(path, false)
+}
+
+pub fn open_log_file(path: &Path) -> Result<File> {
+    open_private_file(path, true)
+}
+
+fn open_private_file(path: &Path, append: bool) -> Result<File> {
     ensure_private_parent(path)?;
-    if path.exists() {
-        reject_symlink(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            bail!(
+                "refusing to use non-regular private file {}",
+                path.display()
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
     }
-    let file = OpenOptions::new()
+    let mut options = OpenOptions::new();
+    options
         .read(true)
-        .write(true)
         .create(true)
         .truncate(false)
         .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    if append {
+        options.append(true);
+    } else {
+        options.write(true);
+    }
+    let file = options
         .open(path)
         .with_context(|| format!("open private file {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!(
+            "refusing to use non-regular private file {}",
+            path.display()
+        )
+    }
     file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))?;
     Ok(file)
 }

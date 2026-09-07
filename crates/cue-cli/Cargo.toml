@@ -40,6 +40,7 @@ toml.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+tokio.workspace = true
 
 [features]
 default = ["cue-client", "cue-daemon", "cue-tui"]

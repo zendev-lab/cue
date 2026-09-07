@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use cue_core::{
@@ -21,6 +22,8 @@ use tokio::io::{self, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 type BoxedStream = Box<dyn ClientStream>;
 
@@ -59,11 +62,22 @@ pub struct ExecutionClient {
 
 impl ExecutionClient {
     pub async fn connect(socket: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket)
+        let quoted = format!("'{}'", socket.to_string_lossy().replace('\'', "'\"'\"'"));
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(socket))
             .await
-            .with_context(|| format!("connect to {}", socket.display()))?;
+            .context("daemon connection timed out")
+            .and_then(|result| result.map_err(anyhow::Error::from))
+            .with_context(|| {
+                format!(
+                    "cannot connect to {}; start the daemon with `cued start --socket {quoted}`",
+                    socket.display()
+                )
+            })?;
         let client_id = generated_client_id()?;
-        let mut client = Self::connect_stream(stream, client_id).await?;
+        let mut client = tokio::time::timeout(CONNECT_TIMEOUT, Self::connect_stream(stream, client_id))
+            .await.context("IPC v4 handshake timed out")
+            .and_then(|result| result)
+            .with_context(|| format!("IPC v4 handshake failed at {}; inspect the listener with `cued status --socket {quoted}`", socket.display()))?;
         client.reconnect_socket = Some(socket.to_path_buf());
         Ok(client)
     }
@@ -156,12 +170,15 @@ impl ExecutionClient {
             .is_some_and(|error| error.downcast_ref::<std::io::Error>().is_some())
             && let Some(socket) = self.reconnect_socket.clone()
         {
-            let stream = UnixStream::connect(&socket)
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&socket))
                 .await
+                .context("reconnect IPC v4 socket timed out")?
                 .context("reconnect IPC v4 socket")?;
             self.stream = Box::new(stream);
             self.pending_events.clear();
-            self.hello().await?;
+            tokio::time::timeout(CONNECT_TIMEOUT, self.hello())
+                .await
+                .context("reconnect IPC v4 handshake timed out")??;
             return self.send_prepared(prepared).await;
         }
         response
@@ -804,6 +821,31 @@ mod tests {
     use super::*;
     use cue_core::{Argv, ExecutionPlan, IoMode, Pipeline, Process};
     use cue_daemon::service::{DaemonService, serve_stream};
+
+    #[tokio::test]
+    async fn local_connect_bounds_a_listener_that_never_finishes_hello() {
+        let root = PathBuf::from("/tmp").join(format!("cue-connect-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let serving = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result =
+            tokio::time::timeout(Duration::from_secs(4), ExecutionClient::connect(&socket))
+                .await
+                .unwrap();
+        let error = match result {
+            Ok(_) => panic!("hung Hello cannot be ready"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("handshake timed out"), "{error}");
+        assert!(error.contains("cued status --socket"), "{error}");
+        serving.abort();
+        let _ = serving.await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn scope() -> Scope {
         Scope::new(

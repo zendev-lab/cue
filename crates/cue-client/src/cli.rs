@@ -18,7 +18,9 @@ use crate::default_socket_path;
 use crate::execution::{
     ExecutionClient, MultiplexedClient, SurfaceOutcome, output_bytes, process_scope, wait_execution,
 };
-use crate::script_runner::{execution_exit_code, write_execution_output};
+use crate::script_runner::{
+    execution_exit_code, warn_missing_output_prefix, write_execution_output,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientCommand {
@@ -112,6 +114,11 @@ async fn run_connected(command: ClientCommand) -> Result<i32> {
             let ResultPayload::Output { chunks } = response else {
                 bail!("daemon returned an unexpected output response")
             };
+            let chunks = chunks
+                .into_iter()
+                .filter(|chunk| chunk.stream == stream)
+                .collect::<Vec<_>>();
+            warn_missing_output_prefix(&chunks);
             std::io::stdout().write_all(&output_bytes(&chunks, stream))?;
             Ok(0)
         }

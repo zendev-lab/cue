@@ -50,14 +50,14 @@ pub(crate) async fn stop(socket: &Path) -> Result<()> {
     }
     drop(stream);
     println!("sent SIGTERM to socket peer {pid}; waiting for exit");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::startup::COMPLETION_TIMEOUT, async {
         while process_exists(pid)? {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .with_context(|| format!("socket peer {pid} did not exit within 5 seconds after SIGTERM; stop is not confirmed; no SIGKILL was sent"))??;
+    .with_context(|| format!("socket peer {pid} did not exit within 15 seconds after SIGTERM; stop is not confirmed; no SIGKILL was sent"))??;
     // A supervisor may have immediately replaced the process. Do not claim the
     // endpoint is stopped or signal the replacement without a new request.
     match connect_control(socket).await {
