@@ -3,6 +3,7 @@ release_always = false
 publish = true
 git_only = false
 dependencies_update = false
+custom_minor_increment_regex = "^breaking$|^💥 breaking:"
 changelog_update = false
 git_release_enable = false
 git_tag_name = "{{ package }}-v{{ version }}"

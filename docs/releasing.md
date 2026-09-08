@@ -14,6 +14,9 @@ crates share a release-plz version group and publish to crates.io.
 4. `cd-publish.yml` validates versions, builds and tests the artifacts, then
    publishes PyPI and npm. GitHub Release creation waits for both publishers.
 
+The repository's `💥 breaking:` commit prefix requests a minor bump in 0.x,
+including protocol/CLI incompatibilities that Rust API checks cannot detect.
+
 There is no `just release` command. Do not edit a product tag to retry a failed
 release. Rerun failed jobs on the original run/commit. Existing PyPI files must
 match the staged SHA-256 before being skipped. Different bytes are an error;
