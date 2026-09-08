@@ -26,3 +26,6 @@ lcov.info
 *.profraw
 *.profdata
 .spark/
+
+# Python release tooling
+__pycache__/

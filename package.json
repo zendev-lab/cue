@@ -1,6 +1,6 @@
 {
   "name": "@zendev-lab/cue",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Canonical agent guidance for the Cue execution runtime.",
   "license": "MIT",
   "author": "zrr1999",

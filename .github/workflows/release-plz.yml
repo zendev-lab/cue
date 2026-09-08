@@ -1,0 +1,103 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.repository == 'zendev-lab/cue'
+    runs-on: ubuntu-latest
+    environment: crates-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.1"
+      - name: Identify the merged release PR
+        id: context
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 scripts/release.py context
+      - name: Check release versions
+        if: steps.context.outputs.release == 'true'
+        run: python3 scripts/release.py check
+      - uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5
+        if: steps.context.outputs.release == 'true'
+        with:
+          command: release
+          version: "0.3.162"
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+      - name: Tag the complete product release
+        if: steps.context.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh auth setup-git
+          git fetch origin --tags
+          python3 scripts/release.py tag-product
+
+  release-pr:
+    if: github.repository == 'zendev-lab/cue'
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.1"
+      - uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5
+        id: release-plz
+        with:
+          command: release-pr
+          version: "0.3.162"
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+      - name: Sync npm version in the release PR
+        if: steps.release-plz.outputs.pr != '' && steps.release-plz.outputs.pr != 'null'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_PR: ${{ steps.release-plz.outputs.pr }}
+        run: |
+          branch="$(jq -r '.head_branch' <<< "$RELEASE_PR")"
+          [[ "$branch" == release-plz-* ]]
+          gh auth setup-git
+          git fetch origin "$branch"
+          git checkout -B "$branch" FETCH_HEAD
+          python3 scripts/release.py sync-npm
+          if ! git diff --quiet -- package.json; then
+            git add package.json
+            git commit -m '🔖 release: sync npm version'
+            git push origin "HEAD:refs/heads/$branch"
+          fi

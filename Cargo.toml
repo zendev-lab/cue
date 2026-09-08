@@ -13,13 +13,23 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/zendev-lab/cue"
 license = "MIT"
 
 [workspace.dependencies]
+cue-cli = { path = "crates/cue-cli", version = "0.2.0" }
+cue-client = { path = "crates/cue-client", version = "0.2.0" }
+cue-core = { path = "crates/cue-core", version = "0.2.0" }
+cue-daemon = { path = "crates/cue-daemon", version = "0.2.0" }
+cue-language = { path = "crates/cue-language", version = "0.2.0" }
+cue-protocol = { path = "crates/cue-protocol", version = "0.2.0" }
+cue-runtime = { path = "crates/cue-runtime", version = "0.2.0" }
+cue-store-sqlite = { path = "crates/cue-store-sqlite", version = "0.2.0" }
+cue-tui = { path = "crates/cue-tui", version = "0.2.0" }
+
 # Error handling
 anyhow = "1"
 base64 = "0.23"

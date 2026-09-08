@@ -24,6 +24,19 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
+  crate-package:
+    name: Crate package verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.1"
+      - name: Verify unpublished workspace packages
+        run: cargo package --workspace --registry crates-io --locked
+
   npm-skill:
     name: npm Skill package
     runs-on: ubuntu-latest

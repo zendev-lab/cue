@@ -9,8 +9,8 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
-cue-core = { path = "../cue-core" }
-cue-protocol = { path = "../cue-protocol" }
+cue-core = { workspace = true }
+cue-protocol = { workspace = true }
 rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
