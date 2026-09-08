@@ -57,7 +57,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<TuiCommand> {
 
 fn print_help() {
     println!(
-        "cue-tui {}\n\nUsage:\n  cue-tui [--socket PATH]\n\nThe TUI submits typed IPC v4 executions from an explicit frontend Scope.\nSession, schedule, retry, resource, and approval policy are external owners.\n\nKeys:\n  Enter   compile and dispatch input\n  Esc     quit\n  Ctrl-C  quit",
+        "cue-tui {}\n\nUsage:\n  cue-tui [--socket PATH]\n\nThe TUI submits typed IPC v4 executions from an explicit frontend Scope.\nSession, schedule, retry, resource, and approval policy are external owners.\n\nKeys:\n  F1      keyboard help\n  F2/F3/F4 tasks / output / command\n  1-6     output tabs (output focused)\n  Enter   run input or open selected task\n  Tab     complete input\n  Up/Down command history or task selection\n  Del/K   cancel / force-cancel selected task\n  f/o     attach / observe selected PTY; Ctrl-] returns\n  Ctrl-B  toggle sidebar\n  Ctrl-Y  copy active view (OSC 52)\n  Esc     return to input; clear input; quit if empty\n  Ctrl-C  quit",
         env!("CARGO_PKG_VERSION")
     );
 }

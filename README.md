@@ -117,10 +117,26 @@ cue-client restart|shutdown
 then print retained output and return the execution exit status. Spawn, builtin,
 and runtime failures include a Step ID and diagnostic on stderr. They currently
 do not stream output or forward stdin during that wait. To run an interactive
-program, submit it in `cue tui`, then attach its Step using `cue fg E7/S2` in a
-terminal. PTY control uses one controller and any number of observers; Ctrl-]
+program, submit it in `cue tui`, press F3 and `f` to attach its selected PTY Step, or use
+`cue fg E7/S2` in another terminal. PTY control uses one controller and any number of observers; Ctrl-]
 detaches the controller CLI. Disconnecting the client does not cancel its work;
 use `list`/`show` to find it and `cancel`/`kill` to stop it.
+
+`cue tui` opens an execution sidebar and follows the selected Step's output
+without requiring an `:out` command. F2 focuses the sidebar; F3 focuses output;
+F4 returns to command input. With output focused, 1–6 select combined output,
+stdout, stderr, terminal, details, or activity. Use `[` / `]` to change Steps,
+PgUp/PgDn to scroll, and End to follow live output again. Delete cancels the
+selected execution, `K` force-cancels, and `f` / `o` attach / observe a PTY.
+Ctrl-] returns from PTY interaction to the workbench. F1 shows all shortcuts.
+
+Tab completes input, ↑/↓ recall command history, and bracketed paste inserts
+multiline source for review before Enter submits it. Ctrl-Y copies the active
+view when the terminal supports OSC 52. Ctrl-B toggles the sidebar; narrow
+terminals show it when F2 is focused. A disconnected daemon leaves the last
+snapshot and input draft visible while the TUI reconnects automatically.
+Pending commands are never automatically resubmitted. Command history is stored
+under `$XDG_DATA_HOME/cue` (or `~/.local/share/cue`).
 
 The bundled output store retains only the last 1 MiB per Step stream in memory.
 `exec`, `run`, and stream reads warn when the requested prefix has been evicted.
@@ -142,7 +158,7 @@ one composed execution, not to the invoking shell or the next TUI submission.
 - `cue-language`: surface tokenizer, parser, compiler, completion, highlighting;
 - `cue-daemon`: composition root, IPC service, lifecycle, and local host;
 - `cue-client`: explicit Scope submission and sequential/multiplexed clients;
-- `cue-tui`: small execution projection;
+- `cue-tui`: execution browser, live output, and interactive PTY workbench;
 - `cue-cli`: installed command aggregator and extension dispatch.
 
 Development gates:
