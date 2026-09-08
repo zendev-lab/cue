@@ -1,14 +1,15 @@
 # Releasing Cue
 
 Cargo's workspace version is the product version. Maturin reads it for
-`cue-run`; `package.json` is synchronized in each release PR. All nine Rust
+`cue-run`; `npm run pack` generates the npm manifest from Cargo metadata in
+a temporary directory. The source `package.json` is private and has no version. All nine Rust
 crates share a release-plz version group and publish to crates.io.
 
 ## Normal releases
 
 1. Merging development changes into `main` updates the release-plz PR.
 2. Review its version, breaking changes and CI, then merge it manually.
-3. `release-plz.yml` publishes the crates using OIDC and creates their
+3. `cd-release.yml` publishes the crates using OIDC and creates their
    `<crate>-v<version>` tags. It creates the product `v<version>` tag only
    after every crate/version exists and every crate tag identifies that commit.
 4. `cd-publish.yml` validates versions, builds and tests the artifacts, then
@@ -29,14 +30,16 @@ alongside GitHub's generated change list.
 
 ## Credentials and publisher identities
 
-The private GitHub App is installed only on `zendev-lab/cue`, with Contents and
+The private `zendev-cue-release` GitHub App is installed only on `zendev-lab/cue`, with Contents and
 Pull requests read/write. Actions use `RELEASE_APP_ID` (repository variable)
 and `RELEASE_APP_PRIVATE_KEY` (repository secret) to obtain short-lived
 installation tokens. These tokens allow bot PRs and product tags to trigger CI.
+Release PRs use the default release-plz title/body. Only the title/body policy
+exempts this bot (and Renovate); build and test checks still run.
 
 | Registry | Project | Workflow | GitHub environment |
 | --- | --- | --- | --- |
-| crates.io | Each of the nine workspace crate names | `release-plz.yml` | `crates-release` |
+| crates.io | Each of the nine workspace crate names | `cd-release.yml` | `crates-release` |
 | PyPI | `cue-run` | `cd-publish.yml` | `pypi-release` |
 | npm | `@zendev-lab/cue` | `cd-publish.yml` | `npm-release` |
 

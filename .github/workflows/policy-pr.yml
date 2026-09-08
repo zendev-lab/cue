@@ -28,7 +28,8 @@ jobs:
       - name: Check PR title
         if: >-
           github.event_name == 'pull_request' &&
-          github.event.pull_request.user.login != 'renovate[bot]'
+          github.event.pull_request.user.login != 'renovate[bot]' &&
+          github.event.pull_request.user.login != 'zendev-cue-release[bot]'
         uses: zendev-lab/zendev/actions/validate-title@8f336868ce2cd685cfa8c62882acefc3acbb4ead
         with:
           text: ${{ github.event.pull_request.title }}
@@ -37,16 +38,18 @@ jobs:
       - name: Check PR body
         if: >-
           github.event_name == 'pull_request' &&
-          github.event.pull_request.user.login != 'renovate[bot]'
+          github.event.pull_request.user.login != 'renovate[bot]' &&
+          github.event.pull_request.user.login != 'zendev-cue-release[bot]'
         uses: zendev-lab/zendev/actions/validate-body@6add4d100898f7a1a3c7643a5ca15051a0088e43 # v0.3.0
         with:
           body: ${{ github.event.pull_request.body }}
 
-      - name: Skip PR message checks for Renovate
+      - name: Skip PR message checks for release and dependency bots
         if: >-
           github.event_name == 'pull_request' &&
-          github.event.pull_request.user.login == 'renovate[bot]'
-        run: echo "Renovate PRs are exempt from the repository title and description conventions."
+          (github.event.pull_request.user.login == 'renovate[bot]' ||
+           github.event.pull_request.user.login == 'zendev-cue-release[bot]')
+        run: echo "Release and dependency bot PRs are exempt from the repository title and description conventions."
 
       - name: Confirm queued PR messages were already checked
         if: github.event_name == 'merge_group'

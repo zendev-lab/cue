@@ -25,10 +25,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check tag, Cargo and npm versions
+      - name: Check tag against Cargo workspace version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 scripts/release.py check --tag "$RELEASE_TAG"
+        run: |
+          version="$(cargo metadata --no-deps --locked --format-version 1 | jq -er '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace versions differ") end')"
+          test "$RELEASE_TAG" = "v$version"
 
   build-npm:
     needs: verify
@@ -42,15 +44,8 @@ jobs:
         with:
           node-version-file: .node-version
           package-manager-cache: false
-      - name: Verify tag version
-        run: |
-          package_version="$(node -p 'require("./package.json").version')"
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
-      - name: Pack and smoke-test npm artifact
-        run: |
-          mkdir -p dist
-          npm pack --json --ignore-scripts --pack-destination dist
-          node scripts/smoke_npm_package.mjs "$(find dist -maxdepth 1 -name '*.tgz' -print -quit)"
+      - name: Pack from Cargo version and smoke-test npm artifact
+        run: npm run pack
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cue-npm

@@ -7,22 +7,6 @@ custom_minor_increment_regex = "^breaking$|^💥 breaking:"
 changelog_update = false
 git_release_enable = false
 git_tag_name = "{{ package }}-v{{ version }}"
-pr_name = "🔖 release: publish Cue{% if version %} {{ version }}{% endif %}"
-pr_body = """## 动机
-
-发布下一版 Cue，统一 Rust、Python 和 npm 版本。
-
-## 解决方案
-
-{% for release in releases %}
-- `{{ release.package }}`: {% if release.previous_version %}{{ release.previous_version }} → {% endif %}{{ release.next_version }}
-{% if release.breaking_changes %}
-{{ release.breaking_changes }}
-{% endif %}
-{% endfor %}
-
-合并后由 release-plz 发布 Rust crates，再触发 PyPI/npm 发布。
-"""
 
 [[package]]
 name = "cue-cli"

@@ -38,19 +38,6 @@ class ReleaseTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def test_sync_preserves_npm_fields_and_check_rejects_wrong_tag(self):
-        with patch.object(
-            release, "run", return_value='{"packages":[{"version":"0.2.0"}]}'
-        ):
-            release.sync_npm()
-            self.assertEqual(
-                json.loads(Path("package.json").read_text()),
-                {"name": "@zendev-lab/cue", "version": "0.2.0"},
-            )
-            self.assertEqual(release.check_version("v0.2.0"), "0.2.0")
-            with self.assertRaises(ValueError):
-                release.check_version("v0.1.2")
-
     def test_only_exact_merged_release_pr_can_release(self):
         pr = {
             "merged_at": "today",
@@ -84,10 +71,7 @@ class ReleaseTests(unittest.TestCase):
                 with patch.object(
                     release, "run", return_value=json.dumps([pr | change])
                 ):
-                    release.release_context()
-                self.assertEqual(
-                    self.output.read_text(), f"release={str(allowed).lower()}\n"
-                )
+                    self.assertEqual(release.release_context(), allowed)
 
     def test_pypi_retry_keeps_unpublished_and_removes_only_identical_files(self):
         dist = Path("dist")
@@ -124,7 +108,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_product_tag_rejects_partial_release_and_wrong_crate_commit(self):
         with (
-            patch.object(release, "check_version", return_value="0.2.0"),
+            patch.object(release, "release_context", return_value=True),
             patch.object(release, "workspace", return_value=("0.2.0", ["cue-core"])),
             patch.object(release, "run", return_value="release-sha") as git,
             patch.object(release, "get_json", return_value=None),
@@ -133,7 +117,7 @@ class ReleaseTests(unittest.TestCase):
                 release.tag_product()
             self.assertFalse(any("push" in call.args for call in git.call_args_list))
         with (
-            patch.object(release, "check_version", return_value="0.2.0"),
+            patch.object(release, "release_context", return_value=True),
             patch.object(release, "workspace", return_value=("0.2.0", ["cue-core"])),
             patch.object(
                 release, "run", side_effect=["release-sha", "other-sha"]
@@ -173,7 +157,7 @@ class ReleaseTests(unittest.TestCase):
         for existing, valid in [("release-sha", True), ("other-sha", False)]:
             with (
                 self.subTest(existing=existing),
-                patch.object(release, "check_version", return_value="0.2.0"),
+                patch.object(release, "release_context", return_value=True),
                 patch.object(release, "workspace", return_value=("0.2.0", [])),
                 patch.object(
                     release,

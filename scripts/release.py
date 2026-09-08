@@ -40,30 +40,6 @@ def get_json(url):
         raise
 
 
-def check_version(tag=None):
-    version, _ = workspace()
-    npm = json.loads(Path("package.json").read_text())
-    if npm["version"] != version:
-        raise ValueError("npm and Cargo workspace versions differ")
-    metadata = json.loads(
-        run("cargo", "metadata", "--no-deps", "--locked", "--format-version", "1")
-    )
-    if any(package["version"] != version for package in metadata["packages"]):
-        raise ValueError("Cargo workspace package versions differ")
-    if tag is not None and tag != f"v{version}":
-        raise ValueError(f"tag {tag} does not match workspace version {version}")
-    return version
-
-
-def sync_npm():
-    version, _ = workspace()
-    path = Path("package.json")
-    manifest = json.loads(path.read_text())
-    manifest["version"] = version
-    path.write_text(json.dumps(manifest, indent=2) + "\n")
-    check_version()
-
-
 def release_context():
     repo, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
     prs = json.loads(run("gh", "api", f"repos/{repo}/commits/{sha}/pulls"))
@@ -76,13 +52,13 @@ def release_context():
         and pr["head"]["ref"].startswith("release-plz-")
         for pr in prs
     )
-    with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-        output.write(f"release={str(eligible).lower()}\n")
+    return eligible
 
 
 def tag_product():
-    version = check_version()
-    _, names = workspace()
+    if not release_context():
+        return
+    version, names = workspace()
     sha = os.environ["GITHUB_SHA"]
     if run("git", "rev-parse", "HEAD") != sha:
         raise ValueError("checkout differs from the release commit")
@@ -149,23 +125,13 @@ def pending_npm(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    check = commands.add_parser("check")
-    check.add_argument("--tag")
-    commands.add_parser("sync-npm")
-    commands.add_parser("context")
     commands.add_parser("tag-product")
     pending = commands.add_parser("pending-pypi")
     pending.add_argument("directory", type=Path)
     npm = commands.add_parser("pending-npm")
     npm.add_argument("directory", type=Path)
     args = parser.parse_args()
-    if args.command == "check":
-        print(check_version(args.tag))
-    elif args.command == "sync-npm":
-        sync_npm()
-    elif args.command == "context":
-        release_context()
-    elif args.command == "tag-product":
+    if args.command == "tag-product":
         tag_product()
     elif args.command == "pending-npm":
         pending_npm(args.directory)
