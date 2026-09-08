@@ -3,7 +3,14 @@
 Cargo's workspace version is the product version. Maturin reads it for
 `cue-run`; `npm run pack` generates the npm manifest from Cargo metadata in
 a temporary directory. The source `package.json` is private and has no version. All nine Rust
-crates share a release-plz version group and publish to crates.io.
+crates share the `cue` release-plz version group. Every product release bumps and
+publishes all nine crates at the same version, including crates whose source code
+has not changed. The version identifies the complete Cue release; it does not
+imply that every component gained a feature or a fix. Internal dependency versions
+advance with the workspace version.
+
+Publishing does not filter crates by source changes. It only skips crate versions
+already uploaded successfully, so a partial publish can be retried.
 
 ## Normal releases
 

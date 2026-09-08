@@ -213,6 +213,7 @@ jobs:
       - name: Publish workspace crates
         run: |
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          # Publish the entire version group; skip only versions already uploaded.
           packages=()
           while read -r name version; do
             status="$(curl --silent --show-error --retry 3 --output /tmp/crate-version.json --write-out '%{http_code}' \

@@ -8,6 +8,7 @@ changelog_update = false
 git_release_enable = false
 git_tag_name = "{{ package }}-v{{ version }}"
 
+# Keep every crate in the same version group, including unchanged components.
 [[package]]
 name = "cue-cli"
 git_tag_name = "v{{ version }}"
