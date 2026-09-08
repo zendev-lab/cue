@@ -1,7 +1,7 @@
 [workspace]
 release_always = false
-publish = true
-git_only = false
+publish = false
+git_only = true
 dependencies_update = false
 custom_minor_increment_regex = "^breaking$|^💥 breaking:"
 changelog_update = false
@@ -10,6 +10,7 @@ git_tag_name = "{{ package }}-v{{ version }}"
 
 [[package]]
 name = "cue-cli"
+git_tag_name = "v{{ version }}"
 version_group = "cue"
 
 [[package]]

@@ -4,10 +4,6 @@ on:
   push:
     branches: [main]
 
-concurrency:
-  group: cd-release
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
@@ -15,10 +11,6 @@ jobs:
   release:
     if: github.repository == 'zendev-lab/cue'
     runs-on: ubuntu-latest
-    environment: crates-release
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,17 +32,12 @@ jobs:
           version: "0.3.162"
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
-      - name: Tag the complete product release
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          gh auth setup-git
-          git fetch origin --tags
-          python3 scripts/release.py tag-product
 
   release-pr:
     if: github.repository == 'zendev-lab/cue'
-    needs: release
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

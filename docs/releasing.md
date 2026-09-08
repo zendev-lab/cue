@@ -9,20 +9,27 @@ crates share a release-plz version group and publish to crates.io.
 
 1. Merging development changes into `main` updates the release-plz PR.
 2. Review its version, breaking changes and CI, then merge it manually.
-3. `cd-release.yml` publishes the crates using OIDC and creates their
-   `<crate>-v<version>` tags. It creates the product `v<version>` tag only
-   after every crate/version exists and every crate tag identifies that commit.
-4. `cd-publish.yml` validates versions, builds and tests the artifacts, then
-   publishes PyPI and npm. GitHub Release creation waits for both publishers.
+3. `cd-release.yml` uses release-plz's `git_only` mode to create tags, without
+   publishing packages. `cue-cli` owns the product `v<version>` tag; the other
+   crates use `<crate>-v<version>` tags as their release-plz version baselines.
+4. The product tag triggers `cd-publish.yml`: Cargo publishes Rust crates,
+   Maturin builds the Python distributions for `uv publish`, and npm publishes
+   the Skill package. GitHub Release creation waits for all three publishers.
+
+The `release` and `release-pr` jobs are independent. Only `release-pr` has a
+shared concurrency group, so a later main commit cannot cancel a pending release.
 
 The repository's `💥 breaking:` commit prefix requests a minor bump in 0.x,
 including protocol/CLI incompatibilities that Rust API checks cannot detect.
 
 There is no `just release` command. Do not edit a product tag to retry a failed
-release. Rerun failed jobs on the original run/commit. Existing PyPI files must
-match the staged SHA-256 before being skipped. Different bytes are an error;
-reuse the original artifacts or publish a new version. Existing npm versions
-must likewise match the staged tarball integrity.
+release. Rerun failed jobs on the original run/commit. `uv publish` skips identical
+PyPI files and rejects different bytes; reuse the original build artifacts.
+Cargo handles dependency ordering and index availability. A small registry check
+selects versions not yet published, allowing retries after a partial Rust upload
+and the initial account-token bootstrap. Yanked versions and lookup errors fail.
+For npm, rerun only failed jobs so successful uploads are not repeated; npm
+rejects attempts to overwrite an existing version.
 
 Keep upgrade notes for a breaking release in `docs/releases/<version>.md`;
 when present, the publishing workflow includes them in the GitHub Release
@@ -30,7 +37,7 @@ alongside GitHub's generated change list.
 
 ## Credentials and publisher identities
 
-The private `zendev-cue-release` GitHub App is installed only on `zendev-lab/cue`, with Contents and
+Install the private `zendev-cue-release` GitHub App only on `zendev-lab/cue`, with Contents and
 Pull requests read/write. Actions use `RELEASE_APP_ID` (repository variable)
 and `RELEASE_APP_PRIVATE_KEY` (repository secret) to obtain short-lived
 installation tokens. These tokens allow bot PRs and product tags to trigger CI.
@@ -39,33 +46,30 @@ exempts this bot (and Renovate); build and test checks still run.
 
 | Registry | Project | Workflow | GitHub environment |
 | --- | --- | --- | --- |
-| crates.io | Each of the nine workspace crate names | `cd-release.yml` | `crates-release` |
+| crates.io | Each of the nine workspace crate names | `cd-publish.yml` | `crates-release` |
 | PyPI | `cue-run` | `cd-publish.yml` | `pypi-release` |
 | npm | `@zendev-lab/cue` | `cd-publish.yml` | `npm-release` |
 
 All publisher identities use owner `zendev-lab`, repository `cue`. No long-lived
-registry token is stored in Actions. Configure the PyPI pending publisher with
-exactly `cue-run`; a different project name cannot create this distribution.
+registry token is stored in Actions. Configure the Trusted Publisher on the existing PyPI project `cue-run`.
 
 ## First crates.io release
 
 crates.io requires the first release of a new crate to use an account token;
 Trusted Publishing can be configured after the crate exists. From the fixed,
-reviewed release commit, publish `0.2.0` in this order:
+reviewed release commit, publish the workspace using an account token:
 
-```text
-cue-core → cue-language → cue-protocol → cue-runtime → cue-store-sqlite
-→ cue-daemon → cue-client → cue-tui → cue-cli
+```sh
+cargo publish --workspace --registry crates-io --locked
 ```
 
-For each package run `cargo publish --registry crates-io --locked -p <crate>`
-and wait until its version is available before publishing dependents. Then
-configure each crate's Trusted Publisher, create each `<crate>-v0.2.0` tag on
-the same commit, and create the product `v0.2.0` tag. Never publish from a dirty
-checkout or from the old v0.1.2 checkout.
+Cargo publishes in dependency order and waits for registry availability. If the
+command partially succeeds, retry with `-p <crate>` for the remaining packages.
+Configure each crate's Trusted Publisher for `cd-publish.yml` and `crates-release`,
+then let release-plz create the release tags from the reviewed release commit.
+Never publish from a dirty checkout or from the old v0.1.2 checkout.
 
-Before publishing, run `just ci`, `just crate-package-smoke` and
-`uv run --no-project --python 3.14 python -m unittest discover -s scripts -p test_release.py`.
+Before publishing, run `just ci` and `just crate-package-smoke`.
 `cargo package --workspace` uses a temporary registry to verify unpublished
 workspace dependencies. Run this check with a clean Cargo configuration;
 a crates.io source replacement may bypass that temporary registry and produce
