@@ -15,7 +15,7 @@ pr_body = """## 动机
 ## 解决方案
 
 {% for release in releases %}
-- `{{ release.package }}`: {{ release.previous_version }} → {{ release.next_version }}
+- `{{ release.package }}`: {% if release.previous_version %}{{ release.previous_version }} → {% endif %}{{ release.next_version }}
 {% if release.breaking_changes %}
 {{ release.breaking_changes }}
 {% endif %}
