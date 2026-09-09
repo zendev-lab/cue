@@ -34,15 +34,13 @@ Cue 的 CLI、IPC、语言、持久化和执行语义共同构成跨进程、跨
 合入。
 
 `Feature` FP 描述公开功能，`Governance` FP 描述 Cue 自身的提案、发布或协作规则。
-FP 默认使用中文正文，但作者可以根据读者选择英文；编号、类型、代码、命令和技术
-标识保持英文。schema 和校验器不检查自然语言，也不维护 `language` 字段。
-
-FP pull request 复用仓库统一中文模板和 `zendev` title profile。新提案、修订和
-替代分别使用 `propose`、`revise` 和 `supersede`；这些动词帮助人类识别变更意图，
-不构成机器状态或合并门禁。
+FP 标题和正文使用中文。编号、类型、代码、
+命令和技术标识保持英文。schema 和校验器不检查自然语言，也不维护 `language` 字段。
 
 提案永久保留在 Git 中。后续提案替代旧提案时，在新文档的 `supersedes` 中引用旧
-提案；索引据此派生 `superseded_by`。不改变提案含义的编辑修订可以直接更新原记录。
+提案的整数编号；v2 索引以整数 `fp` 作为唯一提案身份，并据此派生整数关系
+`superseded_by`。FP-NNNN 保留用于文件名、标题和正文引用，不另生成索引 id。
+不改变提案含义的编辑修订可以直接更新原记录。
 
 ## 兼容性
 
@@ -52,6 +50,6 @@ schema 和对应文档共同定义。
 
 ## 验证
 
-固定版本的 `zendev-proposal check` 校验当前 FP 元数据、模板章节、关系和确定性索引。
+使用 `zendev-proposal check` 校验当前 FP 元数据、模板章节、关系和确定性索引。
 仓库的 prek/CI 运行相同检查，但不会从 Git 历史、实现 diff 或 pull request 文本推断
 提案状态与采纳结果。
