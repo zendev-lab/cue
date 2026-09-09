@@ -51,8 +51,8 @@ Cargo/PyPI/npm 上传，以及最后的 GitHub Release。PyPI 使用 PyPA 官方
 版本检查直接使用 `cargo metadata` 和 `jq -e` 断言 tag 与全部 crate 的版本一致。
 `cargo package` 验证的是包能否构建，不能替代仓库的 tag 命名约定。
 
-The `release` and `release-pr` jobs are independent. Only `release-pr` has a
-shared concurrency group, so a later main commit cannot cancel a pending release.
+`create-tags` 与 `release-pr` 独立运行。只有 `release-pr` 使用共享并发组，
+避免后续 main push 取消等待中的打 tag job。
 
 The repository's `💥 breaking:` commit prefix requests a minor bump in 0.x,
 including protocol/CLI incompatibilities that Rust API checks cannot detect.
