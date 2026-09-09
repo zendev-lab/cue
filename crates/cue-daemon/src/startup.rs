@@ -18,9 +18,9 @@ pub(crate) struct SpawnedDaemon {
     log_offset: u64,
 }
 
-pub(crate) async fn start(socket: &Path, database: &Path) -> Result<()> {
+pub(crate) async fn start(socket: &Path, database: &Path, config: Option<&Path>) -> Result<()> {
     let instance = uuid::Uuid::new_v4().to_string();
-    let mut spawned = spawn_daemon(socket, database, &instance)?;
+    let mut spawned = spawn_daemon(socket, database, &instance, config)?;
     let pid = spawned.child.id();
     let result = wait_ready_inner(
         socket,
@@ -42,7 +42,7 @@ pub(crate) async fn start(socket: &Path, database: &Path) -> Result<()> {
         );
     }
     println!(
-        "started {} (pid {pid}, IPC v4 ready)\nlog: {}",
+        "started {} (pid {pid}, IPC v5 ready)\nlog: {}",
         socket.display(),
         spawned.log.display()
     );
@@ -53,6 +53,7 @@ pub(crate) fn spawn_daemon(
     socket: &Path,
     database: &Path,
     instance: &str,
+    config: Option<&Path>,
 ) -> Result<SpawnedDaemon> {
     let log = host::sidecar(socket, ".log");
     let output = dirs::open_log_file(&log)?;
@@ -70,6 +71,9 @@ pub(crate) fn spawn_daemon(
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
     // SAFETY: the post-fork hook only calls the async-signal-safe setsid syscall.
     // A new session and redirected descriptors detach the daemon from the shell.
     unsafe {

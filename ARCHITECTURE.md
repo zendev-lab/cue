@@ -9,7 +9,7 @@ frontend Scope + surface source
 ScopeHash --------> ExecutionSpec { ScopeHash, closed ExecutionPlan }
                          |
                          v
-IPC v4 -> reducer -> typed RuntimeAssembly -> process/PTY/output
+IPC v5 -> extension admission -> reducer -> typed RuntimeAssembly -> process/PTY/output
 ```
 
 `cue-core` alone decides plan meaning, stable Steps, result aggregation, and
@@ -28,3 +28,9 @@ Start with the [design index](docs/design/README.md) and
 [project direction](VISION.md) and [design principles](PRINCIPLES.md).
 
 [FP-0001](fps/FP-0001-structured-execution-kernel.md) owns the normative contract.
+
+`cue-resources` is a built-in Composition extension with independent SQLite
+tables. Generic IPC extension dispatch, atomic submission effects, admission,
+and background cleanup remain host mechanisms. Resource types never enter
+Core, protocol variants, or runtime policy. Physical environment contributions
+flow through SpawnContext after logical environment construction.

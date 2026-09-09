@@ -78,6 +78,14 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
         }),
         Some("run") => {
             let run_args = args.collect::<Vec<_>>();
+            if run_args.iter().any(|arg| arg == "--need") {
+                return Ok(CueCommand::Forward {
+                    program: "cue-client".into(),
+                    args: std::iter::once(OsString::from("run"))
+                        .chain(run_args)
+                        .collect(),
+                });
+            }
             let mut path = None;
             for arg in &run_args {
                 match arg.to_str() {
@@ -104,6 +112,10 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
                 args: forwarded,
             })
         }
+        Some(name @ ("resources" | "providers")) => Ok(CueCommand::Forward {
+            program: "cue-client".into(),
+            args: std::iter::once(OsString::from(name)).chain(args).collect(),
+        }),
         Some("target") => {
             bail!(
                 "`cue target` is not part of the execution kernel; select the local endpoint with CUE_SOCKET or an external transport wrapper"
@@ -200,7 +212,7 @@ fn print_help() {
 
 fn help_text() -> String {
     format!(
-        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue>\n  cue fg <Eid/Sid> [--observe]\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      IPC v4 execution, output, cancel, and PTY commands\n  tui         Interactive execution UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n  fg          Alias for `cue client fg`\n\nExamples:\n  cue run script.cue\n  cue client exec \"cargo test\"\n  cue client list\n  cue fg E1/S1\n  cue tui\n  cue daemon status\n\nSession, schedule, retry, resource, and approval policy are external owners.\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue> [--need KEY=QUANTITY]...\n  cue resources|providers [--json]\n  cue fg <Eid/Sid> [--observe]\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      IPC v5 execution, output, cancel, and PTY commands\n  tui         Interactive execution UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n  fg          Alias for `cue client fg`\n\nExamples:\n  cue run script.cue\n  cue client exec \"cargo test\"\n  cue client list\n  cue fg E1/S1\n  cue tui\n  cue daemon status\n\nSession, schedule, retry, and approval policy are external owners. Resources are execution-scoped daemon extensions.\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -407,7 +419,8 @@ mod tests {
         assert!(text.contains("daemon"));
         assert!(text.contains("<extension>  Run a configured external command"));
         assert!(text.contains("Alias for `cue client run`"));
-        assert!(text.contains("Session, schedule, retry, resource"));
+        assert!(text.contains("--need KEY=QUANTITY"));
+        assert!(text.contains("cue resources|providers [--json]"));
         assert!(text.contains("cue client list"));
     }
 }

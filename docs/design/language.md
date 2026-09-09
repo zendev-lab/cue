@@ -75,6 +75,7 @@ policies and submit an ordinary `ExecutionSpec`; it cannot extend the execution
 algebra.
 
 Legacy launch parameters follow the same rule. `cwd` is written explicitly as
-`cd PATH -> ...`; workspace, wrapper, and resource parameters are resolved by
-Composition before compilation. `ExecutionSpec` has only `scope` and `plan`—it
+`cd PATH -> ...`; workspace and wrapper parameters require Composition
+support. Step `need.*` parameters direct callers to execution-level
+`--need KEY=QUANTITY` submission flags; they never enter the plan. `ExecutionSpec` has only `scope` and `plan`—it
 contains no retry, launch context, source metadata, or ambient session field.

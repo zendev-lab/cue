@@ -1,7 +1,7 @@
 # Cue executable frontends
 
 The `cue-client` binary, top-level `cue` aggregator, and `cue-tui` now present
-only IPC v4 execution concepts. Stable user identities are `ExecutionId` and
+IPC v5 execution and resource extension concepts. Stable user identities are `ExecutionId` and
 `StepId`; J/CH/R identifiers and session attachment epochs are absent.
 
 ## CLI
@@ -22,7 +22,7 @@ warn when the provider returns a later retained offset. The default retention
 is 1 MiB per stream and is lost on daemon restart.
 
 `cue run` and `cue fg` are direct shortcuts. Session, schedule, retry,
-resource, target, and approval commands are not builtin namespaces; an
+target, and approval commands are not builtin namespaces; an
 external producer may still be installed through the extension mechanism.
 
 ## TUI
@@ -57,3 +57,11 @@ have not been ported. Shared language completion support does not imply an
 interactive completion menu. Restoring these frontend features can use the v4
 projections without restoring the deleted v3 workflow owners. The v4 cut ships
 this reduced interface; frontend feature parity remains follow-up work.
+
+## 资源命令
+
+`cue run FILE --need KEY=QUANTITY` and `cue client run/exec` submit
+execution-wide needs atomically. Repeat `--need` for different keys; duplicate
+keys and invalid quantities fail. `cue resources [--json]` and
+`cue providers [--json]` return JSON observations; `cue client show E1` adds
+a separate `resources` projection. Step-level `need.*` points to these flags.
