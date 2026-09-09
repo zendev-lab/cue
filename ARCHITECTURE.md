@@ -25,6 +25,6 @@ There is no IPC v3 implementation or dual stack. The only legacy behavior is
 read-only archival of the old database before the v4 store opens.
 
 Start with the [design index](docs/design/README.md) and
-[project direction](SPARK.md).
+[project direction](VISION.md) and [design principles](PRINCIPLES.md).
 
 [FP-0001](fps/FP-0001-structured-execution-kernel.md) owns the normative contract.

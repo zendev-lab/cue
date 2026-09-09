@@ -12,6 +12,19 @@ advance with the workspace version.
 Publishing does not filter crates by source changes. It only skips crate versions
 already uploaded successfully, so a partial publish can be retried.
 
+## Workflow 职责
+
+- `cd-release.yml`：自动准备 Release PR，并在合并后打 tag；`release-plz release`
+  是工具的命令名，`git_only = true` 和 `publish = false` 禁止它上传 registry。
+- `build-packages.yml`：通过 GitHub 原生 `workflow_call` 供 CI 和 Publish 共用，
+  执行 Cargo 打包、wheel/sdist/npm 构建与安装 smoke，并上传产物。
+- `ci-package-smoke.yml`：在 PR、main 和 merge queue 中调用相同的构建流程。
+- `cd-publish.yml`：校验 tag，调用构建流程，随后上传三个 registry 并创建 GitHub Release。
+- `ci-static-checks.yml`、`ci-tests.yml`、`policy-pr.yml`：分别负责静态检查、测试及 PR 格式。
+
+版本检查直接使用 `cargo metadata` 和 `jq -e` 断言 tag 与全部 crate 的版本一致。
+`cargo package` 验证的是包能否构建，不能替代仓库的 tag 命名约定。
+
 ## Normal releases
 
 1. Merging development changes into `main` updates the release-plz PR.

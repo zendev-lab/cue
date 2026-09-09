@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   release:
+    name: Create release tags
     if: github.repository == 'zendev-lab/cue'
     runs-on: ubuntu-latest
     steps:
@@ -26,7 +27,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.1"
-      - uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5
+      - name: Create tags (git_only mode; no registry publishing)
+        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5
         with:
           command: release
           version: "0.3.162"
@@ -34,6 +36,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
 
   release-pr:
+    name: Prepare release PR
     if: github.repository == 'zendev-lab/cue'
     concurrency:
       group: release-plz-${{ github.ref }}
@@ -54,8 +57,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.1"
-      - uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5
-        id: release-plz
+      - name: Create or update the release PR
+        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5
         with:
           command: release-pr
           version: "0.3.162"
