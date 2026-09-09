@@ -344,12 +344,15 @@ dependencies = [
  "anyhow",
  "cue-core",
  "cue-protocol",
+ "cue-resources",
  "cue-runtime",
  "cue-store-sqlite",
  "libc",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -374,6 +377,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "cue-resources"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "cue-core",
+ "cue-runtime",
+ "cue-store-sqlite",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "uuid",
 ]
 
 [[package]]

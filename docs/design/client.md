@@ -10,7 +10,8 @@ environment, and current `umask` into a complete `Scope`. The ordered flow is:
 
 1. `PutScope(scope)` and receive its content hash plus durability class.
 2. Compile surface source with that explicit `ScopeHash`.
-3. `SubmitExecution(typed_spec)`.
+3. `SubmitExecution(typed_spec)`, or the `resources` extension `submit` command
+   containing the typed spec and execution-level needs. Allocation stays in cued.
 
 The daemon therefore never guesses which shell, terminal, session, or process
 environment a command came from. Environment values carry explicit sensitivity. The SQLite host rejects
@@ -23,7 +24,7 @@ message. Every query receives a fresh non-zero `RequestId`. A logical command ow
 immutable `PreparedCommand` with its ClientId, OperationId, and payload. Socket
 reconnection retries it with the original identity. Stream and multiplexed
 callers can retain and reuse prepared commands across connection replacement. The
-client uses the same strict length-prefixed IPC v4 framing as the daemon and
+client uses the same strict length-prefixed IPC v5 framing as the daemon and
 surfaces typed protocol errors without retrying a rejected effect. Local socket
 connection and Hello waits, including reconnect Hello, are bounded to two
 seconds. A missing daemon points to `cued start`; a failed Hello points to
@@ -37,7 +38,7 @@ facts/PTY events to a separate event queue.
 ## Language boundary
 
 `cue-language` returns `SurfaceCommand`; the client is the only layer that maps
-those intents into Query or Command envelopes. Schedule, retry, resource,
+those intents into Query or Command envelopes. Schedule, retry,
 session, and approval policies remain external owners and cannot reappear as
 hidden daemon request fields.
 

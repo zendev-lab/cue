@@ -105,7 +105,15 @@ pub(crate) fn validate_extension_name(name: &str, label: &str) -> Result<()> {
 fn is_reserved_extension_name(name: &str) -> bool {
     matches!(
         name,
-        "client" | "daemon" | "help" | "run" | "target" | "tui" | "version"
+        "client"
+            | "daemon"
+            | "help"
+            | "run"
+            | "resources"
+            | "providers"
+            | "target"
+            | "tui"
+            | "version"
     )
 }
 

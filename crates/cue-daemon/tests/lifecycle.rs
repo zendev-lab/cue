@@ -42,6 +42,7 @@ impl Fixture {
             .arg("--socket")
             .arg(&self.socket)
             .current_dir(&self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -58,7 +59,7 @@ impl Fixture {
     async fn start(&self) {
         let result = self.run("start").await;
         assert!(result.status.success(), "{result:?}");
-        assert!(String::from_utf8_lossy(&result.stdout).contains("IPC v4 ready"));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("IPC v5 ready"));
     }
 
     async fn ready(&self) -> (String, i32) {
@@ -213,6 +214,7 @@ async fn foreground_and_relative_paths_are_supported() {
     let mut command = tokio::process::Command::new(BINARY);
     command
         .args(["start", "--socket", "peer.sock", "--db", "data.db"])
+        .env("XDG_CONFIG_HOME", fixture.root.join("config"))
         .current_dir(&fixture.root)
         .kill_on_drop(true);
     assert!(output(command).await.status.success());

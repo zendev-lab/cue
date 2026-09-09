@@ -1,4 +1,4 @@
-//! IPC v4 client and frontend-owned Scope submission flow.
+//! IPC v5 client and frontend-owned Scope submission flow.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
@@ -47,7 +47,7 @@ pub struct PreparedCommand {
     command: Command,
 }
 
-/// Sequential IPC v4 connection. Convert it into a multiplexed client before
+/// Sequential IPC v5 connection. Convert it into a multiplexed client before
 /// sharing it between an interactive frontend's request and event loops.
 pub struct ExecutionClient {
     stream: BoxedStream,
@@ -75,9 +75,9 @@ impl ExecutionClient {
             })?;
         let client_id = generated_client_id()?;
         let mut client = tokio::time::timeout(CONNECT_TIMEOUT, Self::connect_stream(stream, client_id))
-            .await.context("IPC v4 handshake timed out")
+            .await.context("IPC v5 handshake timed out")
             .and_then(|result| result)
-            .with_context(|| format!("IPC v4 handshake failed at {}; inspect the listener with `cued status --socket {quoted}`", socket.display()))?;
+            .with_context(|| format!("IPC v5 handshake failed at {}; inspect the listener with `cued status --socket {quoted}`", socket.display()))?;
         client.reconnect_socket = Some(socket.to_path_buf());
         Ok(client)
     }
@@ -172,13 +172,13 @@ impl ExecutionClient {
         {
             let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&socket))
                 .await
-                .context("reconnect IPC v4 socket timed out")?
-                .context("reconnect IPC v4 socket")?;
+                .context("reconnect IPC v5 socket timed out")?
+                .context("reconnect IPC v5 socket")?;
             self.stream = Box::new(stream);
             self.pending_events.clear();
             tokio::time::timeout(CONNECT_TIMEOUT, self.hello())
                 .await
-                .context("reconnect IPC v4 handshake timed out")??;
+                .context("reconnect IPC v5 handshake timed out")??;
             return self.send_prepared(prepared).await;
         }
         response
@@ -219,11 +219,56 @@ impl ExecutionClient {
         }
     }
 
+    pub async fn submit_with_needs(
+        &mut self,
+        spec: ExecutionSpec,
+        needs: BTreeMap<String, String>,
+    ) -> Result<ExecutionView> {
+        if needs.is_empty() {
+            return self.submit(spec).await;
+        }
+        match self
+            .command(Command::Extension(cue_protocol::ExtensionRequest {
+                namespace: "resources".into(),
+                version: 1,
+                method: "submit".into(),
+                data: serde_json::json!({"spec":spec,"needs":needs}),
+            }))
+            .await?
+        {
+            ResultPayload::ExecutionSubmitted { execution } => Ok(*execution),
+            other => bail!("unexpected resource submission response: {other:?}"),
+        }
+    }
+
+    pub async fn resource_query(
+        &mut self,
+        method: &str,
+        data: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self
+            .query(Query::Extension(cue_protocol::ExtensionRequest {
+                namespace: "resources".into(),
+                version: 1,
+                method: method.into(),
+                data,
+            }))
+            .await?
+        {
+            ResultPayload::Extension {
+                namespace,
+                version: 1,
+                data,
+            } if namespace == "resources" => Ok(data),
+            other => bail!("unexpected resource query response: {other:?}"),
+        }
+    }
+
     /// Store the exact frontend Scope, compile against its content hash, and
     /// only then submit the fully resolved execution.
     pub async fn submit_file(&mut self, scope: Scope, source: &str) -> Result<ExecutionView> {
         let (hash, _) = self.put_scope(scope).await?;
-        let spec = compile_file(source, hash).context("compile Cue file for IPC v4")?;
+        let spec = compile_file(source, hash).context("compile Cue file for IPC v5")?;
         self.submit(spec).await
     }
 
@@ -237,7 +282,7 @@ impl ExecutionClient {
     ) -> Result<SurfaceOutcome> {
         let hash = scope.compute_hash();
         let command =
-            compile_command(source, mode, hash).context("compile Cue command for IPC v4")?;
+            compile_command(source, mode, hash).context("compile Cue command for IPC v5")?;
         dispatch_surface(self, scope, command).await
     }
 
@@ -254,7 +299,7 @@ impl ExecutionClient {
                 )
             }
             Message::Query { .. } | Message::Command { .. } => {
-                bail!("daemon sent a client-only IPC v4 message")
+                bail!("daemon sent a client-only IPC v5 message")
             }
         }
     }
@@ -276,10 +321,10 @@ impl ExecutionClient {
 
     async fn send(&mut self, message: &Message) -> Result<()> {
         self.stream
-            .write_all(&encode_message(message).context("encode IPC v4 message")?)
+            .write_all(&encode_message(message).context("encode IPC v5 message")?)
             .await
-            .context("write IPC v4 message")?;
-        self.stream.flush().await.context("flush IPC v4 message")
+            .context("write IPC v5 message")?;
+        self.stream.flush().await.context("flush IPC v5 message")
     }
 
     async fn wait_response(&mut self, expected: RequestId) -> Result<ResultPayload> {
@@ -296,7 +341,7 @@ impl ExecutionClient {
                 ),
                 Message::Event { payload } => self.pending_events.push_back(payload),
                 Message::Query { .. } | Message::Command { .. } => {
-                    bail!("daemon sent a client-only IPC v4 message")
+                    bail!("daemon sent a client-only IPC v5 message")
                 }
             }
         }
@@ -309,7 +354,7 @@ struct PendingResponses {
     closed: Option<String>,
 }
 
-/// Concurrent v4 client for TUI and other event-driven frontends.
+/// Concurrent IPC v5 client for TUI and other event-driven frontends.
 pub struct MultiplexedClient {
     client_id: ClientId,
     writer: Arc<Mutex<io::WriteHalf<BoxedStream>>>,
@@ -361,7 +406,7 @@ impl MultiplexedClient {
         mode: Mode,
     ) -> Result<SurfaceOutcome> {
         let command = compile_command(source, mode, scope.compute_hash())
-            .context("compile Cue command for IPC v4")?;
+            .context("compile Cue command for IPC v5")?;
         self.execute_compiled(scope, command).await
     }
 
@@ -421,15 +466,15 @@ impl MultiplexedClient {
     }
 
     async fn call(&self, request_id: RequestId, message: Message) -> Result<ResultPayload> {
-        let frame = encode_message(&message).context("encode IPC v4 message")?;
+        let frame = encode_message(&message).context("encode IPC v5 message")?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self
                 .pending
                 .lock()
-                .map_err(|_| anyhow::anyhow!("lock pending v4 responses"))?;
+                .map_err(|_| anyhow::anyhow!("lock pending IPC responses"))?;
             if let Some(reason) = &pending.closed {
-                bail!("IPC v4 connection is closed: {reason}");
+                bail!("IPC v5 connection is closed: {reason}");
             }
             pending.waiters.insert(request_id, tx);
         }
@@ -438,8 +483,8 @@ impl MultiplexedClient {
             writer
                 .write_all(&frame)
                 .await
-                .context("write IPC v4 message")?;
-            writer.flush().await.context("flush IPC v4 message")
+                .context("write IPC v5 message")?;
+            writer.flush().await.context("flush IPC v5 message")
         }
         .await;
         if let Err(error) = send {
@@ -456,7 +501,7 @@ impl MultiplexedClient {
 impl Drop for MultiplexedClient {
     fn drop(&mut self) {
         self.reader_task.abort();
-        fail_pending(&self.pending, "IPC v4 client dropped");
+        fail_pending(&self.pending, "IPC v5 client dropped");
     }
 }
 
@@ -481,11 +526,11 @@ async fn run_reader(
             }
             Ok(Message::Event { payload }) => {
                 if events.send(payload).is_err() {
-                    break "IPC v4 event receiver closed".to_owned();
+                    break "IPC v5 event receiver closed".to_owned();
                 }
             }
             Ok(Message::Query { .. } | Message::Command { .. }) => {
-                break "daemon sent a client-only IPC v4 message".to_owned();
+                break "daemon sent a client-only IPC v5 message".to_owned();
             }
             Err(error) => break error.to_string(),
         }
@@ -511,10 +556,10 @@ where
     reader
         .read_exact(&mut header)
         .await
-        .context("read IPC v4 length prefix")?;
+        .context("read IPC v5 length prefix")?;
     let length = u32::from_be_bytes(header) as usize;
     if length > MAX_MESSAGE_SIZE {
-        bail!("IPC v4 message is {length} bytes; maximum is {MAX_MESSAGE_SIZE}");
+        bail!("IPC v5 message is {length} bytes; maximum is {MAX_MESSAGE_SIZE}");
     }
     let mut frame = Vec::with_capacity(4 + length);
     frame.extend_from_slice(&header);
@@ -522,8 +567,8 @@ where
     reader
         .read_exact(&mut frame[4..])
         .await
-        .context("read IPC v4 message body")?;
-    cue_protocol::decode_message(&frame).context("decode IPC v4 message")
+        .context("read IPC v5 message body")?;
+    cue_protocol::decode_message(&frame).context("decode IPC v5 message")
 }
 
 fn result(payload: ResponsePayload) -> Result<ResultPayload> {
@@ -531,7 +576,7 @@ fn result(payload: ResponsePayload) -> Result<ResultPayload> {
         ResponsePayload::Ok(result) => Ok(result),
         ResponsePayload::Error(error) => {
             bail!(
-                "daemon rejected IPC v4 request [{:?}]: {}",
+                "daemon rejected IPC v5 request [{:?}]: {}",
                 error.code,
                 error.message
             )
@@ -1218,7 +1263,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("encode IPC v4 message"));
+        assert!(error.to_string().contains("encode IPC v5 message"));
         assert!(matches!(
             client.query(Query::Ping).await.unwrap(),
             ResultPayload::Ack

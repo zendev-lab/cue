@@ -17,6 +17,8 @@ PTY reattachment matter.
 | --- | --- |
 | Run one Cue expression and wait | `cue client exec SOURCE` |
 | Run a `.cue` file and wait | `cue run FILE.cue` |
+| Submit with execution resources | `cue run FILE.cue --need worker=1`, `cue client exec --need gpu_mem=24GiB -- SOURCE` |
+| Inspect resources and cleanup | `cue resources --json`, `cue providers --json` |
 | List or inspect executions | `cue client list`, `cue client show E7` |
 | Wait for an execution | `cue client wait E7` |
 | Read one Step stream | `cue client out|err|terminal E7/S2` |
@@ -65,7 +67,17 @@ literal argument; `A=B` alone is invalid.
   by `cued start`, preserving the selected socket and custom database.
 - An unresolved physical Run after a crash blocks daemon startup. Do not edit
   attempt markers or rerun a side effect to bypass that recovery failure.
-- Schedule, retry, resource selection, approval, remote transport, and session
+- Schedule, retry, approval, remote transport, and session
   policy belong to the calling host or an external producer, not Cue commands.
 - For complex shell behavior, write a script and invoke its interpreter as
   explicit argv; do not smuggle an unreviewed command string into Cue.
+
+## 执行资源
+
+Providers are configured by the daemon host in `daemon.toml`, optionally via
+`cued start --config PATH`. Resource keys must exist in that configuration.
+Use one `--need KEY=QUANTITY` per key; needs hold across all steps, parallel
+branches, pipelines, and PTYs. Move Step-level `need.*` to submission flags.
+Waiting executions have normal IDs; use cancel/kill to stop them.
+`show` reports resource cleanup separately from execution success. Unresolved
+provider ownership blocks reuse or recovery; do not delete allocation records.

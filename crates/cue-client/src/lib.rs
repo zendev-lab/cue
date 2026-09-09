@@ -1,4 +1,4 @@
-//! IPC v4 client and executable frontend support.
+//! IPC v5 client and executable frontend support.
 
 pub mod cli;
 pub mod execution;

@@ -27,6 +27,16 @@ pub enum Message {
     },
 }
 
+/// A namespaced, versioned extension request. The selected extension validates data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionRequest {
+    pub namespace: String,
+    pub version: u32,
+    pub method: String,
+    pub data: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hello {
@@ -42,6 +52,7 @@ pub struct Hello {
     deny_unknown_fields
 )]
 pub enum Query {
+    Extension(ExtensionRequest),
     Hello(Hello),
     Ping,
     GetScope {
@@ -86,6 +97,7 @@ pub struct OutputRange {
     deny_unknown_fields
 )]
 pub enum Command {
+    Extension(ExtensionRequest),
     PutScope {
         scope: Box<Scope>,
     },
@@ -164,6 +176,11 @@ impl ResponsePayload {
     deny_unknown_fields
 )]
 pub enum ResultPayload {
+    Extension {
+        namespace: String,
+        version: u32,
+        data: serde_json::Value,
+    },
     Ack,
     Hello {
         protocol_version: u32,

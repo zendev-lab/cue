@@ -1,22 +1,15 @@
 [package]
-name = "cue-daemon"
+name = "cue-resources"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Persistent local execution daemon for Cue"
+description = "Execution-scoped resource extension and configurable providers"
 repository.workspace = true
 license.workspace = true
-autobins = false
-
-[[bin]]
-name = "cued"
-path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 cue-core = { path = "../cue-core" }
-cue-protocol = { path = "../cue-protocol" }
-cue-resources = { path = "../cue-resources" }
 cue-runtime = { path = "../cue-runtime" }
 cue-store-sqlite = { path = "../cue-store-sqlite" }
 libc.workspace = true
@@ -25,6 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid.workspace = true
