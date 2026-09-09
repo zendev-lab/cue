@@ -204,7 +204,7 @@ jobs:
           name: cue-npm
           path: dist
       - name: Publish npm artifact
-        run: npm publish dist/*.tgz --access public
+        run: npm publish ./dist/*.tgz --access public
 
   publish-crates:
     name: Publish crates.io
