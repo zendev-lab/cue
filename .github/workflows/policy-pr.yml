@@ -22,18 +22,24 @@ jobs:
           persist-credentials: false
 
       - name: Check PR title
-        if: github.event.pull_request.user.login != 'renovate[bot]'
+        if: >-
+          github.event.pull_request.user.login != 'renovate[bot]' &&
+          github.event.pull_request.user.login != 'zendev-cue-release[bot]'
         uses: zendev-lab/zendev/actions/validate-title@91087d4d4e9841aaf8cead8b7c6d294a3db63b10 # v0.4.0
         with:
           text: ${{ github.event.pull_request.title }}
           profile: zendev
 
       - name: Check PR body
-        if: github.event.pull_request.user.login != 'renovate[bot]'
+        if: >-
+          github.event.pull_request.user.login != 'renovate[bot]' &&
+          github.event.pull_request.user.login != 'zendev-cue-release[bot]'
         uses: zendev-lab/zendev/actions/validate-body@91087d4d4e9841aaf8cead8b7c6d294a3db63b10 # v0.4.0
         with:
           body: ${{ github.event.pull_request.body }}
 
-      - name: Skip PR message checks for Renovate
-        if: github.event.pull_request.user.login == 'renovate[bot]'
-        run: echo "Renovate PRs are exempt from the repository title and description conventions."
+      - name: Skip PR message checks for release and dependency bots
+        if: >-
+          (github.event.pull_request.user.login == 'renovate[bot]' ||
+           github.event.pull_request.user.login == 'zendev-cue-release[bot]')
+        run: echo "Release and dependency bot PRs are exempt from the repository title and description conventions."

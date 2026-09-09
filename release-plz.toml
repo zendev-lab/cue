@@ -1,0 +1,47 @@
+[workspace]
+release_always = false
+publish = false
+git_only = true
+dependencies_update = false
+custom_minor_increment_regex = "^breaking$|^💥 breaking:"
+changelog_update = false
+git_release_enable = false
+git_tag_name = "{{ package }}-v{{ version }}"
+
+# Keep every crate in the same version group, including unchanged components.
+[[package]]
+name = "cue-cli"
+git_tag_name = "v{{ version }}"
+version_group = "cue"
+
+[[package]]
+name = "cue-client"
+version_group = "cue"
+
+[[package]]
+name = "cue-core"
+version_group = "cue"
+
+[[package]]
+name = "cue-daemon"
+version_group = "cue"
+
+[[package]]
+name = "cue-language"
+version_group = "cue"
+
+[[package]]
+name = "cue-protocol"
+version_group = "cue"
+
+[[package]]
+name = "cue-runtime"
+version_group = "cue"
+
+[[package]]
+name = "cue-store-sqlite"
+version_group = "cue"
+
+[[package]]
+name = "cue-tui"
+version_group = "cue"

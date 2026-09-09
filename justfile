@@ -59,6 +59,10 @@ clean:
     rm -rf target/
     rm -f lcov.info
 
+# Verify normalized crate packages, using Cargo's temporary workspace registry.
+crate-package-smoke:
+    cargo package --workspace --registry crates-io --locked
+
 # Full local CI gate.
 ci: check test msrv package-smoke npm-package-smoke
 
