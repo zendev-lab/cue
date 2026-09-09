@@ -7,9 +7,11 @@ on:
 permissions:
   contents: read
 
+# Both jobs observe pushes to main. release_always = false lets release-plz
+# identify a merged release PR through GitHub's associated-PR API.
 jobs:
-  release:
-    name: Create release tags
+  create-tags:
+    name: Tag the merged release PR
     if: github.repository == 'zendev-lab/cue'
     runs-on: ubuntu-latest
     steps:
@@ -36,7 +38,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
 
   release-pr:
-    name: Prepare release PR
+    name: Prepare the next release PR
     if: github.repository == 'zendev-lab/cue'
     concurrency:
       group: release-plz-${{ github.ref }}

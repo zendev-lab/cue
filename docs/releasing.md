@@ -12,29 +12,44 @@ advance with the workspace version.
 Publishing does not filter crates by source changes. It only skips crate versions
 already uploaded successfully, so a partial publish can be retried.
 
-## Workflow 职责
+## Workflow 职责与触发
 
-- `cd-release.yml`：自动准备 Release PR，并在合并后打 tag；`release-plz release`
-  是工具的命令名，`git_only = true` 和 `publish = false` 禁止它上传 registry。
-- `build-packages.yml`：通过 GitHub 原生 `workflow_call` 供 CI 和 Publish 共用，
-  执行 Cargo 打包、wheel/sdist/npm 构建与安装 smoke，并上传产物。
-- `ci-package-smoke.yml`：在 PR、main 和 merge queue 中调用相同的构建流程。
-- `cd-publish.yml`：校验 tag，调用构建流程，随后上传三个 registry 并创建 GitHub Release。
-- `ci-static-checks.yml`、`ci-tests.yml`、`policy-pr.yml`：分别负责静态检查、测试及 PR 格式。
+`cd-release.yml` 只订阅 `main` 的 push，包含两个独立 job：
+
+- `release-pr` 运行 `release-plz release-pr`，有待发布变化时自动创建或更新 Release PR。
+- `create-tags` 运行 `release-plz release`。`release_always = false` 使其查询当前 commit
+  关联的 PR，只有关联 PR 的分支以 `release-plz-` 开头时才继续；普通 PR 合并后跳过打 tag。
+  这是工具原生的判断，不解析 commit message，也不额外监听 PR closed 事件。
+
+审核并合并 Release PR 后，合并产生的 main push 走同一个 workflow。配置中的
+`git_only = true`、`publish = false` 和 `git_release_enable = false` 让它只创建 Git tag。
+`cue-cli` 使用产品 `v<version>` tag，其余 crate 的 tag 用作 release-plz 版本基线。
+GitHub App token 使推送 tag 能继续触发其他 workflow。
+
+```text
+普通 PR 合并 → push main → 自动创建/更新 Release PR
+                               ↓ 审核并合并
+                          push main → release-plz 识别关联的 Release PR
+                                          ↓
+                                       push tag v*
+                                          ↓
+                                    cd-publish.yml
+                                          ↓
+                          构建与安装 smoke → 上传 registry → GitHub Release
+```
+
+`cd-publish.yml` 只订阅 `v*` tag push，直接包含版本检查、产物构建、安装 smoke、
+Cargo/PyPI/npm 上传，以及最后的 GitHub Release。PyPI 使用 PyPA 官方发布 Action，
+保留 Trusted Publishing 和默认的 PEP 740 发布证明。上传 jobs 与构建 jobs 分离，
+仅上传 jobs 获得对应 registry 的 OIDC 权限。
+
+`ci-package-smoke.yml` 直接运行 PR 阶段的 Cargo 打包和 wheel/sdist/npm 安装 smoke，
+提前发现发行包缺文件、无法安装或启动等问题。它不上传 registry，也不调用共用 workflow。
+`ci-static-checks.yml` 和 `ci-tests.yml` 分别负责静态检查与代码测试。
+`policy-pr.yml` 只监听 PR 事件，检查 PR 格式。
 
 版本检查直接使用 `cargo metadata` 和 `jq -e` 断言 tag 与全部 crate 的版本一致。
 `cargo package` 验证的是包能否构建，不能替代仓库的 tag 命名约定。
-
-## Normal releases
-
-1. Merging development changes into `main` updates the release-plz PR.
-2. Review its version, breaking changes and CI, then merge it manually.
-3. `cd-release.yml` uses release-plz's `git_only` mode to create tags, without
-   publishing packages. `cue-cli` owns the product `v<version>` tag; the other
-   crates use `<crate>-v<version>` tags as their release-plz version baselines.
-4. The product tag triggers `cd-publish.yml`: Cargo publishes Rust crates,
-   Maturin builds the Python distributions for `uv publish`, and npm publishes
-   the Skill package. GitHub Release creation waits for all three publishers.
 
 The `release` and `release-pr` jobs are independent. Only `release-pr` has a
 shared concurrency group, so a later main commit cannot cancel a pending release.
@@ -43,8 +58,10 @@ The repository's `💥 breaking:` commit prefix requests a minor bump in 0.x,
 including protocol/CLI incompatibilities that Rust API checks cannot detect.
 
 There is no `just release` command. Do not edit a product tag to retry a failed
-release. Rerun failed jobs on the original run/commit. `uv publish` skips identical
-PyPI files and rejects different bytes; reuse the original build artifacts.
+release. Rerun failed jobs on the original run/commit and reuse the original build
+artifacts. The PyPA Action uses `skip-existing` to tolerate files already uploaded;
+this is duplicate-upload handling, not a content-equality check. Do not use it to
+replace existing files with a rebuild.
 Cargo handles dependency ordering and index availability. A small registry check
 selects versions not yet published, allowing retries after a partial Rust upload
 and the initial account-token bootstrap. Yanked versions and lookup errors fail.
