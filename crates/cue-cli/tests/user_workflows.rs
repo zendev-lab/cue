@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const DAEMON: &str = env!("CARGO_BIN_EXE_cued");
 const CLIENT: &str = env!("CARGO_BIN_EXE_cue-client");
@@ -15,14 +15,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = PathBuf::from("/tmp").join(format!(
-            "cue-cli-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = PathBuf::from("/tmp").join(format!("cue-cli-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         Self {
             socket: root.join("peer.sock"),
