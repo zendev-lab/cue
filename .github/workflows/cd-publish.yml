@@ -47,9 +47,9 @@ jobs:
       - name: Verify unpublished workspace packages
         run: cargo package --workspace --registry crates-io --locked
 
-  build-npm:
+  build-skill:
     needs: check-version
-    name: npm Skill package
+    name: Build npm Skill package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,7 +59,7 @@ jobs:
         with:
           node-version-file: .node-version
           package-manager-cache: false
-      - name: Pack and smoke-test npm artifact
+      - name: Pack and smoke-test Skill artifact
         run: npm run pack
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -157,7 +157,7 @@ jobs:
       - check-crates
       - build-wheel
       - build-sdist
-      - build-npm
+      - build-skill
     permissions:
       contents: read
       # PyPI trusted publishing exchanges GitHub's OIDC token.
@@ -184,7 +184,7 @@ jobs:
       - check-crates
       - build-wheel
       - build-sdist
-      - build-npm
+      - build-skill
     environment: npm-release
     permissions:
       contents: read
@@ -208,7 +208,7 @@ jobs:
 
   publish-crates:
     name: Publish crates.io
-    needs: [check-crates, build-wheel, build-sdist, build-npm]
+    needs: [check-crates, build-wheel, build-sdist, build-skill]
     runs-on: ubuntu-latest
     environment: crates-release
     permissions:
@@ -255,7 +255,7 @@ jobs:
       - check-crates
       - build-wheel
       - build-sdist
-      - build-npm
+      - build-skill
     permissions:
       # The release job creates a GitHub Release and uploads its artifacts.
       contents: write
