@@ -228,7 +228,7 @@ jobs:
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           # Publish the entire version group; skip only versions already uploaded.
           packages=()
-          while read -r name version; do
+          while IFS=$'\t' read -r name version; do
             status="$(curl --silent --show-error --retry 3 --output /tmp/crate-version.json --write-out '%{http_code}' \
               --user-agent 'cue-release (zendev-lab/cue)' "https://crates.io/api/v1/crates/$name/$version")"
             case "$status" in
@@ -237,7 +237,7 @@ jobs:
               404) packages+=(-p "$name") ;;
               *) echo "crates.io lookup failed for $name@$version (HTTP $status)" >&2; exit 1 ;;
             esac
-          done <<< "$(jq -r '.packages[] | [.name, .version] | @tsv' <<< "$metadata")"
+          done < <(jq -r '.packages[] | [.name, .version] | @tsv' <<< "$metadata")
           if ((${#packages[@]})); then
             cargo publish --locked --registry crates-io "${packages[@]}"
           fi
