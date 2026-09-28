@@ -7,11 +7,13 @@ dependencies_update = false
 custom_minor_increment_regex = "^breaking$|^💥 breaking:"
 changelog_update = false
 git_release_enable = false
-git_tag_name = "{{ package }}-v{{ version }}"
+# Only the product package owns a release tag.
+git_tag_enable = false
 
 # Keep every crate in the same version group, including unchanged components.
 [[package]]
 name = "cue-cli"
+git_tag_enable = true
 git_tag_name = "v{{ version }}"
 version_group = "cue"
 

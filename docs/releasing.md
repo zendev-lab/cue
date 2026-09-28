@@ -27,7 +27,8 @@ already uploaded successfully, so a partial publish can be retried.
 
 审核并合并 Release PR 后，合并产生的 main push 走同一个 workflow。配置中的
 `git_only = true`、`publish = false` 和 `git_release_enable = false` 让它只创建 Git tag。
-`cue-cli` 使用产品 `v<version>` tag，其余 crate 的 tag 用作 release-plz 版本基线。
+release-plz 只为 `cue-cli` 创建产品 `v<version>` tag；其他 crate 不创建独立 tag。
+九个 crate 仍在同一 version group 中更新和发布，产品 tag 是统一 release 的唯一 Git 基线。
 GitHub App token 使推送 tag 能继续触发其他 workflow。
 
 ```text
