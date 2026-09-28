@@ -14,12 +14,16 @@ already uploaded successfully, so a partial publish can be retried.
 
 ## Workflow 职责与触发
 
-`cd-release.yml` 只订阅 `main` 的 push，包含两个独立 job：
+`cd-release.yml` 只订阅 `main` 的 push，包含两个 job：
 
 - `release-pr` 运行 `release-plz release-pr`，有待发布变化时自动创建或更新 Release PR。
 - `create-tags` 运行 `release-plz release`。`release_always = false` 使其查询当前 commit
   关联的 PR，只有关联 PR 的分支以 `release-plz-` 开头时才继续；普通 PR 合并后跳过打 tag。
   这是工具原生的判断，不解析 commit message，也不额外监听 PR closed 事件。
+
+`release-pr` 等待 `create-tags` 完成后才运行。否则两个 job 可能并行 checkout 同一个
+刚合并的 release commit，而 `release-pr` 尚未看到新 tag 时会把这次 release 再计算成下一
+个版本，产生没有实际变更的连续 Release PR。
 
 审核并合并 Release PR 后，合并产生的 main push 走同一个 workflow。配置中的
 `git_only = true`、`publish = false` 和 `git_release_enable = false` 让它只创建 Git tag。
@@ -51,7 +55,7 @@ Cargo/PyPI/npm 上传，以及最后的 GitHub Release。PyPI 使用 PyPA 官方
 版本检查直接使用 `cargo metadata` 和 `jq -e` 断言 tag 与全部 crate 的版本一致。
 `cargo package` 验证的是包能否构建，不能替代仓库的 tag 命名约定。
 
-`create-tags` 与 `release-pr` 独立运行。只有 `release-pr` 使用共享并发组，
+`create-tags` 与 `release-pr` 通过 job 依赖串行运行。只有 `release-pr` 使用共享并发组，
 避免后续 main push 取消等待中的打 tag job。
 
 The repository's `💥 breaking:` commit prefix requests a minor bump in 0.x,

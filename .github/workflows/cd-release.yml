@@ -40,6 +40,11 @@ jobs:
   release-pr:
     name: Prepare the next release PR
     if: github.repository == 'zendev-lab/cue'
+    # The release command pushes the vX.Y.Z tags for a merged release PR.
+    # Wait for those tags before calculating the next release, otherwise a
+    # concurrent release-pr run can treat the just-merged release commit as
+    # unreleased work and open a redundant PR.
+    needs: create-tags
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
