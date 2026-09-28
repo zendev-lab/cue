@@ -247,10 +247,15 @@ jobs:
   github-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
+    # A GitHub Release contains the tag's checked and built artifacts. It does
+    # not need every registry publisher to succeed; each registry can be
+    # retried independently without withholding the release record.
     needs:
-      - publish-pypi
-      - publish-npm
-      - publish-crates
+      - check-version
+      - check-crates
+      - build-wheel
+      - build-sdist
+      - build-npm
     permissions:
       # The release job creates a GitHub Release and uploads its artifacts.
       contents: write

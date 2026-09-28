@@ -39,13 +39,18 @@ GitHub App token 使推送 tag 能继续触发其他 workflow。
                                           ↓
                                     cd-publish.yml
                                           ↓
-                          构建与安装 smoke → 上传 registry → GitHub Release
+                          构建与安装 smoke ───────────────→ GitHub Release
+                               ├→ 上传 PyPI
+                               ├→ 上传 npm
+                               └→ 上传 crates.io
 ```
 
 `cd-publish.yml` 只订阅 `v*` tag push，直接包含版本检查、产物构建、安装 smoke、
 Cargo/PyPI/npm 上传，以及最后的 GitHub Release。PyPI 使用 PyPA 官方发布 Action，
 保留 Trusted Publishing 和默认的 PEP 740 发布证明。上传 jobs 与构建 jobs 分离，
-仅上传 jobs 获得对应 registry 的 OIDC 权限。
+仅上传 jobs 获得对应 registry 的 OIDC 权限。GitHub Release 只依赖版本检查、打包和
+smoke 检查；三个 registry 上传相互独立，某个 registry 暂时失败时不会阻止 GitHub
+Release 创建或其他 registry 的重试。
 
 `ci-package-smoke.yml` 直接运行 PR 阶段的 Cargo 打包和 wheel/sdist/npm 安装 smoke，
 提前发现发行包缺文件、无法安装或启动等问题。它不上传 registry，也不调用共用 workflow。
