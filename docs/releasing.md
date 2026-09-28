@@ -47,10 +47,10 @@ GitHub App token 使推送 tag 能继续触发其他 workflow。
 ```
 
 `cd-publish.yml` 只订阅 `v*` tag push，直接包含版本检查、产物构建、安装 smoke、
-PyPI/npm/crates.io 上传，以及最后的 GitHub Release。crates.io 使用 release-plz
-的原生 `release` 命令，查询并只发布尚未上传的 workspace crate 版本；配置文件
-`release-plz-publish.toml` 关闭 tag 和 GitHub Release，避免再次创建 release tag。
-PyPI 使用 PyPA 官方发布 Action，
+PyPI/npm/crates.io 上传，以及最后的 GitHub Release。crates.io 使用
+`katyo/publish-crates` Action，按依赖顺序发布 workspace crate，跳过已经上传的
+精确版本并等待 crates.io 索引可见；它把 `--locked` 传给 Cargo。PyPI 使用 PyPA
+官方发布 Action，
 保留 Trusted Publishing 和默认的 PEP 740 发布证明。上传 jobs 与构建 jobs 分离，
 仅上传 jobs 获得对应 registry 的 OIDC 权限。GitHub Release 只依赖版本检查、打包和
 smoke 检查；三个 registry 上传相互独立，某个 registry 暂时失败时不会阻止 GitHub
@@ -75,10 +75,10 @@ release. Rerun failed jobs on the original run/commit and reuse the original bui
 artifacts. The PyPA Action uses `skip-existing` to tolerate files already uploaded;
 this is duplicate-upload handling, not a content-equality check. Do not use it to
 replace existing files with a rebuild.
-release-plz handles Cargo dependency ordering, index availability, and already-published
-versions, allowing retries after a partial Rust upload. Its Trusted Publishing flow is
-used after each crate has completed its first account-token bootstrap. A newly created
-crate still needs that one-time manual publish; yanked versions and registry errors
+`katyo/publish-crates` handles Cargo dependency ordering, index availability, and
+already-published versions, allowing retries after a partial Rust upload. The
+crates.io auth Action exchanges this job's OIDC identity for a short-lived token.
+A newly created crate still needs that one-time manual publish; registry errors
 remain publish failures.
 For npm, rerun only failed jobs so successful uploads are not repeated; npm
 rejects attempts to overwrite an existing version.
@@ -118,8 +118,8 @@ cargo publish --workspace --registry crates-io --locked
 Cargo publishes in dependency order and waits for registry availability. If the
 command partially succeeds, retry the remaining packages with `-p <crate>`.
 Configure each crate's Trusted Publisher for `cd-publish.yml` and `crates-release`.
-After that bootstrap, the tag-triggered publish job runs release-plz and handles
-partial retries without a repository-maintained registry lookup script.
+After that bootstrap, the tag-triggered publish job runs `katyo/publish-crates` and
+handles partial retries without a repository-maintained registry lookup script.
 Never publish from a dirty checkout or from the old v0.1.2 checkout.
 
 Before publishing, run `just ci` and `just crate-package-smoke`.
