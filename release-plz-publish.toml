@@ -1,0 +1,8 @@
+[workspace]
+release_always = true
+publish = true
+git_only = false
+git_tag_enable = false
+git_release_enable = false
+dependencies_update = false
+changelog_update = false

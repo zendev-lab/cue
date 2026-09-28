@@ -47,7 +47,10 @@ GitHub App token 使推送 tag 能继续触发其他 workflow。
 ```
 
 `cd-publish.yml` 只订阅 `v*` tag push，直接包含版本检查、产物构建、安装 smoke、
-Cargo/PyPI/npm 上传，以及最后的 GitHub Release。PyPI 使用 PyPA 官方发布 Action，
+PyPI/npm/crates.io 上传，以及最后的 GitHub Release。crates.io 使用 release-plz
+的原生 `release` 命令，查询并只发布尚未上传的 workspace crate 版本；配置文件
+`release-plz-publish.toml` 关闭 tag 和 GitHub Release，避免再次创建 release tag。
+PyPI 使用 PyPA 官方发布 Action，
 保留 Trusted Publishing 和默认的 PEP 740 发布证明。上传 jobs 与构建 jobs 分离，
 仅上传 jobs 获得对应 registry 的 OIDC 权限。GitHub Release 只依赖版本检查、打包和
 smoke 检查；三个 registry 上传相互独立，某个 registry 暂时失败时不会阻止 GitHub
@@ -72,9 +75,11 @@ release. Rerun failed jobs on the original run/commit and reuse the original bui
 artifacts. The PyPA Action uses `skip-existing` to tolerate files already uploaded;
 this is duplicate-upload handling, not a content-equality check. Do not use it to
 replace existing files with a rebuild.
-Cargo handles dependency ordering and index availability. A small registry check
-selects versions not yet published, allowing retries after a partial Rust upload
-and the initial account-token bootstrap. Yanked versions and lookup errors fail.
+release-plz handles Cargo dependency ordering, index availability, and already-published
+versions, allowing retries after a partial Rust upload. Its Trusted Publishing flow is
+used after each crate has completed its first account-token bootstrap. A newly created
+crate still needs that one-time manual publish; yanked versions and registry errors
+remain publish failures.
 For npm, rerun only failed jobs so successful uploads are not repeated; npm
 rejects attempts to overwrite an existing version.
 
@@ -104,16 +109,17 @@ registry token is stored in Actions. Configure the Trusted Publisher on the exis
 
 crates.io requires the first release of a new crate to use an account token;
 Trusted Publishing can be configured after the crate exists. From the fixed,
-reviewed release commit, publish the workspace using an account token:
+reviewed release commit, bootstrap any new crate with an account token:
 
 ```sh
 cargo publish --workspace --registry crates-io --locked
 ```
 
 Cargo publishes in dependency order and waits for registry availability. If the
-command partially succeeds, retry with `-p <crate>` for the remaining packages.
-Configure each crate's Trusted Publisher for `cd-publish.yml` and `crates-release`,
-then let release-plz create the release tags from the reviewed release commit.
+command partially succeeds, retry the remaining packages with `-p <crate>`.
+Configure each crate's Trusted Publisher for `cd-publish.yml` and `crates-release`.
+After that bootstrap, the tag-triggered publish job runs release-plz and handles
+partial retries without a repository-maintained registry lookup script.
 Never publish from a dirty checkout or from the old v0.1.2 checkout.
 
 Before publishing, run `just ci` and `just crate-package-smoke`.
