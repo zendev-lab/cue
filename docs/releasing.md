@@ -89,12 +89,13 @@ alongside GitHub's generated change list.
 
 ## Credentials and publisher identities
 
-Install the private `zendev-cue-release` GitHub App only on `zendev-lab/cue`, with Contents and
-Pull requests read/write. Actions use `RELEASE_APP_ID` (repository variable)
+The private `zendev-release` GitHub App is shared across ZenDev repositories and
+uses Contents and Pull requests read/write. Its installation must include
+`zendev-lab/cue`. Actions use `RELEASE_APP_ID` (repository variable)
 and `RELEASE_APP_PRIVATE_KEY` (repository secret) to obtain short-lived
 installation tokens. These tokens allow bot PRs and product tags to trigger CI.
-Release PRs use the default release-plz title/body. Only the title/body policy
-exempts this bot (and Renovate); build and test checks still run.
+Release PRs use the default release-plz title/body. The PR body policy
+exempts this bot (and Renovate); title, build, and test checks still run.
 
 | Registry | Project | Workflow | GitHub environment |
 | --- | --- | --- | --- |
