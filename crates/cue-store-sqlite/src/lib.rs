@@ -10,7 +10,7 @@ use cue_protocol::{ClientId, Command, OperationId, ResponsePayload};
 use rusqlite::{Connection, OptionalExtension as _};
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const STORE_SCHEMA: &str = r#"
 CREATE TABLE scopes (
     hash            BLOB PRIMARY KEY,
@@ -79,7 +79,21 @@ impl Store {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&connection)?;
-        Ok(Self { connection })
+        let store = Self { connection };
+        if store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?
+            == 2
+        {
+            // Before enabling extensions, prove that an older daemon owns no uncertain Run.
+            store.recover_runtime_work()?;
+        }
+        Ok(store)
+    }
+
+    /// Extension providers share this connection and its host-owned mutex.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     pub fn put_scope(
@@ -137,11 +151,23 @@ impl Store {
         execution: &StoredExecution,
         facts: &[FactDraft],
     ) -> Result<ExecutionCommandCommit, StoreError> {
+        self.commit_execution_command_with(operation, execution, facts, |_| Ok(()))
+    }
+
+    /// The extension effect commits with the Execution and logical operation, never on replay.
+    pub fn commit_execution_command_with(
+        &self,
+        operation: OperationCommit<'_>,
+        execution: &StoredExecution,
+        facts: &[FactDraft],
+        effect: impl FnOnce(&Connection) -> Result<(), StoreError>,
+    ) -> Result<ExecutionCommandCommit, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
         match record_operation_on(&transaction, operation)? {
             OperationRecord::Inserted => {
                 validate_commit(&transaction, execution, facts)?;
                 let facts = commit_projection(&transaction, execution, facts)?;
+                effect(&transaction)?;
                 transaction.commit()?;
                 Ok(ExecutionCommandCommit::Committed { facts })
             }
@@ -461,11 +487,6 @@ impl Store {
             [completed_before_ms],
         )?)
     }
-
-    #[cfg(test)]
-    fn connection(&self) -> &Connection {
-        &self.connection
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,7 +790,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             supported: SCHEMA_VERSION,
         });
     }
-    if version != 0 && version != SCHEMA_VERSION {
+    if version != 0 && version != 2 && version != SCHEMA_VERSION {
         return Err(StoreError::IncompatibleSchema(version));
     }
     if version == 0 {

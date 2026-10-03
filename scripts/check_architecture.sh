@@ -15,22 +15,22 @@ fail_if_match() {
 }
 
 fail_if_match \
-    '^[[:space:]]*(cue-(client|daemon|language|protocol|runtime)|rusqlite|tokio)[[:space:]]*=' \
+    '^[[:space:]]*(cue-(client|daemon|language|protocol|resources|runtime)|rusqlite|tokio)[[:space:]]*=' \
     'cue-core must remain independent of runtime, transport, storage, and frontend crates' \
     "${repo_root}/crates/cue-core/Cargo.toml"
 
 fail_if_match \
-    '^[[:space:]]*(cue-(client|daemon|language|protocol|store-sqlite)|rusqlite)[[:space:]]*=' \
+    '^[[:space:]]*(cue-(client|daemon|language|protocol|resources|store-sqlite)|rusqlite)[[:space:]]*=' \
     'cue-runtime must remain independent of daemon, transport, persistence, and frontends' \
     "${repo_root}/crates/cue-runtime/Cargo.toml"
 
 fail_if_match \
-    '^[[:space:]]*(cue-(client|daemon|language|runtime|store-sqlite)|rusqlite|tokio)[[:space:]]*=' \
+    '^[[:space:]]*(cue-(client|daemon|language|resources|runtime|store-sqlite)|rusqlite|tokio)[[:space:]]*=' \
     'cue-protocol must depend only on Core data and transport serialization' \
     "${repo_root}/crates/cue-protocol/Cargo.toml"
 
 fail_if_match \
-    '^[[:space:]]*(cue-(client|daemon|language|runtime)|tokio)[[:space:]]*=' \
+    '^[[:space:]]*(cue-(client|daemon|language|resources|runtime)|tokio)[[:space:]]*=' \
     'cue-store-sqlite must remain an independent Core/protocol store provider' \
     "${repo_root}/crates/cue-store-sqlite/Cargo.toml"
 
@@ -56,7 +56,7 @@ fail_if_match \
 
 fail_if_match \
     'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)' \
-    'the client must use only Core and the strict IPC v4 protocol' \
+    'the client must use only Core and the strict IPC v5 protocol' \
     "${repo_root}/crates/cue-client/src/execution.rs"
 
 fail_if_match \
