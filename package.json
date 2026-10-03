@@ -1,6 +1,5 @@
 {
   "name": "@zendev-lab/cue",
-  "version": "0.1.2",
   "description": "Canonical agent guidance for the Cue execution runtime.",
   "license": "MIT",
   "author": "zrr1999",
@@ -37,6 +36,8 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "test": "node scripts/smoke_npm_package.mjs"
-  }
+    "test": "node scripts/smoke_npm_package.mjs",
+    "pack": "node scripts/smoke_npm_package.mjs --out dist"
+  },
+  "private": true
 }

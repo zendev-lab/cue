@@ -62,3 +62,4 @@ socket/数据库上验证真实命令与故障路径；不要用工作中的用�
 状态。提交描述继续使用中文。
 使用 [仓库 PR 模板](.github/pull_request_template.md)，保留所需章节，说明问题、最终
 变更、实际验证及后续工作。默认以 Draft PR 交付，CI、合并和发布状态分别报告。
+安全漏洞请私下报告，流程见 [SECURITY.md](SECURITY.md)。

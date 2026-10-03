@@ -17,10 +17,10 @@ ansi-to-tui = "8"
 anyhow.workspace = true
 base64.workspace = true
 crossterm.workspace = true
-cue-client = { path = "../cue-client" }
-cue-core = { path = "../cue-core" }
-cue-language = { path = "../cue-language" }
-cue-protocol = { path = "../cue-protocol" }
+cue-client = { workspace = true }
+cue-core = { workspace = true }
+cue-language = { workspace = true }
+cue-protocol = { workspace = true }
 libc.workspace = true
 ratatui.workspace = true
 serde.workspace = true
@@ -28,4 +28,4 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-cue-daemon = { path = "../cue-daemon" }
+cue-daemon = { workspace = true }

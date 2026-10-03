@@ -15,9 +15,9 @@ path = "src/bin/cue-client.rs"
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
-cue-core = { path = "../cue-core" }
-cue-language = { path = "../cue-language" }
-cue-protocol = { path = "../cue-protocol" }
+cue-core = { workspace = true }
+cue-language = { workspace = true }
+cue-protocol = { workspace = true }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,4 +25,4 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-cue-daemon = { path = "../cue-daemon" }
+cue-daemon = { workspace = true }

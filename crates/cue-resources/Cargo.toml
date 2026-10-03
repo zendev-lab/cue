@@ -9,9 +9,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-cue-core = { path = "../cue-core" }
-cue-runtime = { path = "../cue-runtime" }
-cue-store-sqlite = { path = "../cue-store-sqlite" }
+cue-core = { workspace = true }
+cue-runtime = { workspace = true }
+cue-store-sqlite = { workspace = true }
 libc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

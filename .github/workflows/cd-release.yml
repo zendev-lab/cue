@@ -1,0 +1,73 @@
+name: "CD - Release"
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Both jobs observe pushes to main. release_always = false lets release-plz
+# identify a merged release PR through GitHub's associated-PR API.
+jobs:
+  create-tags:
+    name: Tag the merged release PR
+    if: github.repository == 'zendev-lab/cue'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.1"
+      - name: Create tags (git_only mode; no registry publishing)
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
+        with:
+          command: release
+          version: "0.3.162"
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+
+  release-pr:
+    name: Prepare the next release PR
+    if: github.repository == 'zendev-lab/cue'
+    # The release command pushes the vX.Y.Z tags for a merged release PR.
+    # Wait for those tags before calculating the next release, otherwise a
+    # concurrent release-pr run can treat the just-merged release commit as
+    # unreleased work and open a redundant PR.
+    needs: create-tags
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.1"
+      - name: Create or update the release PR
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
+        with:
+          command: release-pr
+          version: "0.3.162"
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}

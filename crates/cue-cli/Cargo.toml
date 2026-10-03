@@ -32,9 +32,9 @@ required-features = ["cue-daemon"]
 
 [dependencies]
 anyhow.workspace = true
-cue-client = { path = "../cue-client" }
-cue-daemon = { path = "../cue-daemon", optional = true }
-cue-tui = { path = "../cue-tui", optional = true }
+cue-client = { workspace = true }
+cue-daemon = { workspace = true, optional = true }
+cue-tui = { workspace = true, optional = true }
 serde.workspace = true
 toml.workspace = true
 

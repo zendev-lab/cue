@@ -9,7 +9,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-cue-core = { path = "../cue-core" }
+cue-core = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]
