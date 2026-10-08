@@ -64,6 +64,11 @@ hooks = [
 ]
 
 [[repos]]
+repo = "https://github.com/asamarts/alint-pre-commit"
+rev = "v0.17.0"
+hooks = [{ id = "alint", stages = ["pre-commit"] }]
+
+[[repos]]
 repo = "https://github.com/zendev-lab/zendev"
 rev = "v0.4.0"
 hooks = [

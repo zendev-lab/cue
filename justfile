@@ -14,7 +14,7 @@ check: architecture
 
 # Enforce crate boundaries that keep execution semantics closed.
 architecture:
-    ./scripts/check_architecture.sh
+    uvx prek run alint --all-files
 
 # Run tests
 test *ARGS:
