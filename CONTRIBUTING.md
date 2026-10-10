@@ -19,7 +19,7 @@
 安装仓库现有 hooks：
 
 ```shell
-uvx prek install --hook-type pre-commit --hook-type commit-msg
+uvx prek install
 ```
 
 变更提案或元数据后，直接使用最新版工具生成并检查索引：
