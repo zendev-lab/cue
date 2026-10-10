@@ -19,5 +19,5 @@ contract; these documents describe its implementation.
   and multiplexed response/event routing.
 - [Frontends](frontends.md): CLI, PTY passthrough, TUI, and extension boundary.
 
-Research notes under `docs/research/` are historical inputs, not current API or
+Research notes under `.agents/notes/` are historical inputs, not current API or
 compatibility promises.
