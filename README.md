@@ -206,4 +206,4 @@ sessions and execution history are not imported.
 
 ## 项目演进
 
-[EVOLUTION.md](EVOLUTION.md) 保存项目起源、历史方向和迁移来源。后续方向变化按真实日期追加，包含“触发”“变化”“理由”，同日变更合并；维护后运行 `zendev evolution check`。文中历史状态不替代当前实现和验收证据。
+[EVOLUTION.md](EVOLUTION.md) 保存项目起源和真实的方向变化。后续方向变化按真实日期追加，包含“触发”“变化”“理由”，同日变更合并；维护后运行 `zendev evolution check`。文中历史状态不替代当前实现和验收证据。
