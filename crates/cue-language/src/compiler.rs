@@ -18,7 +18,7 @@ use crate::surface::{ModeParams, ParamValue, PipeOp, command_prefers_foreground}
 use crate::{Mode, ParseError, parse_command, parse_file_script_command};
 
 /// A language-owned intent. Client adapters translate these variants into the
-/// v4 Query/Command envelopes and provide request and operation identities.
+/// v5 Query/Command envelopes and provide request and operation identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceCommand {
     Submit(ExecutionSpec),
@@ -256,6 +256,9 @@ fn compile_script_item(command: ResolvedCommand) -> Result<ExecutionPlan, Compil
 
 fn validate_run_params(params: &ModeParams) -> Result<Option<IoMode>, CompileError> {
     for name in params.params.keys() {
+        if name == "need" || name.starts_with("need.") {
+            return Err(CompileError::Invalid("resource needs apply to the entire Execution; use `cue run FILE --need KEY=QUANTITY` or `cue client exec --need KEY=QUANTITY -- SOURCE`; submit separate executions for independent quotas".into()));
+        }
         if name != "pty" {
             return Err(CompileError::ExternalOwner {
                 feature: match name.as_str() {
@@ -724,6 +727,19 @@ mod tests {
                 compile_command(input, Mode::Job, SCOPE),
                 Err(CompileError::ExternalOwner { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn step_resource_parameters_point_to_execution_submission_flags() {
+        for source in [
+            ":run(need.gpu=1) echo ok",
+            ":run(need.gpu_mem=24GiB) echo ok",
+        ] {
+            let error = compile_command(source, Mode::Job, SCOPE)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("--need KEY=QUANTITY"), "{error}");
         }
     }
 

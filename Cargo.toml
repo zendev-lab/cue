@@ -7,6 +7,7 @@ members = [
   "crates/cue-daemon",
   "crates/cue-language",
   "crates/cue-protocol",
+  "crates/cue-resources",
   "crates/cue-runtime",
   "crates/cue-store-sqlite",
   "crates/cue-tui",
@@ -26,6 +27,7 @@ cue-core = { path = "crates/cue-core", version = "0.2.1" }
 cue-daemon = { path = "crates/cue-daemon", version = "0.2.1" }
 cue-language = { path = "crates/cue-language", version = "0.2.1" }
 cue-protocol = { path = "crates/cue-protocol", version = "0.2.1" }
+cue-resources = { path = "crates/cue-resources", version = "0.2.1" }
 cue-runtime = { path = "crates/cue-runtime", version = "0.2.1" }
 cue-store-sqlite = { path = "crates/cue-store-sqlite", version = "0.2.1" }
 cue-tui = { path = "crates/cue-tui", version = "0.2.1" }

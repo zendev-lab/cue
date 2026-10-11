@@ -7,28 +7,28 @@ rules:
   - id: core-dependencies
     kind: toml_path_absent
     paths: crates/cue-core/Cargo.toml
-    path: "$..['cue-client','cue-daemon','cue-language','cue-protocol','cue-runtime','rusqlite','tokio']"
+    path: "$..['cue-client','cue-daemon','cue-language','cue-protocol','cue-resources','cue-runtime','rusqlite','tokio']"
     level: error
     message: "cue-core must remain independent of runtime, transport, storage, and frontend crates."
 
   - id: runtime-dependencies
     kind: toml_path_absent
     paths: crates/cue-runtime/Cargo.toml
-    path: "$..['cue-client','cue-daemon','cue-language','cue-protocol','cue-store-sqlite','rusqlite']"
+    path: "$..['cue-client','cue-daemon','cue-language','cue-protocol','cue-resources','cue-store-sqlite','rusqlite']"
     level: error
     message: "cue-runtime must remain independent of daemon, transport, persistence, and frontends."
 
   - id: protocol-dependencies
     kind: toml_path_absent
     paths: crates/cue-protocol/Cargo.toml
-    path: "$..['cue-client','cue-daemon','cue-language','cue-runtime','cue-store-sqlite','rusqlite','tokio']"
+    path: "$..['cue-client','cue-daemon','cue-language','cue-resources','cue-runtime','cue-store-sqlite','rusqlite','tokio']"
     level: error
     message: "cue-protocol must depend only on Core data and transport serialization."
 
   - id: store-dependencies
     kind: toml_path_absent
     paths: crates/cue-store-sqlite/Cargo.toml
-    path: "$..['cue-client','cue-daemon','cue-language','cue-runtime','tokio']"
+    path: "$..['cue-client','cue-daemon','cue-language','cue-resources','cue-runtime','tokio']"
     level: error
     message: "cue-store-sqlite must remain an independent Core/protocol store provider."
 
@@ -69,7 +69,7 @@ rules:
       - crates/cue-tui/src/**
     pattern: 'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)'
     level: error
-    message: "The client and executable frontends must use only Core and the strict IPC v4 protocol."
+    message: "The client and executable frontends must use only Core and the strict IPC v5 protocol."
 
   - id: removed-core-modules
     kind: file_content_forbidden

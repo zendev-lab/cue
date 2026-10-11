@@ -5,7 +5,7 @@ Clients submit a fully typed `ExecutionSpec`; `cued` owns process groups, PTYs,
 output, execution facts, idempotency, and restart recovery.
 
 Cue deliberately does not own session cursors, schedules, automatic retry,
-resource policy, approvals, remote fleets, or a general DAG. Those systems may
+approvals, remote fleets, or a general DAG. Those systems may
 submit ordinary executions, but cannot extend the closed execution algebra.
 
 ## Quick start
@@ -30,7 +30,7 @@ cue daemon status
 ```
 
 `cued start` runs in the background and returns only after that new instance
-answers IPC v4 Hello. Logs are appended to `<socket>.log`; the startup command
+answers IPC v5 Hello. Logs are appended to `<socket>.log`; the startup command
 prints the path and reports child startup errors. Use `cued start --fg` (or `-f`)
 for foreground logs or a service manager. `cued stop` waits for shutdown and
 `cued restart` waits for the requested replacement to become ready.
@@ -82,9 +82,36 @@ Operators map as follows:
 | `A \|\|\| B` | Parallel, all must succeed |
 | `A \|?\| B` | Parallel, any success wins |
 
-## IPC v4 and persistence
+## 执行级资源
 
-IPC v4 uses strict length-prefixed JSON on a private Unix socket. Every
+Configure static, JSON stdio, or NVIDIA providers in
+`$XDG_CONFIG_HOME/cue/daemon.toml` (fallback `~/.config/cue/daemon.toml`),
+or start with `cued start --config PATH`. No providers are enabled by default.
+
+```toml
+[[resources.providers]]
+id = "workers"
+kind = "static"
+[resources.providers.capacity]
+worker = "2"
+```
+
+```sh
+cue run task.cue --need worker=1
+cue client exec --need worker=1 -- "sleep 1 -> printf done"
+cue resources --json
+cue providers --json
+```
+
+Needs apply to the whole Execution, including parallel branches and PTYs.
+Waiting executions have IDs and can be cancelled; disconnecting does not cancel
+them. Allocation and cleanup are independent of the program exit status.
+[资源配置与 provider 协议](docs/design/resources.md) covers quantities,
+GPU budgets, external providers, and recovery.
+
+## IPC v5 与持久化
+
+IPC v5 uses strict length-prefixed JSON on a private Unix socket. Every
 connection begins with `Hello`; read-only Queries use `RequestId`, while every
 side-effecting Command also carries an idempotent `OperationId`. The protocol
 contains explicit Scope, Execution, output, PTY attachment, and daemon
@@ -152,8 +179,9 @@ one composed execution, not to the invoking shell or the next TUI submission.
 ## Repository structure
 
 - `cue-core`: root execution ADT, Scope, reducer, facts, and identities;
-- `cue-protocol`: strict IPC v4 messages and framing;
+- `cue-protocol`: strict IPC v5 messages and framing;
 - `cue-store-sqlite`: Scope/Execution/fact/operation persistence provider;
+- `cue-resources`: execution admission, allocation, provider state, and cleanup;
 - `cue-runtime`: bootstrap Composition, typed providers, runner, and recovery;
 - `cue-language`: surface tokenizer, parser, compiler, completion, highlighting;
 - `cue-daemon`: composition root, IPC service, lifecycle, and local host;
@@ -185,7 +213,7 @@ See [architecture](ARCHITECTURE.md), [design](docs/design/README.md),
 
 Replacing the `cued` executable does not replace an already running daemon.
 If `status`, `stop`, or `restart` reports that the socket is listening but the
-IPC v4 handshake failed, stop the old process independently of its protocol:
+IPC v5 handshake failed, stop the old process independently of its protocol:
 
 ```sh
 cued stop --force
@@ -197,9 +225,11 @@ Use the same `--socket PATH` for both commands when using a custom socket.
 kernel peer credentials and waits up to fifteen seconds for exit. It does not send
 SIGKILL, delete sockets, or use PID files. A timeout is a failed stop, not a
 success; if a service manager restarts the process, stop that service first.
-Normal v4 shutdown still drains owned Runs when receiving SIGTERM.
+Normal shutdown still drains owned Runs when receiving SIGTERM.
 `cued start` returns after background readiness. A service manager should run
 `cued start --fg` and own its restart policy.
 When restarting a custom database, also pass the original `--db PATH` to `start`.
-The first default v4 start archives `cued.db` and creates `cued-v4.db`; old
-sessions and execution history are not imported.
+The `cued-v4.db` path is retained. Schema 2 execution history is preserved;
+resource tables and schema version 3 are installed transactionally after
+ownership checks. Old daemons reject the new schema. Preserve `--config PATH`
+when manually starting a replacement; `restart` forwards it automatically.

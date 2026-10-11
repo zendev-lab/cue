@@ -114,7 +114,7 @@ execution hot path must not use a service locator.
 
 ## Compatibility rule
 
-IPC v4 and the root `cue_core` API are the only execution contract. The daemon
+IPC v5 and the root `cue_core` API are the only execution contract. The daemon
 does not translate IPC v3 requests or import v3 session, schedule, resource, or
 execution semantics. A legacy `cued.db` is archived read-only on first default
 startup and is never dual-read.

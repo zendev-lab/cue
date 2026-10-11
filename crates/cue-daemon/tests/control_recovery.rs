@@ -17,8 +17,9 @@ impl Fixture {
         let root = PathBuf::from("/tmp").join(format!("cue-recovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let socket = root.join("peer.sock");
-        let child = if mode == "v4" {
+        let child = if mode == "v5" {
             Command::new(BINARY)
+                .env("XDG_CONFIG_HOME", root.join("config"))
                 .arg("start")
                 .arg("--fg")
                 .arg("--socket")
@@ -117,7 +118,7 @@ fn socket_fixture() {
         if mode == "hang" {
             std::thread::sleep(Duration::from_secs(30));
         } else {
-            // Consume a complete v4 frame before closing, like the v3 decoder
+            // Consume a complete v5 frame before closing, like the v3 decoder
             // rejecting the envelope. This avoids connection-reset ambiguity.
             let mut header = [0; 4];
             if stream.read_exact(&mut header).is_ok() {
@@ -166,7 +167,7 @@ fn incompatible_listener_has_actionable_status_and_control_errors() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(text.contains("IPC v4"), "{text}");
+        assert!(text.contains("IPC v5"), "{text}");
         assert!(text.contains("cued stop --force --socket"), "{text}");
         assert!(text.contains(fixture.socket.to_str().unwrap()), "{text}");
         assert!(!text.contains("not running"), "{text}");
@@ -206,13 +207,13 @@ fn force_stop_does_not_claim_success_or_escalate_when_signal_is_ignored() {
 }
 
 #[test]
-fn v4_signal_shutdown_cleans_up_socket_and_missing_stop_is_idempotent() {
-    let mut fixture = Fixture::start("v4");
+fn v5_signal_shutdown_cleans_up_socket_and_missing_stop_is_idempotent() {
+    let mut fixture = Fixture::start("v5");
     assert!(fixture.command("status").output().unwrap().status.success());
     assert!(fixture.force_stop().status.success());
     assert!(
         !fixture.socket.exists(),
-        "v4 must drain and remove its socket on SIGTERM"
+        "v5 must drain and remove its socket on SIGTERM"
     );
     assert!(fixture.root.join("test.db").exists());
     assert!(fixture.command("stop").output().unwrap().status.success());

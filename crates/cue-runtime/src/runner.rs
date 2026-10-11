@@ -288,6 +288,7 @@ fn configured_command(
     for (key, value) in process.effective_env(scope.env()) {
         command.env(key.as_str(), value.as_str());
     }
+    command.envs(&context.environment);
     let umask = scope.umask().get() as libc::mode_t;
     let terminal_fd = terminal.map(|file| file.as_raw_fd());
     if terminal_leader && terminal_fd.is_none() {

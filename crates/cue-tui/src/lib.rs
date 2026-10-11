@@ -1,4 +1,4 @@
-//! IPC v4 execution workbench: browse, inspect, follow output, and control jobs.
+//! IPC v5 execution workbench: browse, inspect, follow output, and control jobs.
 
 pub mod cli;
 mod editor;
