@@ -203,3 +203,7 @@ Normal v4 shutdown still drains owned Runs when receiving SIGTERM.
 When restarting a custom database, also pass the original `--db PATH` to `start`.
 The first default v4 start archives `cued.db` and creates `cued-v4.db`; old
 sessions and execution history are not imported.
+
+## 项目演进
+
+[EVOLUTION.md](EVOLUTION.md) 保存项目起源、历史方向和迁移来源。后续方向变化按真实日期追加，包含“触发”“变化”“理由”，同日变更合并；维护后运行 `zendev evolution check`。文中历史状态不替代当前实现和验收证据。
