@@ -1,3 +1,5 @@
+default_install_hook_types = ["pre-commit", "commit-msg"]
+
 [[repos]]
 repo = "builtin"
 hooks = [
@@ -62,6 +64,11 @@ rev = "v1.48.0"
 hooks = [
   { id = "typos", args = ["--force-exclude"], stages = ["pre-commit"] },
 ]
+
+[[repos]]
+repo = "https://github.com/asamarts/alint-pre-commit"
+rev = "v0.17.0"
+hooks = [{ id = "alint", stages = ["pre-commit"] }]
 
 [[repos]]
 repo = "https://github.com/zendev-lab/zendev"

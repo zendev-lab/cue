@@ -14,7 +14,7 @@ check: architecture
 
 # Enforce crate boundaries that keep execution semantics closed.
 architecture:
-    ./scripts/check_architecture.sh
+    uvx prek run alint --all-files
 
 # Run tests
 test *ARGS:
@@ -72,7 +72,7 @@ pre-commit:
 
 # Install local git hooks via prek
 pre-commit-install:
-    uvx prek install --install-hooks --hook-type pre-commit --hook-type commit-msg
+    uvx prek install --prepare-hooks
 
 # Remove local git hooks installed by prek
 pre-commit-uninstall:

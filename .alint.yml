@@ -1,0 +1,93 @@
+# Crate and module boundaries that keep execution semantics closed.
+# yaml-language-server: $schema=https://raw.githubusercontent.com/asamarts/alint/main/schemas/v1/config.json
+
+version: 1
+
+rules:
+  - id: core-dependencies
+    kind: toml_path_absent
+    paths: crates/cue-core/Cargo.toml
+    path: "$..['cue-client','cue-daemon','cue-language','cue-protocol','cue-resources','cue-runtime','rusqlite','tokio']"
+    level: error
+    message: "cue-core must remain independent of runtime, transport, storage, and frontend crates."
+
+  - id: runtime-dependencies
+    kind: toml_path_absent
+    paths: crates/cue-runtime/Cargo.toml
+    path: "$..['cue-client','cue-daemon','cue-language','cue-protocol','cue-resources','cue-store-sqlite','rusqlite']"
+    level: error
+    message: "cue-runtime must remain independent of daemon, transport, persistence, and frontends."
+
+  - id: protocol-dependencies
+    kind: toml_path_absent
+    paths: crates/cue-protocol/Cargo.toml
+    path: "$..['cue-client','cue-daemon','cue-language','cue-resources','cue-runtime','cue-store-sqlite','rusqlite','tokio']"
+    level: error
+    message: "cue-protocol must depend only on Core data and transport serialization."
+
+  - id: store-dependencies
+    kind: toml_path_absent
+    paths: crates/cue-store-sqlite/Cargo.toml
+    path: "$..['cue-client','cue-daemon','cue-language','cue-resources','cue-runtime','tokio']"
+    level: error
+    message: "cue-store-sqlite must remain an independent Core/protocol store provider."
+
+  - id: daemon-dependencies
+    kind: toml_path_absent
+    paths: crates/cue-daemon/Cargo.toml
+    path: "$..['cue-language']"
+    level: error
+    message: "cue-daemon must not parse the surface language."
+
+  - id: core-kernel-modules
+    kind: file_content_forbidden
+    paths: crates/cue-core/src/kernel/**
+    pattern: 'crate::(command|cron|ipc|launch|resource|scope|spawn_adapter|tui_debug)'
+    level: error
+    message: "cue-core must not depend on removed transport or policy modules."
+
+  - id: language-compiler-modules
+    kind: file_content_forbidden
+    paths: crates/cue-language/src/compiler.rs
+    pattern: 'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)'
+    level: error
+    message: "The language compiler must not depend on removed execution policy."
+
+  - id: daemon-service-modules
+    kind: file_content_forbidden
+    paths: crates/cue-daemon/src/service.rs
+    pattern: 'crate::(actor|storage)|cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)'
+    level: error
+    message: "The daemon service must not depend on the removed actor tree or execution policy."
+
+  - id: frontend-modules
+    kind: file_content_forbidden
+    paths:
+      - crates/cue-client/src/execution.rs
+      - crates/cue-client/src/cli.rs
+      - crates/cue-client/src/script_runner.rs
+      - crates/cue-tui/src/**
+    pattern: 'cue_core::(execution|ipc|launch|resource|scope|spawn_adapter)'
+    level: error
+    message: "The client and executable frontends must use only Core and the strict IPC v5 protocol."
+
+  - id: removed-core-modules
+    kind: file_content_forbidden
+    paths: crates/**
+    pattern: 'cue_core::(command|cron|execution|ipc|launch|pipeline|process_status|resource|scope|spawn_adapter|tui_debug)'
+    level: error
+    message: "Workspace source must not import removed cue-core modules."
+
+  - id: removed-compatibility-paths
+    kind: file_absent
+    paths:
+      - crates/cue-core/src/ipc.rs
+      - crates/cue-core/src/execution.rs
+      - crates/cue-core/src/resource.rs
+      - crates/cue-language/src/vnext_compiler.rs
+      - crates/cue-daemon/src/actor/mod.rs
+      - crates/cue-daemon/src/vnext.rs
+      - crates/cue-client/src/vnext.rs
+      - crates/cue-client/src/transport_config.rs
+    level: error
+    message: "Removed compatibility paths must not return."
