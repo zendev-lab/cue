@@ -1,32 +1,79 @@
----
-description: Cue 是持久、可观察的本地结构化进程执行内核；closed execution semantics 通过启动时 Composition 连接到可替换的运行机制。
-owner: zrr1999
-created: 2026-04-26
-updated: 2026-08-31
-inspired_by:
-  - bash
-  - zsh
-  - tmux
-  - zellij
-  - nushell
-  - Volvox Core
-  - Cordis
----
+# 项目演进
 
-## 起源
+## 初始意图
 
-Cue 最初从 shell-like agent workflow 出发，随后逐步获得 daemon、命名
-session、schedule、resource admission、PTY、workspace、wrapper 和
-SpawnAdapter。它已经能够可靠托管进程，但 daemon 同时承担 execution
-semantics、交互 session、触发策略和 host policy，导致一个本应稳定的小内核
-需要理解越来越多的上层概念。
+Cue 从 shell-like agent workflow 出发，希望让 Agent 的工作流能够可靠地运行本地进程。
+最早的完整设计没有留存在现有起源记录中；后来的 daemon、命名 session、schedule
+与执行内核是逐步形成的方向。
 
-当前 Cue 不再以“继续给 daemon 加能力”为演进方向，而是把已经验证过的
-Execution/Step/PTY/output/idempotency 提炼为持久本地执行内核。语言、session、
-schedule、resource policy 和 agent workflow 都成为内核的调用方或实现机制，
-不再成为 ExecutionPlan 的隐式输入。
+bash、zsh 与 Nushell 提供命令表达的参考，tmux、Zellij 提供持久交互的参考。
+Cue 逐步把关注点收敛到可观察、可取消和可恢复的本地进程执行。
 
-## 产品/设计目标
+## 2026-04-26
+
+### 触发
+
+Agent 工作流与底层进程机制需要各自明确职责。
+
+### 变化
+
+从 agent/workflow shell 收缩到底层进程机制，供上层 Agent 或工作流系统调用。
+
+### 理由
+
+让进程机制可独立复用，避免把某一种 Agent 工作流固化到执行层。
+
+<!-- 触发与理由根据现存起源及职责边界归纳；当日原始讨论未恢复。 -->
+
+## 2026-07-22
+
+### 触发
+
+持久会话需要支持多个观察者，并明确交互输入的归属。
+
+### 变化
+
+确认命名 session 与共享 PTY 的方向：多个 observer 可以观察同一终端，一个 controller 持有输入控制权。
+
+### 理由
+
+将观察与控制分开，使重新连接和多人观察不产生竞争输入。
+
+<!-- 触发与理由根据修订记录中的多 observer / 单 controller 决策归纳。 -->
+
+## 2026-08-21
+
+### 触发
+
+执行身份、语言表达、触发和实际进程启动需要分离。
+
+### 变化
+
+硬切 IPC v3，统一 Execution/Step，拆出 `cue-language` 和 TriggerService，引入 SpawnAdapter、v21 persistence 与 XDG `cue` 路径。
+
+### 理由
+
+通过稳定的执行身份和独立的语言、触发、启动边界，为不同调用方复用同一进程机制。
+
+<!-- 触发与理由根据这一轮拆分及后续内核设计归纳。 -->
+
+## 2026-08-30
+
+### 触发
+
+daemon 已同时承担 execution semantics、交互 session、触发策略和 host policy。继续扩展它会让稳定的小内核不断依赖上层概念。
+
+### 变化
+
+确定持久本地执行内核方向：closed Execution ADT、显式 Scope、每个 Run 的 PTY
+和启动时 Composition。session、schedule、resource、retry policy 移出内核。
+
+这一轮建立纯 reducer、独立的 `cue-protocol` v4 与 `cue-store-sqlite` provider，
+并完成 typed Assembly、local runner 和 surface compiler。Builtin/Run 持久记录
+输入、输出 ScopeHash；Sequence 顺序传递，Parallel fork 且不 merge。
+Captured/PTY 都实现 typed Pipeline，compiler 不再把上层策略 lower 到内核。
+
+#### 产品与设计目标
 
 Cue 接收完全解析的 typed `ExecutionSpec`，执行一棵有限、静态、结构化的
 execution tree。一次提交拥有一个 `ExecutionId`；每个真正可观察的 Builtin 或
@@ -48,7 +95,7 @@ Captured 产生独立 stdout/stderr；PTY 产生一个 terminal stream。一个 
 是一个 Step、一个生命周期和一个 process group，内部 PipeLink 仍然保留每个
 process 的可观察性。
 
-## 目标用户
+#### 目标用户
 
 - 需要可靠运行、取消、观察和恢复本地进程的人类开发者。
 - 需要 typed、幂等、无 shell 注入边界的 agent/host runtime，例如 Spark/DSH。
@@ -56,7 +103,7 @@ process 的可观察性。
   进程内核的上层系统。
 - 需要通过替换 store/spawner/workspace 等机制适配不同本地执行环境的集成方。
 
-## 核心原则
+#### 核心原则
 
 - Execution semantics 封闭；implementation graph 开放。
 - Scope、Execution、Step、Event 都是显式可序列化事实，不依赖 session ambient state。
@@ -66,7 +113,7 @@ process 的可观察性。
 - Composition 只在 daemon bootstrap resolve；运行热路径不查 service locator。
 - 失败尽早、结构化、可恢复；敏感 env value 不落盘、不进入日志或事件。
 
-## 能力地图（方向性）
+#### 能力地图（方向性）
 
 - Execution：Builtin、Run、Sequence、Parallel 的 closed ADT 与纯 reducer。
 - Scope：显式完整快照、内容寻址、Builtin transition 和 client-owned cursor。
@@ -77,7 +124,7 @@ process 的可观察性。
 - Frontend：Cue surface 编译、literal argv 构造、completion/highlight、CLI/TUI projection。
 - Producer：cron、workflow、agent 或 queue 通过 `ExecutionSubmitter` 创建独立 Execution。
 
-## 成功信号
+#### 成功信号
 
 - 只阅读 Core ADT 就能确定任意 plan 的 Step、结果和 Scope 传播，不需要查看 daemon。
 - 同一 execution/step 在 CLI、TUI、Spark 和 DSH 中身份与状态一致。
@@ -88,7 +135,7 @@ process 的可观察性。
 - schedule/resource/retry policy 可以独立演进而不修改 cue-core 或 IPC execution algebra。
 - daemon 重启不会重复已确认的 side effect；volatile secret execution 明确不可 replay。
 
-## 生态关系
+#### 生态关系
 
 - `cue-language` 和 client 把 surface syntax 编译成 fully resolved ExecutionSpec；daemon
   永不接收原始 Cue source。
@@ -100,7 +147,7 @@ process 的可观察性。
 - bash/zsh/fish 继续负责通用 shell；tmux/zellij 继续负责 pane/layout。Cue 不重新
   实现完整 shell 或 terminal multiplexer。
 
-## 什么不是本项目要做的（Non-goals）
+#### 什么不是本项目要做的（Non-goals）
 
 - 通用 DAG、动态 Step、补偿事务或长时 workflow state machine。
 - daemon 内置 schedule/cron、自动 retry 或 resource scheduling policy。
@@ -110,7 +157,7 @@ process 的可观察性。
 - v3/v4 双栈 daemon 或长期保留两套 Execution semantics。
 - 自动脱敏子进程主动写入 stdout/stderr 的内容。
 
-## 已考虑的替代方案 & 理由
+#### 已考虑的替代方案 & 理由
 
 - 继续扩展现有 IPC v3/daemon owner：迁移成本最低，但 session、schedule、resource
   和 execution 会继续互相牵制，因此放弃。
@@ -124,41 +171,40 @@ process 的可观察性。
   literal argv；compiler 也尚未实现这类展开。若未来增加，应由 frontend 从显式
   Scope 解析，不由 daemon 读取 ambient environment。
 
-## 后续问题（不阻塞内核）
+#### 后续问题（不阻塞内核）
 
 - 静态 Rust provider 之外，哪些 sidecar provider protocol 值得成为稳定公共接口。
 - 是否把 client-owned named session 做成独立可共享组件。
 - Scope archive 与长期 output retention 是否需要独立的管理工具和 GC policy。
 
-## 修订记录
+### 理由
 
-- 2026-08-31：完成 IPC v4 hard cut；旧 Core/daemon/client/TUI 实现与兼容入口已物理
-  删除，`cue_core` 根 API 成为唯一 execution contract，默认 `cued-v4.db` 独立建库，
-  旧 `cued.db` 只读归档且不导入；公开文档、Skill、package smoke 和架构守卫同步收口。
-- 2026-08-31：CLI/TUI 完成 v4 hard cut；公开入口只使用 ExecutionId/StepId，CLI
-  提供 typed run/query/output/cancel/PTY passthrough，TUI 直接投影 ExecutionView/fact；
-  session/cron/resource/target 页面、J/CH/R 与旧 foreground epoch state machine 已删除。
-- 2026-08-31：完成 vNext client transport；frontend 显式 snapshot cwd/env/umask，按
-  PutScope -> compile -> Submit 顺序提交，Hello/ClientId、RequestId/OperationId、strict
-  v4 framing 与并发 response/event multiplexer 不再复用 v3 session cursor。
-- 2026-08-31：完成 vNext daemon service；启动时绑定 typed RuntimeAssembly，IPC v4
-  强制 Hello/client identity，PutScope/Submit 与 operation claim 原子提交，fact cursor
-  replay、live event、volatile secret store 和 PTY observer/controller attachment 进入主路径。
-- 2026-08-30：完成 vNext surface compiler；初始 Scope 通过 `PutScope -> ScopeHash`
-  显式传入，Core builtin 固定为 Cd/Env/Umask，assignment 只作用于单个 Process，PTY
-  在每个 Run 上 resolve；schedule/resource/retry/session 命令不再 lower 到内核。
-- 2026-08-30：完成 vNext typed Assembly 与 local runner；captured/PTY 都直接实现 typed
-  Pipeline，PTY 每个 Run 仅一个 terminal endpoint，显式 control、绝对 output offset 与
-  restart interruption recovery 不再由 v3 ProcessManager 私有状态决定。
-- 2026-08-30：新增独立 `cue-protocol` v4 和 `cue-store-sqlite` provider；wire 从类型上
-  区分幂等 Command 与只读 Query，持久化只保存 vNext Scope/Execution/fact/operation，
-  不继承 v3 session/schedule/resource schema。
-- 2026-08-30：固化 vNext 纯 reducer；每个 Builtin/Run Step 持久记录输入/输出
-  ScopeHash，Sequence 传递、Parallel fork/no-merge、Skipped/Cancelled 和重启中断语义
-  均由 Core 决定。
-- 2026-08-30：启动 vNext 大重构；确定 closed Execution ADT、显式 Scope、per-Run
-  PTY、bootstrap Composition，并把 session/schedule/resource/retry policy 移出内核。
-- 2026-08-21：硬切 IPC v3，统一 Execution/Step，拆出 cue-language 和
-  TriggerService，引入 SpawnAdapter、v21 persistence 与 XDG `cue` 迁移。
-- 2026-07-22：确认命名 session 与共享 PTY 的多 observer/单 controller 方向。
-- 2026-04-26：从 agent/workflow shell 收缩到底层进程机制。
+Core 只定义程序的含义；Runtime Composition 决定由哪些机制实现。
+把已经验证过的 Execution/Step/PTY/output/idempotency 提炼成稳定契约，
+可以让语言、会话与调度独立演进，同时保持持久化和 reducer 的静态语义可判断。
+
+扩展只能替换实现，不能添加动态 Step 或改变 Sequence/Parallel 的结果。
+这也避免先重写 ExecutionPlan、随后又为 Composition 搬迁责任边界。
+
+## 2026-08-31
+
+### 触发
+
+vNext 内核、协议、存储与 runner 已建立，需要让 daemon、client 和用户入口使用同一执行契约。
+
+### 变化
+
+完成 IPC v4 hard cut，`cue_core` 根 API 成为唯一 execution contract。
+
+- daemon 启动时绑定 typed RuntimeAssembly；Hello/client identity、原子 operation claim、
+  fact replay、live event、volatile secret store 和 PTY attachment 进入主路径。
+- client 显式 snapshot cwd/env/umask，按 PutScope → compile → Submit 提交，使用
+  RequestId/OperationId、strict v4 framing 和并发 response/event multiplexer。
+- CLI/TUI 只使用 ExecutionId/StepId 与 ExecutionView/fact；删除旧 session、cron、
+  resource、target 页面及 foreground epoch 状态机。
+- 默认数据库改为独立的 `cued-v4.db`；旧 `cued.db` 只读归档，不导入。
+  旧 Core/daemon/client/TUI 实现与兼容入口删除，公开文档、Skill、smoke 与架构守卫同步收口。
+
+### 理由
+
+旧 Scope identity、session cursor 和 schedule contract 与 v4 不等价。整体切换并归档旧数据，避免两套执行语义和无法证明正确的逐项迁移。
