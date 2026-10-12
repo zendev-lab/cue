@@ -18,6 +18,3 @@ contract; these documents describe its implementation.
 - [Client](client.md): frontend Scope snapshots, typed dispatch, correlation,
   and multiplexed response/event routing.
 - [Frontends](frontends.md): CLI, PTY passthrough, TUI, and extension boundary.
-
-Research notes under `docs/research/` are historical inputs, not current API or
-compatibility promises.
