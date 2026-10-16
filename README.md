@@ -233,3 +233,7 @@ The `cued-v4.db` path is retained. Schema 2 execution history is preserved;
 resource tables and schema version 3 are installed transactionally after
 ownership checks. Old daemons reject the new schema. Preserve `--config PATH`
 when manually starting a replacement; `restart` forwards it automatically.
+
+## 项目演进
+
+[EVOLUTION.md](EVOLUTION.md) 保存项目起源和真实的方向变化。后续方向变化按真实日期追加，包含“触发”“变化”“理由”，同日变更合并；维护后运行 `zendev evolution check`。文中历史状态不替代当前实现和验收证据。
