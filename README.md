@@ -178,6 +178,11 @@ just npm-package-smoke
 Repository guidance: [协作约定](AGENTS.md)、[愿景](VISION.md)、
 [设计原则](PRINCIPLES.md)、[贡献指南](CONTRIBUTING.md)。
 
+Explore the [interactive code map](docs/codemap/codemap.html) and its
+[reader and maintenance guide](docs/codemap/README.md) for source-backed module
+relationships and four end-to-end workflows. Clone/download the repository to
+open the HTML locally; GitHub shows its source.
+
 See [architecture](ARCHITECTURE.md), [design](docs/design/README.md),
 [testing](docs/testing.md), and the canonical [agent Skill](skills/cue/SKILL.md).
 

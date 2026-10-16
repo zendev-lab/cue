@@ -57,3 +57,12 @@ remain attributable to the lane that owns them.
 When reviewing a test, ask what observable regression becomes invisible if it is removed, whether a
 wording-only refactor would break it, whether fail-closed and recovery behavior have negative paths,
 and whether the test runs at the boundary that owns the contract.
+
+## 代码地图证据校验
+
+`python3 scripts/codemap.py check` validates the documentation atlas separately
+from behavior tests. It checks source paths, named test declarations, graph
+references, baseline commit and evidence hashes without compiling the product.
+After intentional source or map changes, review the semantics before refreshing
+hashes with `python3 scripts/codemap.py build`. See the
+[maintenance checklist](codemap/README.md#生成与维护).

@@ -28,3 +28,30 @@ Start with the [design index](docs/design/README.md) and
 [project direction](VISION.md) and [design principles](PRINCIPLES.md).
 
 [FP-0001](fps/FP-0001-structured-execution-kernel.md) owns the normative contract.
+
+## 沿实现边界追踪变更
+
+The [interactive code map](docs/codemap/codemap.html) provides clickable ownership,
+call/data-flow relationships, production crate dependencies and test declarations.
+The [map guide](docs/codemap/README.md) explains local use and evidence validation.
+
+| Boundary | Owner | Input → output |
+| --- | --- | --- |
+| User intent | CLI / TUI / client | arguments or surface text → explicit Scope and client requests |
+| Surface compilation | language | source + Scope hash → closed typed ExecutionSpec |
+| Transport contract | protocol | validated IPC v4 messages ↔ length-prefixed JSON |
+| Semantic decisions | core | plan + state + completion/cancel → transitions and facts |
+| Durable orchestration | daemon + store | command → atomic operation outcome, projection, facts and runtime work |
+| Physical effects | runtime | ready leaf + full Scope → owned process/PTY and known completion |
+| Observation | daemon + client | stored/live facts and retained bytes → frontend projection |
+
+The daemon commits transitions before publishing or realizing follow-up work.
+The reducer does not call a process runner; the daemon interprets its ready
+Steps through a typed runtime assembly. The SQLite provider stores output-range
+facts, while the runtime's memory output provider stores the actual bytes. This
+split matters when diagnosing an empty output response after restart.
+
+For source review, start at `ExecutionClient::submit_file`,
+`DaemonService::submit`/`realize`, `Store::commit_execution_command`, and
+`LocalProcessSpawner::spawn`. The map links these owning files and their test
+locations without treating a build dependency as proof of a runtime call.
