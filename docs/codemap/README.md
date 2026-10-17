@@ -1,101 +1,81 @@
 # 交互式代码地图
 
-Open [codemap.html](codemap.html) directly in a JavaScript-enabled browser after
-cloning the repository. It embeds its own data, makes no fetch requests and needs
-no daemon, build, network connection or third-party library. When viewing this
-repository on GitHub, download/clone it first: GitHub displays HTML source rather
-than running the map.
+克隆仓库后，使用启用 JavaScript 的浏览器直接打开 [codemap.html](codemap.html)。
+页面内嵌数据，不发送 fetch 请求，无需守护进程、构建、网络连接或第三方库。
+GitHub 只显示 HTML 源码，不会运行地图，因此在 GitHub 浏览仓库时需要先下载或克隆。
 
 ## 阅读地图
 
-1. Start with a workflow: execute a file, observe/cancel, attach to a PTY, or
-   start/recover. The numbered steps are control/data flow, not a dependency DAG.
-2. Select a module. The detail panel shows its responsibility, callers,
-   dependencies, downstream consequences and evidence. Use Tab and Enter/Space
-   for module and workflow buttons. On narrow screens, details follow the list.
-3. Switch **Relationship lens** to distinguish runtime data flow from production
-   Cargo dependencies. The latter excludes dev-dependencies. An upstream caller
-   may also depend on a contract crate; those relationships have different meanings.
-4. Expand source or test evidence. When opened as a file, local links open the working copy; **baseline
-   source** links open the recorded commit on GitHub. Hosted pages show baseline
-   links only, because a documentation host does not contain repository source.
-   Uncommitted changes can differ from these baseline links. Paths and SHA-256 hashes are
-   checked independently, so stale local files cannot silently pass validation.
+1. 从工作流入手：执行文件、观察与取消、连接 PTY，或启动与恢复。
+   编号步骤表示控制流和数据流，不是依赖 DAG。
+2. 选择模块，查看职责、调用方、依赖、下游影响和证据。
+   可使用 Tab 和 Enter/空格键操作模块与工作流按钮；窄屏下详情位于模块列表之后。
+3. 切换**关系视图**，区分运行时数据流和 Cargo 生产依赖；后者不包含 dev-dependencies。
+   上游调用方也可能依赖某个契约 crate，但这两种关系含义不同。
+4. 展开源码或测试证据。以文件方式打开时，本地链接指向工作副本，**基线源码**链接
+   指向 GitHub 上记录的提交。托管页面只显示基线链接，因为文档服务器不包含仓库源码。
+   未提交改动可能与基线不同；路径和 SHA-256 哈希独立校验，过时的本地文件无法静默通过。
 
-The initial map contains fifteen primary nodes: nine crates, the SQLite store,
-POSIX facilities, three dependency groups and distribution. Each crate groups
-its lower-level files. External groups intentionally omit minor libraries; the
-complete dependency/version inventory remains in `Cargo.toml` and `Cargo.lock`.
-There is no remote service or general scheduling engine in this kernel.
+地图包含十五个主要节点：九个 crate、SQLite 存储、POSIX 系统能力、三个依赖组和分发模块。
+各 crate 将底层文件归组；外部依赖组有意省略次要库，完整依赖与版本清单仍以
+`Cargo.toml` 和 `Cargo.lock` 为准。此内核不包含远程服务或通用调度引擎。
 
 ## 定位责任模块
 
-| Problem | Start here | Evidence to check next |
+| 问题 | 从这里开始 | 接下来检查的证据 |
 | --- | --- | --- |
-| A CLI command dispatches to the wrong executable | `cue-cli` | `main.rs`, `companion_binary.rs`, process tests |
-| A surface expression becomes the wrong plan | `cue-language` | compiler and parser tests; Core plan contract |
-| Wrong success, failure, cancellation or Scope propagation | `cue-core` | reducer transition tests |
-| Request correlation, attach or wait fails | `cue-client` / `cue-protocol` | framing and multiplexing tests |
-| Accepted execution stops progressing | `cue-daemon` | service regressions, durable runtime-work generations |
-| Physical process, pipeline, PTY or output cleanup fails | `cue-runtime` | runner tests, process-level lifecycle tests |
-| Facts, operation replay or recovery differ after restart | `cue-store-sqlite` / `cue-daemon` | atomic store tests and recovery admission |
-| Installed commands or exported Skill files are missing | distribution | wheel/sdist and npm smoke scripts |
+| CLI 命令分派到错误的可执行文件 | `cue-cli` | `main.rs`、`companion_binary.rs`、进程测试 |
+| 表层表达式生成错误的计划 | `cue-language` | 编译器和解析器测试、Core 计划契约 |
+| 成功、失败、取消或 Scope 传递错误 | `cue-core` | 归约器状态转换测试 |
+| 请求关联、连接或等待失败 | `cue-client` / `cue-protocol` | 帧格式和多路复用测试 |
+| 已接纳的执行停止推进 | `cue-daemon` | 服务回归测试、持久化运行时工作的代次 |
+| 实际进程、管道、PTY 或输出清理失败 | `cue-runtime` | 执行器测试、进程级生命周期测试 |
+| 重启后的事实、操作重放或恢复不一致 | `cue-store-sqlite` / `cue-daemon` | 原子存储测试、恢复准入检查 |
+| 缺少已安装命令或导出的 Skill 文件 | 分发模块 | wheel/sdist 和 npm 冒烟测试脚本 |
 
-See [design](../design/README.md) for the implementation narrative,
-[testing](../testing.md) for executable gates, and
-[FP-0001](../../fps/FP-0001-structured-execution-kernel.md) for normative contracts.
-The map does not supersede those contracts.
+实现说明见[设计文档](../design/README.md)，可执行检查见[测试文档](../testing.md)，
+规范契约见 [FP-0001](../../fps/FP-0001-structured-execution-kernel.md)。地图不取代这些契约。
 
 ## 生成与维护
 
-From the repository root, with Python 3.11 or newer and Git available:
+在仓库根目录运行，需要 Python 3.11 或更新版本及 Git：
 
 ```sh
 python3 scripts/codemap.py check
 ```
 
-The check resolves every module/file/test/edge/workflow reference, validates test
-symbols and declaration lines, checks complete crate/file/test inventory and production dependency edges against Cargo
-manifests, checks the baseline commit, verifies source/test
-SHA-256 hashes and checks that embedded HTML equals the JSON plus template. This
-is a documentation integrity check, **not** a Rust test run or a semantic proof of
-an arrow. Relationship descriptions still require source review.
+检查会解析模块、文件、测试、关系和工作流引用，验证测试符号与声明行，核对完整的
+crate、文件、测试清单以及 Cargo 清单中的生产依赖关系，检查基线提交，验证源码与测试的
+SHA-256 哈希，并确认内嵌 HTML 与 JSON 加模板一致。这是文档完整性检查，**不是**
+Rust 测试执行或关系箭头的语义证明；关系描述仍需源码审阅。
 
-After changing source:
+源码变更后：
 
-1. Review affected nodes, edges and all four workflows against actual call sites.
-   Update `codemap.json`, including test declaration line numbers and its baseline
-   commit. Never infer runtime calls from filenames or crate dependency presence.
-2. Edit `template.html` for presentation changes; do not hand-edit generated HTML.
-3. Run `python3 scripts/codemap.py build`, then `python3 scripts/codemap.py check`.
-   Build records current evidence hashes in `codemap.lock`; it does not claim that
-   the working tree is identical to the baseline commit.
-4. Open the HTML in a browser. Exercise all module buttons, both lenses, four
-   workflows, search (including an empty result), evidence links and keyboard
-   focus at desktop and narrow widths. Record any unavailable validation honestly.
-5. Run the relevant behavior gates from [testing](../testing.md) if source changed.
+1. 根据实际调用位置复核受影响的节点、关系和四条工作流。更新 `codemap.json`，
+   包括测试声明行号与基线提交；不可仅凭文件名或 crate 依赖推断运行时调用。
+2. 展示改动在 `template.html` 中进行，不要手工修改生成的 HTML。
+3. 运行 `python3 scripts/codemap.py build`，再运行 `python3 scripts/codemap.py check`。
+   生成过程将当前证据哈希写入 `codemap.lock`，不表示工作区与基线提交完全相同。
+4. 在浏览器打开 HTML，在桌面和窄屏宽度下操作全部模块按钮、两种关系视图、四条工作流、
+   搜索（含空结果）、证据链接和键盘焦点。如有无法完成的验证，按实际情况记录。
+5. 若修改了源码，运行[测试文档](../testing.md)中相关的行为检查。
 
-The JSON is the editable semantic source. The lock records the immutable Git
-baseline plus exact current evidence hashes; it deliberately does not hash itself.
-Test declarations are source evidence only. A missing test is recorded as missing,
-not replaced by an invented test name. Distribution uses smoke-script evidence
-rather than Rust test declarations.
+JSON 是可编辑的语义数据源。锁定清单记录不可变的 Git 基线与精确的当前证据哈希，
+不对自身计算哈希。测试声明仅是源码证据；缺失的测试按缺失记录，不虚构测试名称。
+分发模块使用冒烟测试脚本作为证据，不使用 Rust 测试声明。
 
 ## 运行边界
 
-- The daemon receives typed plans; it never parses Cue source.
-- Sequence threads Scope. Parallel forks Scope and does not merge mutations.
-- A committed operation response makes retries idempotent; it does not make a
-  physical Run safe to replay after loss of ownership.
-- Execution history and output-range facts survive restart; memory output bytes
-  do not. Old empty output is not proof that a command produced no output.
-- An unknown physical Run attempt can block daemon startup. There is no supported
-  abandon/repair command; do not clear markers to force acceptance.
-- PTY lease loss releases input control, not execution ownership. Disconnecting a
-  client does not cancel its work.
+- 守护进程接收带类型的计划，不解析 Cue 源码。
+- Sequence 传递 Scope；Parallel 分叉 Scope，不合并修改。
+- 已提交的操作响应使重试具备幂等性，但不能保证失去所有权后的实际 Run 可以安全重放。
+- 执行历史和输出范围事实在重启后保留，内存中的输出字节不会保留。
+  历史输出为空不能证明命令没有产生输出。
+- 状态未知的实际 Run 尝试可能阻止守护进程启动。目前没有受支持的放弃或修复命令，
+  不应清除标记来强制通过准入检查。
+- PTY 租约丢失释放的是输入控制权，不是执行所有权；客户端断线不会取消其工作。
 
 ## 浏览器验收
 
-See [the validation record](VALIDATION.md) for tested viewports, real interactions,
-repairs and limits. Map acceptance does not imply application or deployed-site
-acceptance.
+已检查的视口、实际交互、修复和边界见[验收记录](VALIDATION.md)。
+地图验收不代表应用或已部署站点验收通过。

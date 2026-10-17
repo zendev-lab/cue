@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
-  "title": "Cue code map",
+  "title": "Cue 代码地图",
   "baseline": "f5854442a4ab4edea11f6886eb3bf9482ea38989",
   "nodes": [
     {
       "id": "cue-cli",
       "label": "cue-cli",
-      "group": "Entry points",
-      "role": "Dispatches cue commands to companion binaries and extension executables; packaging owns all four installed names.",
-      "impact": "Changes affect command routing and installed distributions.",
+      "group": "入口",
+      "role": "将 cue 命令分派给配套二进制程序与扩展可执行文件；打包层负责四个安装后的命令名。",
+      "impact": "改动会影响命令路由和安装分发。",
       "files": [
         "crates/cue-cli/Cargo.toml",
         "crates/cue-cli/src/bin/cue-client.rs",
@@ -301,14 +301,14 @@
           "line": 108
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-tui",
       "label": "cue-tui",
-      "group": "Entry points",
-      "role": "Owns the terminal workbench, editor, history, request generations and reconnect-safe execution projection.",
-      "impact": "Changes affect terminal input, selection, cancellation and rendering.",
+      "group": "入口",
+      "role": "负责终端工作台、编辑器、历史、请求代次，以及支持断线重连的执行状态投影。",
+      "impact": "改动会影响终端输入、选择、取消和渲染。",
       "files": [
         "crates/cue-tui/Cargo.toml",
         "crates/cue-tui/src/cli.rs",
@@ -379,14 +379,14 @@
           "line": 419
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-client",
       "label": "cue-client",
-      "group": "Frontend",
-      "role": "Snapshots explicit Scope, compiles surface input, correlates IPC requests, waits and attaches to PTYs.",
-      "impact": "Changes affect all frontends and connection-owned PTY controls.",
+      "group": "前端",
+      "role": "为显式 Scope 创建快照、编译表层输入、关联 IPC 请求，并负责等待执行和连接 PTY。",
+      "impact": "改动会影响所有前端，以及归连接所有的 PTY 控制权。",
       "files": [
         "crates/cue-client/Cargo.toml",
         "crates/cue-client/src/bin/cue-client.rs",
@@ -475,14 +475,14 @@
           "line": 138
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-language",
       "label": "cue-language",
-      "group": "Frontend",
-      "role": "Tokenizes and compiles direct argv syntax into the closed ExecutionSpec; owns assistance and completion.",
-      "impact": "Changes affect surface syntax, not daemon execution semantics.",
+      "group": "前端",
+      "role": "将直接 argv 语法分词并编译为封闭的 ExecutionSpec；负责输入辅助和补全。",
+      "impact": "改动影响表层语法，不改变守护进程的执行语义。",
       "files": [
         "crates/cue-language/Cargo.toml",
         "crates/cue-language/src/assistance.rs",
@@ -1319,14 +1319,14 @@
           "line": 1311
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-protocol",
       "label": "cue-protocol",
-      "group": "Contracts",
-      "role": "Defines strict IPC v4 messages, identities and length-prefixed JSON framing.",
-      "impact": "Changes affect client/daemon compatibility and persisted command fingerprints.",
+      "group": "契约",
+      "role": "定义严格的 IPC v4 消息、身份标识和带长度前缀的 JSON 帧格式。",
+      "impact": "改动会影响客户端与守护进程的兼容性，以及持久化的命令指纹。",
       "files": [
         "crates/cue-protocol/Cargo.toml",
         "crates/cue-protocol/src/framing.rs",
@@ -1393,14 +1393,14 @@
           "line": 465
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-core",
       "label": "cue-core",
-      "group": "Contracts",
-      "role": "Owns closed plan ADT, Scope, stable Step IDs, facts and pure execution reducer.",
-      "impact": "Changes affect every execution, Scope propagation and durable replay.",
+      "group": "契约",
+      "role": "负责封闭的计划 ADT、Scope、稳定的 Step ID、事实和纯执行归约器。",
+      "impact": "改动会影响每次执行、Scope 传递和持久状态重放。",
       "files": [
         "crates/cue-core/Cargo.toml",
         "crates/cue-core/src/id.rs",
@@ -1647,14 +1647,14 @@
           "line": 232
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-daemon",
       "label": "cue-daemon",
-      "group": "Execution",
-      "role": "Owns local socket and database lifecycle, command idempotency, committed transitions, runtime assembly and attachments.",
-      "impact": "Changes affect admission, durability, process ownership and restart recovery.",
+      "group": "执行",
+      "role": "负责本地套接字和数据库生命周期、命令幂等性、已提交的状态转换、运行时组装和连接管理。",
+      "impact": "改动会影响请求准入、持久性、进程所有权和重启恢复。",
       "files": [
         "crates/cue-daemon/Cargo.toml",
         "crates/cue-daemon/src/dirs.rs",
@@ -1928,14 +1928,14 @@
           "line": 265
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-runtime",
       "label": "cue-runtime",
-      "group": "Execution",
-      "role": "Binds typed providers; realizes builtin and captured/PTY leaves; supervises process groups and bounded memory output.",
-      "impact": "Changes affect physical process effects, output bytes, cancellation and cleanup.",
+      "group": "执行",
+      "role": "绑定带类型的提供者；执行内建叶节点及捕获输出或 PTY 叶节点；管理进程组和有界内存输出。",
+      "impact": "改动会影响实际进程效果、输出字节、取消和清理。",
       "files": [
         "crates/cue-runtime/Cargo.toml",
         "crates/cue-runtime/src/builtin.rs",
@@ -2073,14 +2073,14 @@
           "line": 1069
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "cue-store-sqlite",
       "label": "cue-store-sqlite",
-      "group": "Storage",
-      "role": "Stores Scope, execution projections, facts, operation outcomes and runtime work atomically.",
-      "impact": "Changes affect recovery, idempotency, sensitive-value rejection and migration.",
+      "group": "存储",
+      "role": "以原子事务保存 Scope、执行状态投影、事实、操作结果和运行时工作。",
+      "impact": "改动会影响恢复、幂等性、敏感值拒绝和迁移。",
       "files": [
         "crates/cue-store-sqlite/Cargo.toml",
         "crates/cue-store-sqlite/src/lib.rs"
@@ -2176,14 +2176,14 @@
           "line": 2043
         }
       ],
-      "testNote": "Located test declarations; this map does not claim they were executed."
+      "testNote": "已定位测试声明；此地图不表示这些测试已被执行。"
     },
     {
       "id": "sqlite",
       "label": "SQLite · cued-v4.db",
-      "group": "Storage",
-      "role": "Private WAL database, schema v2: scopes, executions, runtime_work, facts and operations. Output bytes are not persisted.",
-      "impact": "Unknown physical Run attempts block recovery; legacy v3 is archived, never imported.",
+      "group": "存储",
+      "role": "私有 WAL 数据库，schema v2：包含 scopes、executions、runtime_work、facts 和 operations；不持久化输出字节。",
+      "impact": "无法确认状态的实际 Run 尝试会阻止恢复；旧版 v3 仅归档，不导入。",
       "files": [
         "crates/cue-store-sqlite/src/lib.rs",
         "crates/cue-daemon/src/dirs.rs",
@@ -2281,14 +2281,14 @@
           "line": 2043
         }
       ],
-      "testNote": "Adapter coverage in Cue; no claim of upstream dependency tests."
+      "testNote": "Cue 中包含适配器相关测试；不代表上游依赖的测试情况。"
     },
     {
       "id": "posix",
-      "label": "POSIX processes & PTYs",
-      "group": "External",
-      "role": "Unix sockets, file locks, signals, process groups and PTY file descriptors supplied by the host OS through libc/std.",
-      "impact": "Platform-specific ownership, permissions, cleanup and peer credentials need real process tests.",
+      "label": "POSIX 进程与 PTY",
+      "group": "外部依赖",
+      "role": "宿主操作系统通过 libc/std 提供 Unix 套接字、文件锁、信号、进程组和 PTY 文件描述符。",
+      "impact": "平台相关的所有权、权限、清理和对端凭据需要真实进程测试。",
       "files": [
         "crates/cue-runtime/src/runner.rs",
         "crates/cue-daemon/src/host.rs",
@@ -2371,14 +2371,14 @@
           "line": 245
         }
       ],
-      "testNote": "Adapter coverage in Cue; no claim of upstream dependency tests."
+      "testNote": "Cue 中包含适配器相关测试；不代表上游依赖的测试情况。"
     },
     {
       "id": "tokio",
       "label": "Tokio",
-      "group": "External",
-      "role": "Async process, network, I/O, task, synchronization and signal services.",
-      "impact": "Scheduling and I/O progress influence daemon and frontend responsiveness.",
+      "group": "外部依赖",
+      "role": "提供异步进程、网络、I/O、任务、同步和信号服务。",
+      "impact": "调度和 I/O 推进会影响守护进程与前端的响应速度。",
       "files": [
         "Cargo.toml",
         "crates/cue-runtime/src/runner.rs",
@@ -2436,14 +2436,14 @@
           "line": 1205
         }
       ],
-      "testNote": "Adapter coverage in Cue; no claim of upstream dependency tests."
+      "testNote": "Cue 中包含适配器相关测试；不代表上游依赖的测试情况。"
     },
     {
       "id": "terminal",
       "label": "Ratatui / Crossterm",
-      "group": "External",
-      "role": "Terminal layout, raw input events and terminal lifecycle; used by TUI and client attach.",
-      "impact": "Terminal compatibility and input feedback are frontend concerns.",
+      "group": "外部依赖",
+      "role": "提供终端布局、原始输入事件和终端生命周期管理；供 TUI 与客户端连接功能使用。",
+      "impact": "终端兼容性和输入反馈属于前端职责。",
       "files": [
         "crates/cue-tui/Cargo.toml",
         "crates/cue-tui/src/lib.rs",
@@ -2476,14 +2476,14 @@
           "line": 665
         }
       ],
-      "testNote": "Adapter coverage in Cue; no claim of upstream dependency tests."
+      "testNote": "Cue 中包含适配器相关测试；不代表上游依赖的测试情况。"
     },
     {
       "id": "codec",
       "label": "Serde / BLAKE3 / UUID",
-      "group": "External",
-      "role": "Serialization, content hashing and identifier generation; concrete crate dependencies appear in manifests.",
-      "impact": "Wire validation, Scope hashes, operation identities and stored JSON depend on these contracts.",
+      "group": "外部依赖",
+      "role": "提供序列化、内容哈希和标识符生成；具体 crate 依赖见清单文件。",
+      "impact": "协议校验、Scope 哈希、操作标识和存储的 JSON 都依赖这些契约。",
       "files": [
         "Cargo.toml",
         "crates/cue-core/src/kernel/scope.rs",
@@ -2526,14 +2526,14 @@
           "line": 465
         }
       ],
-      "testNote": "Adapter coverage in Cue; no claim of upstream dependency tests."
+      "testNote": "Cue 中包含适配器相关测试；不代表上游依赖的测试情况。"
     },
     {
       "id": "distribution",
-      "label": "Distribution & agent Skill",
-      "group": "Delivery",
-      "role": "Maturin packages Rust executables as cue-run; npm exports the canonical Skill directory, not a JavaScript daemon.",
-      "impact": "Package metadata and executable/Skill file allowlists affect installed users.",
+      "label": "分发与 Agent Skill",
+      "group": "分发",
+      "role": "Maturin 将 Rust 可执行文件打包为 cue-run；npm 导出规范的 Skill 目录，而非 JavaScript 守护进程。",
+      "impact": "包元数据与可执行文件、Skill 文件的允许清单会影响安装后的使用。",
       "files": [
         "pyproject.toml",
         "package.json",
@@ -2553,7 +2553,7 @@
         "scripts/smoke_npm_package.mjs"
       ],
       "tests": [],
-      "testNote": "Package smoke scripts are evidence; not executed by map validation."
+      "testNote": "包的冒烟测试脚本作为证据；地图校验不会执行这些脚本。"
     }
   ],
   "edges": [
@@ -2561,7 +2561,7 @@
       "id": "e47",
       "source": "cue-cli",
       "target": "cue-client",
-      "label": "exec/run routes to companion client",
+      "label": "exec/run 路由到配套客户端",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-cli/src/main.rs"
@@ -2571,7 +2571,7 @@
       "id": "e48",
       "source": "cue-cli",
       "target": "cue-tui",
-      "label": "tui routes to companion TUI",
+      "label": "tui 路由到配套 TUI",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-cli/src/main.rs"
@@ -2581,7 +2581,7 @@
       "id": "e49",
       "source": "cue-cli",
       "target": "cue-daemon",
-      "label": "daemon routes to cued",
+      "label": "daemon 路由到 cued",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-cli/src/main.rs"
@@ -2591,7 +2591,7 @@
       "id": "e50",
       "source": "cue-tui",
       "target": "cue-client",
-      "label": "multiplexed commands and queries",
+      "label": "多路复用命令与查询",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-tui/src/lib.rs"
@@ -2601,7 +2601,7 @@
       "id": "e51",
       "source": "cue-client",
       "target": "cue-language",
-      "label": "compile_file / compile_command with Scope hash",
+      "label": "以 Scope 哈希调用 compile_file / compile_command",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-client/src/execution.rs"
@@ -2611,7 +2611,7 @@
       "id": "e52",
       "source": "cue-language",
       "target": "cue-core",
-      "label": "construct typed ExecutionSpec",
+      "label": "构造带类型的 ExecutionSpec",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-language/src/compiler.rs"
@@ -2621,7 +2621,7 @@
       "id": "e53",
       "source": "cue-client",
       "target": "cue-daemon",
-      "label": "Hello then Scope, execution, output and PTY requests over IPC v4",
+      "label": "先发送 Hello，再通过 IPC v4 发送 Scope、执行、输出和 PTY 请求",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-client/src/execution.rs"
@@ -2631,7 +2631,7 @@
       "id": "e54",
       "source": "cue-daemon",
       "target": "cue-core",
-      "label": "ready / complete / cancel reducer transitions",
+      "label": "通过归约器处理 ready / complete / cancel 状态转换",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-daemon/src/service.rs"
@@ -2641,7 +2641,7 @@
       "id": "e55",
       "source": "cue-daemon",
       "target": "cue-store-sqlite",
-      "label": "atomic projection, facts and runtime-work commits",
+      "label": "原子提交状态投影、事实和运行时工作",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-daemon/src/service.rs"
@@ -2651,7 +2651,7 @@
       "id": "e56",
       "source": "cue-store-sqlite",
       "target": "sqlite",
-      "label": "WAL transactions and schema migration",
+      "label": "WAL 事务与 schema 迁移",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-store-sqlite/src/lib.rs"
@@ -2661,7 +2661,7 @@
       "id": "e57",
       "source": "cue-daemon",
       "target": "cue-runtime",
-      "label": "realize ready leaves through typed RuntimeAssembly",
+      "label": "通过带类型的 RuntimeAssembly 执行就绪叶节点",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-daemon/src/service.rs"
@@ -2671,7 +2671,7 @@
       "id": "e58",
       "source": "cue-runtime",
       "target": "posix",
-      "label": "spawn pipelines, supervise process groups and pump PTY",
+      "label": "启动管道、监管进程组并转发 PTY 数据",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-runtime/src/runner.rs"
@@ -2681,7 +2681,7 @@
       "id": "e59",
       "source": "cue-runtime",
       "target": "cue-daemon",
-      "label": "known Run completion returns to reducer; output store is shared",
+      "label": "已确认的 Run 完成结果返回归约器；输出存储共享",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-daemon/src/service.rs"
@@ -2691,7 +2691,7 @@
       "id": "e60",
       "source": "cue-daemon",
       "target": "cue-client",
-      "label": "responses and replayed/live facts, retained output and PTY data",
+      "label": "返回响应、重放与实时事实、保留的输出和 PTY 数据",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-daemon/src/service.rs"
@@ -2701,7 +2701,7 @@
       "id": "e61",
       "source": "cue-client",
       "target": "cue-tui",
-      "label": "correlated results/events update projection",
+      "label": "关联后的结果与事件更新状态投影",
       "kind": "dataflow",
       "evidence": [
         "crates/cue-tui/src/lib.rs"
@@ -2711,7 +2711,7 @@
       "id": "e62",
       "source": "distribution",
       "target": "cue-cli",
-      "label": "Maturin builds four packaged binaries",
+      "label": "Maturin 构建四个打包的二进制程序",
       "kind": "dataflow",
       "evidence": [
         "pyproject.toml"
@@ -3191,54 +3191,54 @@
   "flows": [
     {
       "id": "submit",
-      "title": "Execute a file",
+      "title": "执行文件",
       "command": "cue run hello.cue",
       "steps": [
         {
           "node": "cue-cli",
-          "description": "Routes run to the client.",
+          "description": "将 run 路由到客户端。",
           "evidence": [
             "crates/cue-cli/src/main.rs"
           ]
         },
         {
           "node": "cue-client",
-          "description": "Sends PutScope and compiles the file against its returned hash.",
+          "description": "发送 PutScope，并使用返回的哈希编译文件。",
           "evidence": [
             "crates/cue-client/src/execution.rs"
           ]
         },
         {
           "node": "cue-language",
-          "description": "Produces typed Run/Builtin/Sequence/Parallel plans.",
+          "description": "生成带类型的 Run/Builtin/Sequence/Parallel 计划。",
           "evidence": [
             "crates/cue-language/src/compiler.rs"
           ]
         },
         {
           "node": "cue-daemon",
-          "description": "Accepts SubmitExecution; commits before scheduling.",
+          "description": "接收 SubmitExecution，先提交再调度。",
           "evidence": [
             "crates/cue-daemon/src/service.rs"
           ]
         },
         {
           "node": "cue-store-sqlite",
-          "description": "Atomically stores operation outcome and execution facts.",
+          "description": "原子保存操作结果与执行事实。",
           "evidence": [
             "crates/cue-store-sqlite/src/lib.rs"
           ]
         },
         {
           "node": "cue-runtime",
-          "description": "Spawns ready pipeline; known completion returns to daemon/reducer.",
+          "description": "启动就绪管道；已确认的完成结果返回守护进程与归约器。",
           "evidence": [
             "crates/cue-runtime/src/runner.rs"
           ]
         },
         {
           "node": "cue-client",
-          "description": "Waits and prints retained output; no streaming stdin during exec/run.",
+          "description": "等待并打印保留的输出；exec/run 期间不提供流式标准输入。",
           "evidence": [
             "crates/cue-client/src/cli.rs"
           ]
@@ -3247,12 +3247,12 @@
     },
     {
       "id": "tui",
-      "title": "Observe and cancel",
+      "title": "观察与取消",
       "command": "cue tui",
       "steps": [
         {
           "node": "cue-tui",
-          "description": "Loads list and reacts to terminal keys.",
+          "description": "加载列表并响应终端按键。",
           "evidence": [
             "crates/cue-tui/src/lib.rs",
             "crates/cue-tui/src/requests.rs",
@@ -3261,35 +3261,35 @@
         },
         {
           "node": "cue-client",
-          "description": "Multiplexes queries, commands and events.",
+          "description": "多路复用查询、命令和事件。",
           "evidence": [
             "crates/cue-client/src/execution.rs"
           ]
         },
         {
           "node": "cue-daemon",
-          "description": "Registers watches; commits cancellation and schedules runtime work.",
+          "description": "注册订阅，提交取消操作并调度运行时工作。",
           "evidence": [
             "crates/cue-daemon/src/service.rs"
           ]
         },
         {
           "node": "cue-core",
-          "description": "Marks pending work terminal, running work cancelling until completion.",
+          "description": "将待执行工作标记为终态，将运行中工作标记为取消中，直至完成。",
           "evidence": [
             "crates/cue-core/src/kernel/execution.rs"
           ]
         },
         {
           "node": "cue-runtime",
-          "description": "Terminates owned process groups; natural exit may race cancellation.",
+          "description": "终止自有进程组；自然退出可能与取消同时发生。",
           "evidence": [
             "crates/cue-runtime/src/runner.rs"
           ]
         },
         {
           "node": "cue-tui",
-          "description": "Applies results/facts to the visible execution projection.",
+          "description": "将结果与事实应用到可见的执行状态投影。",
           "evidence": [
             "crates/cue-tui/src/workbench.rs",
             "crates/cue-tui/src/view.rs"
@@ -3299,40 +3299,40 @@
     },
     {
       "id": "pty",
-      "title": "Attach to a terminal Step",
+      "title": "连接终端 Step",
       "command": "cue fg E7/S2",
       "steps": [
         {
           "node": "cue-cli",
-          "description": "Routes fg to client companion.",
+          "description": "将 fg 路由到配套客户端。",
           "evidence": [
             "crates/cue-cli/src/main.rs"
           ]
         },
         {
           "node": "cue-client",
-          "description": "Requests attach, forwards input/resize and detaches with Ctrl-].",
+          "description": "请求连接，转发输入和尺寸变化；按 Ctrl-] 断开。",
           "evidence": [
             "crates/cue-client/src/cli.rs"
           ]
         },
         {
           "node": "cue-daemon",
-          "description": "Enforces one controller plus observers and connection-owned leases.",
+          "description": "限制为一个控制者加多个观察者，并维护归连接所有的租约。",
           "evidence": [
             "crates/cue-daemon/src/service.rs"
           ]
         },
         {
           "node": "cue-runtime",
-          "description": "Pumps PTY output, input and resize with bounded control.",
+          "description": "在有界控制下转发 PTY 输出、输入和尺寸变化。",
           "evidence": [
             "crates/cue-runtime/src/runner.rs"
           ]
         },
         {
           "node": "cue-daemon",
-          "description": "Disconnect releases lease and unfinished input, not the execution.",
+          "description": "断线释放租约和未完成的输入，不终止执行。",
           "evidence": [
             "crates/cue-daemon/src/service.rs"
           ]
@@ -3341,40 +3341,40 @@
     },
     {
       "id": "recovery",
-      "title": "Start and recover",
+      "title": "启动与恢复",
       "command": "cued start --socket PATH --db PATH",
       "steps": [
         {
           "node": "cue-daemon",
-          "description": "Detached child acquires socket/database locks and opens private DB.",
+          "description": "分离的子进程获取套接字与数据库锁，并打开私有数据库。",
           "evidence": [
             "crates/cue-daemon/src/host.rs"
           ]
         },
         {
           "node": "cue-store-sqlite",
-          "description": "Migrates schema; rejects recovery of unproven physical Run attempts.",
+          "description": "迁移 schema；拒绝恢复状态未经确认的实际 Run 尝试。",
           "evidence": [
             "crates/cue-store-sqlite/src/lib.rs"
           ]
         },
         {
           "node": "cue-daemon",
-          "description": "Restores nonterminal projections page by page and drives recoverable work.",
+          "description": "逐页恢复非终态投影，推进可恢复工作。",
           "evidence": [
             "crates/cue-daemon/src/service.rs"
           ]
         },
         {
           "node": "cue-runtime",
-          "description": "Only ready recoverable work is realized; memory output starts empty.",
+          "description": "只执行已就绪且可恢复的工作；内存输出从空状态开始。",
           "evidence": [
             "crates/cue-runtime/src/output.rs"
           ]
         },
         {
           "node": "cue-daemon",
-          "description": "Readiness is Hello from the expected new instance.",
+          "description": "以预期新实例返回的 Hello 确认就绪。",
           "evidence": [
             "crates/cue-daemon/src/startup.rs"
           ]
@@ -3383,10 +3383,10 @@
     }
   ],
   "limitations": [
-    "Static source evidence, not runtime or installed-package acceptance.",
-    "Dependency edges come from production Cargo manifests; dev-dependencies are excluded.",
-    "External dependencies are grouped; Cargo.lock remains the full version inventory.",
-    "No remote service or schedule owner exists in the kernel.",
-    "Output bytes live in bounded memory and disappear on daemon restart."
+    "这是静态源码证据，不代表运行时或安装包验收通过。",
+    "依赖关系来自 Cargo 清单中的生产依赖，不包含 dev-dependencies。",
+    "外部依赖按组展示；完整版本清单仍以 Cargo.lock 为准。",
+    "此内核不包含远程服务或调度管理模块。",
+    "输出字节保存在有界内存中，守护进程重启后消失。"
   ]
 }
