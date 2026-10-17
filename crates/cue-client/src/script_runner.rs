@@ -1,4 +1,4 @@
-//! Non-interactive `.cue` file runner for IPC v4.
+//! Non-interactive `.cue` file runner for IPC v5.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -19,14 +19,24 @@ pub fn run(path: PathBuf) -> Result<i32> {
 }
 
 async fn run_async(path: PathBuf) -> Result<i32> {
+    run_with_needs(path, Default::default()).await
+}
+
+pub async fn run_with_needs(
+    path: PathBuf,
+    needs: std::collections::BTreeMap<String, String>,
+) -> Result<i32> {
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("read Cue file {}", path.display()))?;
     let socket = std::env::var_os("CUE_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
     let mut client = ExecutionClient::connect(&socket).await?;
+    let scope = process_scope()?;
+    let spec = cue_language::compile_file(&source, scope.compute_hash())?;
+    client.put_scope(scope).await?;
     let submitted = client
-        .submit_file(process_scope()?, &source)
+        .submit_with_needs(spec, needs)
         .await
         .with_context(|| format!("submit Cue file {}", path.display()))?;
     let execution = wait_execution(&mut client, submitted.snapshot.id).await?;
