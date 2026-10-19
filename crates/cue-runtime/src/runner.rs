@@ -102,10 +102,14 @@ async fn spawn_pty(
     let writer = master
         .try_clone()
         .map_err(|error| io_error("clone PTY writer", error))?;
-    let reader = tokio::io::unix::AsyncFd::new(reader)
+    // SAFETY: The cloned File owns a valid descriptor that is never closed or
+    // replaced while AsyncFd owns it; the reader only borrows it for I/O.
+    let reader = unsafe { tokio::io::unix::AsyncFd::register(reader) }
         .map_err(|error| io_error("register PTY reader", error))?;
     let writer = Arc::new(
-        tokio::io::unix::AsyncFd::new(writer)
+        // SAFETY: The cloned File keeps the same descriptor open until AsyncFd
+        // deregisters it on drop. Control and resize only borrow the descriptor.
+        unsafe { tokio::io::unix::AsyncFd::register(writer) }
             .map_err(|error| io_error("register PTY writer", error))?,
     );
     let slave = std::fs::File::from(pair.slave);

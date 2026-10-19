@@ -29,8 +29,8 @@ uvx zendev-proposal check --fix
 uvx zendev-proposal check
 ```
 
-仓库 hooks 使用 `prek.toml` 中的 v0.4.0，提案索引采用 v2 格式，以整数编号表示身份
-和关系，不额外生成格式化 id。流程、schema 和索引配置以 `proposal.toml` 与
+仓库 hooks 使用 `prek.toml` 中的 v0.5.0，提案索引采用 v2 格式，以整数编号表示身份
+和关系，不额外生成格式化 id。流程、schema 和索引配置以 `zendev.toml` 与
 `schemas/fp.schema.json` 为准；不引入另一份验证脚本或状态文件。
 
 ## 验证
