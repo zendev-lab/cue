@@ -1,6 +1,6 @@
 # Cue design index
 
-These documents describe the shipped IPC v4 architecture. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the normative
+These documents describe the shipped IPC v5 architecture. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the normative
 contract; these documents describe its implementation.
 
 - [Execution kernel](kernel.md): product boundary, closed plan ADT, Scope,
@@ -18,3 +18,4 @@ contract; these documents describe its implementation.
 - [Client](client.md): frontend Scope snapshots, typed dispatch, correlation,
   and multiplexed response/event routing.
 - [Frontends](frontends.md): CLI, PTY passthrough, TUI, and extension boundary.
+- [执行级资源扩展](resources.md): provider 配置、通用 IPC 接入、预算及安全清理。

@@ -1,7 +1,8 @@
-//! IPC v4 daemon service.
-//!
-//! A connection binds a `ClientId` through `Hello`; commands then use the strict
-//! operation ledger while queries remain side-effect free.
+use crate::extensions::{Extensions, ResourceExtension, SubmissionEffect};
+// IPC v5 daemon service.
+//
+// A connection binds a `ClientId` through `Hello`; commands then use the strict
+// operation ledger while queries remain side-effect free.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +36,7 @@ const OUTPUT_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 /// SQLite is the authoritative store; unsupported Sensitive data is rejected.
 struct StoreProvider {
-    durable: Mutex<Store>,
+    durable: Arc<Mutex<Store>>,
     events: tokio::sync::broadcast::Sender<FactEvent>,
     output_events: tokio::sync::broadcast::Sender<LiveOutput>,
 }
@@ -53,7 +54,7 @@ impl StoreProvider {
         let (events, _) = tokio::sync::broadcast::channel(1024);
         let (output_events, _) = tokio::sync::broadcast::channel(1024);
         Self {
-            durable: Mutex::new(store),
+            durable: Arc::new(Mutex::new(store)),
             events,
             output_events,
         }
@@ -115,10 +116,24 @@ impl StoreProvider {
         facts: &[FactDraft],
         response: &ResponsePayload,
     ) -> Result<OperationOutcome, RuntimeError> {
+        self.commit_submission_with(client, operation, command, execution, facts, response, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_submission_with(
+        &self,
+        client: &ClientId,
+        operation: &OperationId,
+        command: &Command,
+        execution: &ExecutionProjection,
+        facts: &[FactDraft],
+        response: &ResponsePayload,
+        effect: Option<&dyn SubmissionEffect>,
+    ) -> Result<OperationOutcome, RuntimeError> {
         Ok(
             match self
                 .lock_store()?
-                .commit_execution_command(
+                .commit_execution_command_with(
                     OperationCommit {
                         client,
                         operation,
@@ -128,6 +143,10 @@ impl StoreProvider {
                     },
                     execution,
                     facts,
+                    |connection| match effect {
+                        Some(effect) => effect.insert(connection, execution.snapshot.id),
+                        None => Ok(()),
+                    },
                 )
                 .map_err(store_error)?
             {
@@ -311,6 +330,7 @@ impl OutputStore for FactingOutputStore {
 
 fn build_runtime(
     store: Arc<StoreProvider>,
+    resources: Arc<cue_resources::Resources>,
 ) -> Result<(Arc<RuntimeAssembly>, Arc<FactingOutputStore>), RuntimeError> {
     let output = Arc::new(FactingOutputStore::new(store.clone()));
     let spawner: Arc<dyn ProcessSpawner> = Arc::new(LocalProcessSpawner::new(output.clone()));
@@ -337,6 +357,18 @@ fn build_runtime(
             .map_err(|error| RuntimeError::infrastructure(error.to_string()))?,
         )
         .map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
+    let resource_id = ProviderId::new("cue-resources")
+        .map_err(|e| RuntimeError::infrastructure(e.to_string()))?;
+    composition
+        .register_provider(
+            ProviderSpec::new(
+                resource_id.clone(),
+                env!("CARGO_PKG_VERSION"),
+                [cue_runtime::RuntimePort::SpawnTransform.port_id()],
+            )
+            .map_err(|e| RuntimeError::infrastructure(e.to_string()))?,
+        )
+        .map_err(|e| RuntimeError::infrastructure(e.to_string()))?;
     let assembly = composition
         .resolve(runtime_root_ports())
         .map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
@@ -353,12 +385,24 @@ fn build_runtime(
             },
         )
         .map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
+    registry
+        .insert(
+            resource_id,
+            ProviderBundle {
+                spawn_transform: Some(resources),
+                ..ProviderBundle::default()
+            },
+        )
+        .map_err(|e| RuntimeError::infrastructure(e.to_string()))?;
     let runtime = RuntimeAssembly::bind(assembly, registry)
         .map_err(|error| RuntimeError::infrastructure(error.to_string()))?;
     Ok((Arc::new(runtime), output))
 }
 
 pub struct DaemonService {
+    extensions: Extensions,
+    extension_pump: std::sync::atomic::AtomicBool,
+    extension_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     store: Arc<StoreProvider>,
     runtime: Arc<RuntimeAssembly>,
     output: Arc<FactingOutputStore>,
@@ -441,10 +485,24 @@ impl DaemonService {
     }
 
     pub fn from_store(store: Store) -> Result<Arc<Self>, RuntimeError> {
+        Self::from_store_with_resources(store, cue_resources::ResourceConfig::default())
+    }
+
+    pub fn from_store_with_resources(
+        store: Store,
+        config: cue_resources::ResourceConfig,
+    ) -> Result<Arc<Self>, RuntimeError> {
         let store = Arc::new(StoreProvider::new(store));
-        let (runtime, output) = build_runtime(store.clone())?;
+        let resources = cue_resources::Resources::new(store.durable.clone(), config)
+            .map_err(|e| RuntimeError::infrastructure(e.to_string()))?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(ResourceExtension(resources.clone())))?;
+        let (runtime, output) = build_runtime(store.clone(), resources)?;
         let (lifecycle, _) = tokio::sync::broadcast::channel(16);
         Ok(Arc::new(Self {
+            extensions,
+            extension_pump: std::sync::atomic::AtomicBool::new(false),
+            extension_task: Mutex::new(None),
             store,
             runtime,
             output,
@@ -487,9 +545,16 @@ impl DaemonService {
             })
             .await;
             if let Ok(result) = drained {
+                // Stop the coordinator before the host can release exclusive database ownership.
+                // Cancellation of a provider call leaves its durable uncertain request for recovery.
+                self.stop_extension_pump().await;
+                if result.is_ok() {
+                    self.extensions.tick().await?;
+                }
                 return result;
             }
         }
+        self.stop_extension_pump().await;
         Err(RuntimeError::new(
             RuntimeErrorKind::Conflict,
             "cannot prove all Run attempts quiescent while draining",
@@ -534,6 +599,8 @@ impl DaemonService {
             .lock_store()?
             .recover_runtime_work()
             .map_err(store_error)?;
+        self.extensions.recover().await?;
+        self.start_extension_pump();
         let mut before = None;
         loop {
             let projections = self.store.list(before, STORE_PAGE_SIZE)?;
@@ -576,6 +643,18 @@ impl DaemonService {
         command: &Command,
         spec: cue_core::ExecutionSpec,
     ) -> Result<ResponsePayload, RuntimeError> {
+        self.submit_with_effect(client, operation, command, spec, None)
+            .await
+    }
+
+    async fn submit_with_effect(
+        self: &Arc<Self>,
+        client: &ClientId,
+        operation: &OperationId,
+        command: &Command,
+        spec: cue_core::ExecutionSpec,
+        effect: Option<Box<dyn SubmissionEffect>>,
+    ) -> Result<ResponsePayload, RuntimeError> {
         if self.store.load_scope(spec.scope())?.is_none() {
             return Err(RuntimeError::new(
                 RuntimeErrorKind::NotFound,
@@ -603,13 +682,14 @@ impl DaemonService {
                 scope: projection.snapshot.spec.scope(),
             },
         };
-        let committed = match self.store.commit_submission(
+        let committed = match self.store.commit_submission_with(
             client,
             operation,
             command,
             &projection,
             &[created],
             &response,
+            effect.as_deref(),
         )? {
             OperationOutcome::Replay(response) => return Ok(response),
             OperationOutcome::Conflict => return Err(operation_conflict()),
@@ -629,8 +709,49 @@ impl DaemonService {
         tasks.insert(id, task.clone());
         drop(tasks);
         self.store.publish(&committed);
+        self.start_extension_pump();
         self.schedule_execution(task);
         Ok(response)
+    }
+
+    fn start_extension_pump(self: &Arc<Self>) {
+        if self.extension_pump.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Some(service) = weak.upgrade() else { break };
+                if let Err(error) = service.extensions.tick().await {
+                    tracing::error!(%error, "extension progress failed; retaining allocations");
+                }
+                let tasks = service
+                    .tasks
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for task in tasks {
+                    service.schedule_execution(task);
+                }
+                drop(service);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        *self.extension_task.lock().expect("extension task lock") = Some(handle);
+    }
+
+    async fn stop_extension_pump(&self) {
+        let handle = self
+            .extension_task
+            .lock()
+            .expect("extension task lock")
+            .take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     fn schedule_execution(self: &Arc<Self>, task: Arc<ExecutionTask>) {
@@ -655,6 +776,12 @@ impl DaemonService {
     async fn drive(self: Arc<Self>, task: Arc<ExecutionTask>) -> Result<(), RuntimeError> {
         {
             let mut state = task.state.lock().await;
+            if state.execution.cancel_requested().is_none()
+                && !state.execution.state().is_terminal()
+                && !self.extensions.admitted(task.id)?
+            {
+                return Ok(());
+            }
             let mut candidate = state.execution.clone();
             let transition = candidate.advance().map_err(reducer_error)?;
             if candidate != state.execution {
@@ -1017,6 +1144,16 @@ impl DaemonConnection {
 
     async fn handle_query(&mut self, query: Query) -> Result<ResponsePayload, RuntimeError> {
         match query {
+            Query::Extension(request) => {
+                self.require_client()?;
+                let extension = self.service.extensions.resolve(&request)?;
+                let data = extension.query(request.method, request.data).await?;
+                Ok(ResponsePayload::Ok(ResultPayload::Extension {
+                    namespace: request.namespace,
+                    version: request.version,
+                    data,
+                }))
+            }
             Query::Hello(Hello {
                 protocol_version,
                 client_id,
@@ -1132,7 +1269,9 @@ impl DaemonConnection {
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                     })),
-                    Query::Hello(_) => unreachable!("hello handled before client requirement"),
+                    Query::Hello(_) | Query::Extension(_) => {
+                        unreachable!("hello handled before client requirement")
+                    }
                 }
             }
         }
@@ -1173,6 +1312,35 @@ impl DaemonConnection {
     ) -> Result<ResponsePayload, RuntimeError> {
         let client = self.require_client()?.clone();
         match &command {
+            Command::Extension(request) => {
+                if let Some(saved) = self
+                    .service
+                    .store
+                    .lock_store()?
+                    .get_operation(&client, &operation)
+                    .map_err(store_error)?
+                {
+                    if saved.fingerprint
+                        != cue_store_sqlite::command_fingerprint(&command).map_err(store_error)?
+                    {
+                        return Err(operation_conflict());
+                    }
+                    return saved.response.ok_or_else(operation_expired);
+                }
+                let extension = self.service.extensions.resolve(request)?;
+                let prepared = extension
+                    .prepare(request.method.clone(), request.data.clone())
+                    .await?;
+                self.service
+                    .submit_with_effect(
+                        &client,
+                        &operation,
+                        &command,
+                        prepared.spec,
+                        Some(prepared.effect),
+                    )
+                    .await
+            }
             Command::PutScope { scope } => {
                 let hash = scope.compute_hash();
                 let durable = true;
@@ -1794,7 +1962,7 @@ fn finish_external_operation(
     Ok(response)
 }
 
-/// Serve one strict IPC v4 stream. Fact events are emitted only after the
+/// Serve one strict IPC v5 stream. Fact events are emitted only after the
 /// connection successfully watches their ExecutionId.
 pub async fn serve_stream<S>(service: Arc<DaemonService>, stream: S) -> Result<(), RuntimeError>
 where
@@ -1867,14 +2035,14 @@ where
                 };
                 writer
                     .write_all(&encode_message(&response).map_err(|error| {
-                        RuntimeError::infrastructure(format!("encode v4 response: {error}"))
+                        RuntimeError::infrastructure(format!("encode v5 response: {error}"))
                     })?)
                     .await
-                    .map_err(|error| RuntimeError::infrastructure(format!("write v4 response: {error}")))?;
+                    .map_err(|error| RuntimeError::infrastructure(format!("write v5 response: {error}")))?;
                 writer
                     .flush()
                     .await
-                    .map_err(|error| RuntimeError::infrastructure(format!("flush v4 response: {error}")))?;
+                    .map_err(|error| RuntimeError::infrastructure(format!("flush v5 response: {error}")))?;
                 connection.response_flushed();
                 for fact in connection.drain_replayed_facts() {
                     let message = Message::Event {
@@ -1900,14 +2068,14 @@ where
                         };
                         writer
                             .write_all(&encode_message(&message).map_err(|error| {
-                                RuntimeError::infrastructure(format!("encode v4 event: {error}"))
+                                RuntimeError::infrastructure(format!("encode v5 event: {error}"))
                             })?)
                             .await
-                            .map_err(|error| RuntimeError::infrastructure(format!("write v4 event: {error}")))?;
+                            .map_err(|error| RuntimeError::infrastructure(format!("write v5 event: {error}")))?;
                         writer
                             .flush()
                             .await
-                            .map_err(|error| RuntimeError::infrastructure(format!("flush v4 event: {error}")))?;
+                            .map_err(|error| RuntimeError::infrastructure(format!("flush v5 event: {error}")))?;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -2008,7 +2176,7 @@ impl WireReader {
                     if length == 0 || length > MAX_MESSAGE_SIZE {
                         return Err(RuntimeError::new(
                             RuntimeErrorKind::InvalidInput,
-                            format!("invalid v4 frame length {length}"),
+                            format!("invalid v5 frame length {length}"),
                         ));
                     }
                     self.frame.resize(4 + length, 0);
@@ -2024,14 +2192,14 @@ impl WireReader {
             let read = reader
                 .read(&mut self.frame[self.filled..])
                 .await
-                .map_err(|error| RuntimeError::infrastructure(format!("read v4 frame: {error}")))?;
+                .map_err(|error| RuntimeError::infrastructure(format!("read v5 frame: {error}")))?;
             if read == 0 {
                 return if self.filled == 0 {
                     Ok(None)
                 } else {
                     Err(RuntimeError::new(
                         RuntimeErrorKind::InvalidInput,
-                        "incomplete v4 frame at EOF",
+                        "incomplete v5 frame at EOF",
                     ))
                 };
             }
@@ -2677,7 +2845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_length_prefixed_stream_serves_v4_messages() {
+    async fn strict_length_prefixed_stream_serves_v5_messages() {
         use tokio::io::AsyncWriteExt as _;
 
         let service = DaemonService::in_memory().unwrap();
@@ -2754,7 +2922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_submit_wait_and_read_output_use_the_v4_contract() {
+    async fn put_submit_wait_and_read_output_use_the_v5_contract() {
         let service = DaemonService::in_memory().unwrap();
         let mut connection = service.connection();
         hello(&mut connection).await;
@@ -3132,3 +3300,7 @@ mod tests {
 #[cfg(test)]
 #[path = "service_regressions.rs"]
 mod regressions;
+
+#[cfg(test)]
+#[path = "resource_tests.rs"]
+mod resource_tests;
