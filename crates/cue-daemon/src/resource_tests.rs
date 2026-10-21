@@ -139,16 +139,16 @@ async fn resource_submission_is_atomic_and_replays_the_entire_extension_fingerpr
         .await
         .unwrap();
     assert_eq!(first, replay);
-    let Command::Extension(mut different) = command else {
+    let Command::Extension(mut different) = command.clone() else {
         unreachable!()
     };
     different.data["needs"]["worker"] = json!("2");
-    assert!(
-        client
-            .handle_command(operation, Command::Extension(different))
-            .await
-            .is_err()
-    );
+    let conflict = client
+        .handle_command(operation.clone(), Command::Extension(different))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.kind, operation_conflict().kind);
+    assert_eq!(conflict.message, operation_conflict().message);
     let result = tokio::time::timeout(
         Duration::from_secs(3),
         service.wait_execution(ExecutionId(1)),
@@ -157,6 +157,15 @@ async fn resource_submission_is_atomic_and_replays_the_entire_extension_fingerpr
     .unwrap()
     .unwrap();
     assert_eq!(result.state, ExecutionState::Succeeded);
+    service
+        .store
+        .lock_store()
+        .unwrap()
+        .tombstone_operation_responses_before(i64::MAX)
+        .unwrap();
+    let expired = client.handle_command(operation, command).await.unwrap_err();
+    assert_eq!(expired.kind, operation_expired().kind);
+    assert_eq!(expired.message, operation_expired().message);
     assert_eq!(service.store.list(None, 10).unwrap().len(), 1);
     assert_eq!(records(&service).len(), 1);
     assert_eq!(
