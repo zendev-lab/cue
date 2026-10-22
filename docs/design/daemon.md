@@ -62,7 +62,7 @@ store together with their effect:
 - explicitly Sensitive environment values are rejected as unsupported before
   persistence; names never infer sensitivity.
 
-The wire format is strict IPC v4 framing: a four-byte big-endian payload length
+The wire format is strict IPC v5 framing: a four-byte big-endian payload length
 followed by one validated message. Unknown fields, wrong message roles, and
 oversized frames are rejected.
 Partial frame state survives event delivery. Pending `WaitExecution` queries
@@ -114,8 +114,9 @@ lease also cancels its unfinished input, allowing a new controller to proceed.
 ## Owner boundary
 
 The daemon accepts only fully resolved `ExecutionSpec` values. Surface parsing,
-assignment expansion, named sessions, schedules, retry policy, admission,
-approval, and resource selection belong to clients or external producers. The
+assignment expansion, named sessions, schedules, retry policy, and
+approval belong to clients or external producers. Resource admission belongs
+to the built-in Composition extension; Core retains its closed algebra. The
 daemon provides no v3 compatibility bridge.
 
 Lifecycle commands persist their outcome, then the connection writes and
@@ -137,7 +138,7 @@ the timeout is not evidence that the processes stopped.
 
 The host CLI bounds connection, Hello, and control-response waits. Status keeps
 an absent listener distinct from one that accepts connections but cannot speak
-IPC v4. Failed Hello reports a protocol-independent recovery command; a lost
+IPC v5. Failed Hello reports a protocol-independent recovery command; a lost
 control response reports an unknown outcome rather than automatically replaying
 or signalling the daemon.
 
@@ -149,3 +150,15 @@ rejects non-socket paths, missing peer PID support, and invalid/self PIDs. It
 never escalates to SIGKILL or signals a supervisor's replacement. The host
 handles SIGTERM through the same drain path as its other shutdown signals.
 This facility contains no legacy IPC codec or execution compatibility bridge.
+
+## 资源接入与恢复
+
+The host registers the generic extension dispatcher and transactional submission
+effects. It checks extension admission before advancing any leaf, while allowing
+cancellation. `cue-resources` owns provider calls and its own SQLite tables.
+A serialized background coordinator retries allocation and unresolved cleanup.
+Run completion is committed only after the runtime reports physical quiescence;
+ownership loss never becomes a terminal fact or release authorization.
+Drain stops and joins the coordinator before releasing host ownership. An
+interrupted provider call retains its durable uncertain identity for recovery.
+See [资源扩展](resources.md) for configuration and failure semantics.

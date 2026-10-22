@@ -37,10 +37,22 @@ uv tool run --from "$package_path" cue-client --version
 uv tool run --from "$package_path" cue-tui --version
 uv tool run --from "$package_path" cued --version
 
+mkdir -p "$XDG_CONFIG_HOME/cue"
+cat > "$XDG_CONFIG_HOME/cue/daemon.toml" <<'TOML'
+[[resources.providers]]
+id = "workers"
+kind = "static"
+[resources.providers.capacity]
+worker = "2"
+TOML
+
 daemon_started=true
 uv tool run --from "$package_path" cued start
 uv tool run --from "$package_path" cued status
 uv tool run --from "$package_path" cue-client exec "printf package-ok"
+uv tool run --from "$package_path" cue client exec --need worker=1 -- "printf resource-ok"
+uv tool run --from "$package_path" cue resources --json
+uv tool run --from "$package_path" cue providers --json
 uv tool run --from "$package_path" cue client list
 uv tool run --from "$package_path" cue daemon status
 

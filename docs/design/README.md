@@ -1,6 +1,6 @@
 # Cue design index
 
-These documents describe the shipped IPC v4 architecture. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the normative
+These documents describe the shipped IPC v5 architecture. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the normative
 contract; these documents describe its implementation.
 
 - [Interactive code map](../codemap/codemap.html): clickable responsibilities,
@@ -24,3 +24,5 @@ contract; these documents describe its implementation.
 
 Research notes under `docs/research/` are historical inputs, not current API or
 compatibility promises.
+
+- [执行级资源扩展](resources.md): provider 配置、通用 IPC 接入、预算及安全清理。

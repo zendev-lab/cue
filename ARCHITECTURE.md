@@ -9,7 +9,7 @@ frontend Scope + surface source
 ScopeHash --------> ExecutionSpec { ScopeHash, closed ExecutionPlan }
                          |
                          v
-IPC v4 -> reducer -> typed RuntimeAssembly -> process/PTY/output
+IPC v5 -> extension admission -> reducer -> typed RuntimeAssembly -> process/PTY/output
 ```
 
 `cue-core` alone decides plan meaning, stable Steps, result aggregation, and
@@ -29,6 +29,12 @@ Start with the [design index](docs/design/README.md) and
 
 [FP-0001](fps/FP-0001-structured-execution-kernel.md) owns the normative contract.
 
+`cue-resources` is a built-in Composition extension with independent SQLite
+tables. Generic IPC extension dispatch, atomic submission effects, admission,
+and background cleanup remain host mechanisms. Resource types never enter
+Core, protocol variants, or runtime policy. Physical environment contributions
+flow through SpawnContext after logical environment construction.
+
 ## 沿实现边界追踪变更
 
 The [interactive code map](docs/codemap/codemap.html) provides clickable ownership,
@@ -39,9 +45,10 @@ The [map guide](docs/codemap/README.md) explains local use and evidence validati
 | --- | --- | --- |
 | User intent | CLI / TUI / client | arguments or surface text → explicit Scope and client requests |
 | Surface compilation | language | source + Scope hash → closed typed ExecutionSpec |
-| Transport contract | protocol | validated IPC v4 messages ↔ length-prefixed JSON |
+| Transport contract | protocol | validated IPC v5 messages ↔ length-prefixed JSON |
 | Semantic decisions | core | plan + state + completion/cancel → transitions and facts |
 | Durable orchestration | daemon + store | command → atomic operation outcome, projection, facts and runtime work |
+| Execution resources | resources + daemon extension host | needs → durable allocation, admission, physical environment and cleanup |
 | Physical effects | runtime | ready leaf + full Scope → owned process/PTY and known completion |
 | Observation | daemon + client | stored/live facts and retained bytes → frontend projection |
 

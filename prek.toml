@@ -72,7 +72,7 @@ hooks = [{ id = "alint", stages = ["pre-commit"] }]
 
 [[repos]]
 repo = "https://github.com/zendev-lab/zendev"
-rev = "v0.4.0"
+rev = "v0.5.0"
 hooks = [
   { id = "zendev-proposal-check", stages = ["pre-commit"] },
   { id = "zendev-message-check", stages = ["commit-msg"] },

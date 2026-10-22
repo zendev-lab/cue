@@ -1,4 +1,4 @@
-//! Thin IPC v4 command-line frontend.
+//! Thin IPC v5 command-line frontend.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -28,12 +28,32 @@ enum ClientCommand {
     Version,
     Run(PathBuf),
     Exec(String),
+    RunNeeds {
+        path: PathBuf,
+        needs: std::collections::BTreeMap<String, String>,
+    },
+    ExecNeeds {
+        source: String,
+        needs: std::collections::BTreeMap<String, String>,
+    },
+    Resources {
+        providers: bool,
+    },
     List,
     Show(ExecutionId),
     Wait(ExecutionId),
-    Output { step: StepId, stream: OutputStream },
-    Cancel { id: ExecutionId, force: bool },
-    Foreground { step: StepId, observe: bool },
+    Output {
+        step: StepId,
+        stream: OutputStream,
+    },
+    Cancel {
+        id: ExecutionId,
+        force: bool,
+    },
+    Foreground {
+        step: StepId,
+        observe: bool,
+    },
     Restart,
     Shutdown,
 }
@@ -63,6 +83,33 @@ async fn run_connected(command: ClientCommand) -> Result<i32> {
         .unwrap_or_else(default_socket_path);
     let mut client = ExecutionClient::connect(&socket).await?;
     match command {
+        ClientCommand::RunNeeds { path, needs } => {
+            crate::script_runner::run_with_needs(path, needs).await
+        }
+        ClientCommand::ExecNeeds { source, needs } => {
+            let scope = process_scope()?;
+            let cue_language::SurfaceCommand::Submit(spec) =
+                cue_language::compile_command(&source, Mode::Job, scope.compute_hash())?
+            else {
+                bail!("--need requires executable Cue source")
+            };
+            client.put_scope(scope).await?;
+            let submitted = client.submit_with_needs(spec, needs).await?;
+            let execution = wait_execution(&mut client, submitted.snapshot.id).await?;
+            write_execution_output(&mut client, &execution).await?;
+            Ok(execution_exit_code(&execution))
+        }
+        ClientCommand::Resources { providers } => {
+            print_json(
+                client
+                    .resource_query(
+                        if providers { "providers" } else { "list" },
+                        serde_json::json!({}),
+                    )
+                    .await?,
+            )?;
+            Ok(0)
+        }
         ClientCommand::Exec(source) => {
             match client
                 .execute_surface(process_scope()?, &source, Mode::Job)
@@ -94,7 +141,11 @@ async fn run_connected(command: ClientCommand) -> Result<i32> {
             Ok(0)
         }
         ClientCommand::Show(id) => {
-            print_json(client.query(Query::GetExecution { id }).await?)?;
+            let mut result = serde_json::to_value(client.query(Query::GetExecution { id }).await?)?;
+            result["resources"] = client
+                .resource_query("show", serde_json::json!({"execution":id}))
+                .await?;
+            print_json(result)?;
             Ok(0)
         }
         ClientCommand::Wait(id) => {
@@ -320,15 +371,16 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<ClientComma
     match command.as_str() {
         "help" | "-h" | "--help" => no_args(args, ClientCommand::Help),
         "version" | "-V" | "--version" => no_args(args, ClientCommand::Version),
-        "run" => {
-            let path = one_string(args, "run", "a .cue file")?;
-            let path = PathBuf::from(path);
-            if path.extension().and_then(|value| value.to_str()) != Some("cue") {
-                bail!("`cue-client run` expects a .cue file")
+        "run" | "exec" => parse_submission(&command, args),
+        "resources" | "providers" => {
+            let rest = args.collect::<Vec<_>>();
+            if !rest.is_empty() && rest != [OsString::from("--json")] {
+                bail!("expected optional --json")
             }
-            Ok(ClientCommand::Run(path))
+            Ok(ClientCommand::Resources {
+                providers: command == "providers",
+            })
         }
-        "exec" => Ok(ClientCommand::Exec(one_string(args, "exec", "Cue source")?)),
         "list" => no_args(args, ClientCommand::List),
         "show" => Ok(ClientCommand::Show(parse_one(
             args,
@@ -355,11 +407,70 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<ClientComma
         "fg" => parse_foreground(args),
         "restart" => no_args(args, ClientCommand::Restart),
         "shutdown" => no_args(args, ClientCommand::Shutdown),
-        "session" | "cron" | "retry" | "resources" => bail!(
+        "session" | "cron" | "retry" => bail!(
             "`{command}` is not owned by the Cue execution kernel; use an external producer or orchestration layer"
         ),
         _ => bail!("unknown cue-client command `{command}`"),
     }
+}
+
+fn parse_submission(command: &str, args: impl Iterator<Item = OsString>) -> Result<ClientCommand> {
+    let mut needs = std::collections::BTreeMap::new();
+    let mut rest = Vec::new();
+    let mut args = args.peekable();
+    let mut literal = false;
+    while let Some(arg) = args.next() {
+        if !literal && arg == "--" {
+            literal = true;
+            continue;
+        }
+        if !literal && arg == "--need" {
+            let pair = args
+                .next()
+                .context("--need expects KEY=QUANTITY")?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("need must be UTF-8"))?;
+            let (key, value) = pair
+                .split_once('=')
+                .context("--need expects KEY=QUANTITY")?;
+            if key.is_empty()
+                || value.is_empty()
+                || needs.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                bail!("empty or duplicate resource need")
+            }
+        } else {
+            rest.push(arg)
+        }
+    }
+    if command == "run" {
+        let path = PathBuf::from(one_string(rest.into_iter(), "run", "a .cue file")?);
+        if path.extension().and_then(|v| v.to_str()) != Some("cue") {
+            bail!("cue-client run expects a .cue file")
+        }
+        return Ok(if needs.is_empty() {
+            ClientCommand::Run(path)
+        } else {
+            ClientCommand::RunNeeds { path, needs }
+        });
+    }
+    let source = if literal && rest.len() > 1 {
+        rest.into_iter()
+            .map(|s| {
+                s.into_string()
+                    .map_err(|_| anyhow::anyhow!("source must be UTF-8"))
+                    .and_then(|s| serde_json::to_string(&s).map_err(Into::into))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(" ")
+    } else {
+        one_string(rest.into_iter(), "exec", "Cue source")?
+    };
+    Ok(if needs.is_empty() {
+        ClientCommand::Exec(source)
+    } else {
+        ClientCommand::ExecNeeds { source, needs }
+    })
 }
 
 fn parse_foreground(args: impl IntoIterator<Item = OsString>) -> Result<ClientCommand> {
@@ -423,7 +534,7 @@ fn print_json(value: impl serde::Serialize) -> Result<()> {
 
 fn print_help() {
     println!(
-        "cue-client {}\n\nUsage:\n  cue-client run FILE.cue\n  cue-client exec SOURCE\n  cue-client list\n  cue-client show|wait EXECUTION\n  cue-client out|err|terminal STEP\n  cue-client cancel|kill EXECUTION\n  cue-client fg STEP [--observe]\n  cue-client restart|shutdown\n\nEnvironment:\n  CUE_SOCKET  Override the local cued socket\n\nPTY control: Ctrl-] detaches. Session, schedule, retry, resource and approval policy are external owners.",
+        "cue-client {}\n\nUsage:\n  cue-client run FILE.cue [--need KEY=QUANTITY]...\n  cue-client exec [--need KEY=QUANTITY]... -- SOURCE\n  cue-client resources|providers [--json]\n  cue-client list\n  cue-client show|wait EXECUTION\n  cue-client out|err|terminal STEP\n  cue-client cancel|kill EXECUTION\n  cue-client fg STEP [--observe]\n  cue-client restart|shutdown\n\nEnvironment:\n  CUE_SOCKET  Override the local cued socket\n\nPTY control: Ctrl-] detaches. Session, schedule, retry and approval policy are external owners. Resources are execution-scoped daemon extensions.",
         env!("CARGO_PKG_VERSION")
     );
 }

@@ -1,6 +1,6 @@
-# Cue IPC v4 protocol and store
+# IPC v5 协议与存储
 
-IPC v4 is a strict transport projection of the Core contract. It lives in
+IPC v5 is a strict transport projection of the Core contract. It lives in
 `cue-protocol`; `cue-core` never depends on transport. IPC v3 types and
 translation paths do not exist in the runtime.
 
@@ -22,10 +22,13 @@ connection state. Every Command must carry one. `Hello` establishes a stable
 ClientId for the connection, so the durable at-most-once key is
 `(ClientId, OperationId)` rather than the removed session namespace.
 
-The v4 request surface owns only Scope upload/query, execution
+The core request surface owns Scope upload/query, execution
 submit/query/list/wait/cancel/watch, output ranges, explicit PTY attachments,
-and daemon lifecycle. It has no session cursor, schedule, resource admission,
-retry policy, raw source, or ambient cwd/env handshake fields.
+and daemon lifecycle. Generic Extension queries and commands carry namespace,
+version, method, and data. The host resolves the namespace and version; the
+extension strictly validates methods and data. `resources` version 1 owns
+resource submission and observation. No resource fields enter Core snapshots.
+See [资源扩展](resources.md) for its wire contract.
 
 ## Facts and live events
 
@@ -80,8 +83,10 @@ It neither repeats spawn nor invents a terminal fact.
 
 New Scope values are written before the execution transaction. A failure may
 leave an unreferenced Scope but cannot commit a dangling reference or candidate
-Fact. No Scope reclamation is implemented. Schema 2 rejects pre-FP IPC v4 schema 1
-without translating its incompatible snapshot or ownership semantics.
+Fact. No Scope reclamation is implemented. Schema 3 rejects schema 1. Schema 2 is accepted only after physical
+ownership recovery checks. Resource tables and the version guard are installed
+in one transaction, without rewriting Execution, Step, or Fact history. Older
+daemons reject version 3. The database path remains `cued-v4.db`.
 
 This is a new schema, not an extension of the IPC v3 database. The daemon
 creates the v4 store and archives the old database read-only;
