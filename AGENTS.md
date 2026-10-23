@@ -4,6 +4,9 @@ Cue 是持久、可观察的本地结构化进程执行内核。本仓库同时�
 
 ## 仓库开发 Skill
 
+判断是否需要 FP、起草、实质修订或审阅提案时，使用
+[cue-add-proposal](.agents/skills/cue-add-proposal/SKILL.md) 核对治理、证据与关键选择。
+
 修改或排查执行语义、IPC、持久化和 daemon 生命周期时，使用
 [cue-runtime-change](.agents/skills/cue-runtime-change/SKILL.md) 选择责任层与回归边界。
 日常使用 Cue 执行命令仍阅读 [产品 Skill](skills/cue/SKILL.md)。
