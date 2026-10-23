@@ -1,47 +1,26 @@
 # Cue client
 
-The client owns frontend context and transport correlation. It does not
-restore the v3 session cursor or send surface source to the daemon.
+The client owns frontend context and transport correlation. It does not restore the v3 session cursor or send surface source to the daemon.
 
 ## Explicit submission
 
-For each submission the client snapshots the frontend process `cwd`, Unicode
-environment, and current `umask` into a complete `Scope`. The ordered flow is:
+For each submission the client snapshots the frontend process `cwd`, Unicode environment, and current `umask` into a complete `Scope`. The ordered flow is:
 
 1. `PutScope(scope)` and receive its content hash plus durability class.
 2. Compile surface source with that explicit `ScopeHash`.
 3. `SubmitExecution(typed_spec)`, or the `resources` extension `submit` command
    containing the typed spec and execution-level needs. Allocation stays in cued.
 
-The daemon therefore never guesses which shell, terminal, session, or process
-environment a command came from. Environment values carry explicit sensitivity. The SQLite host rejects
-Sensitive values; ordinary variable names do not imply sensitivity.
+The daemon therefore never guesses which shell, terminal, session, or process environment a command came from. Environment values carry explicit sensitivity. The SQLite host rejects Sensitive values; ordinary variable names do not imply sensitivity.
 
 ## Identity and framing
 
-A connection creates one bounded `ClientId` and sends `Hello` before any other
-message. Every query receives a fresh non-zero `RequestId`. A logical command owns an
-immutable `PreparedCommand` with its ClientId, OperationId, and payload. Socket
-reconnection retries it with the original identity. Stream and multiplexed
-callers can retain and reuse prepared commands across connection replacement. The
-client uses the same strict length-prefixed IPC v5 framing as the daemon and
-surfaces typed protocol errors without retrying a rejected effect. Local socket
-connection and Hello waits, including reconnect Hello, are bounded to two
-seconds. A missing daemon points to `cued start`; a failed Hello points to
-`cued status` for diagnosis. Execution waits are not subject to that timeout.
+A connection creates one bounded `ClientId` and sends `Hello` before any other message. Every query receives a fresh non-zero `RequestId`. A logical command owns an immutable `PreparedCommand` with its ClientId, OperationId, and payload. Socket reconnection retries it with the original identity. Stream and multiplexed callers can retain and reuse prepared commands across connection replacement. The client uses the same strict length-prefixed IPC v5 framing as the daemon and surfaces typed protocol errors without retrying a rejected effect. Local socket connection and Hello waits, including reconnect Hello, are bounded to two seconds. A missing daemon points to `cued start`; a failed Hello points to `cued status` for diagnosis. Execution waits are not subject to that timeout.
 
-The sequential client buffers events that arrive while it waits for a matching
-response. Interactive frontends convert it to `MultiplexedClient`, whose
-single reader routes responses to concurrent callers by `RequestId` and sends
-facts/PTY events to a separate event queue.
+The sequential client buffers events that arrive while it waits for a matching response. Interactive frontends convert it to `MultiplexedClient`, whose single reader routes responses to concurrent callers by `RequestId` and sends facts/PTY events to a separate event queue.
 
 ## Language boundary
 
-`cue-language` returns `SurfaceCommand`; the client is the only layer that maps
-those intents into Query or Command envelopes. Schedule, retry,
-session, and approval policies remain external owners and cannot reappear as
-hidden daemon request fields.
+`cue-language` returns `SurfaceCommand`; the client is the only layer that maps those intents into Query or Command envelopes. Schedule, retry, session, and approval policies remain external owners and cannot reappear as hidden daemon request fields.
 
-Surface queries compile against a locally computed ScopeHash without PutScope.
-Only submission writes Scope. `tail N` uses TailOutput to read the final N
-retained bytes and returns their absolute offsets.
+Surface queries compile against a locally computed ScopeHash without PutScope. Only submission writes Scope. `tail N` uses TailOutput to read the final N retained bytes and returns their absolute offsets.

@@ -1,12 +1,8 @@
 # Cue
 
-Cue is a durable local execution kernel for work shared by people and agents.
-Clients submit a fully typed `ExecutionSpec`; `cued` owns process groups, PTYs,
-output, execution facts, idempotency, and restart recovery.
+Cue is a durable local execution kernel for work shared by people and agents. Clients submit a fully typed `ExecutionSpec`; `cued` owns process groups, PTYs, output, execution facts, idempotency, and restart recovery.
 
-Cue deliberately does not own session cursors, schedules, automatic retry,
-approvals, remote fleets, or a general DAG. Those systems may
-submit ordinary executions, but cannot extend the closed execution algebra.
+Cue deliberately does not own session cursors, schedules, automatic retry, approvals, remote fleets, or a general DAG. Those systems may submit ordinary executions, but cannot extend the closed execution algebra.
 
 ## Quick start
 
@@ -29,15 +25,9 @@ cue tui
 cue daemon status
 ```
 
-`cued start` runs in the background and returns only after that new instance
-answers IPC v5 Hello. Logs are appended to `<socket>.log`; the startup command
-prints the path and reports child startup errors. Use `cued start --fg` (or `-f`)
-for foreground logs or a service manager. `cued stop` waits for shutdown and
-`cued restart` waits for the requested replacement to become ready.
+`cued start` runs in the background and returns only after that new instance answers IPC v5 Hello. Logs are appended to `<socket>.log`; the startup command prints the path and reports child startup errors. Use `cued start --fg` (or `-f`) for foreground logs or a service manager. `cued stop` waits for shutdown and `cued restart` waits for the requested replacement to become ready.
 
-The installed commands are `cue`, `cue-client`, `cue-tui`, and `cued`.
-`CUE_SOCKET` selects a non-default local Unix socket. Remote transport, named
-targets, and service management are external wrappers rather than daemon state.
+The installed commands are `cue`, `cue-client`, `cue-tui`, and `cued`. `CUE_SOCKET` selects a non-default local Unix socket. Remote transport, named targets, and service management are external wrappers rather than daemon state.
 
 ## Execution semantics
 
@@ -48,9 +38,7 @@ targets, and service management are external wrappers rather than daemon state.
 - `Sequence`: run the second plan on success, failure, or always;
 - `Parallel`: join all branches or finish after any branch succeeds.
 
-Builtin and Run leaves receive stable `StepId` values such as `E7/S2`.
-Sequence threads the resulting Scope; Parallel forks one input Scope into every
-branch and never merges branch mutations.
+Builtin and Run leaves receive stable `StepId` values such as `E7/S2`. Sequence threads the resulting Scope; Parallel forks one input Scope into every branch and never merges branch mutations.
 
 The frontend language is direct argv, not an implicit shell:
 
@@ -64,10 +52,7 @@ cd crates/cue-core -> cargo test
 env set MODE=release -> printenv MODE
 ```
 
-`A=B command` patches only that process. In `A=B left |> right`, the right
-process does not inherit `A`. `command A=B` keeps `A=B` as a literal argument,
-and an assignment without an executable is rejected. Use the `env` builtin to
-change the Scope seen by later sequence steps.
+`A=B command` patches only that process. In `A=B left |> right`, the right process does not inherit `A`. `command A=B` keeps `A=B` as a literal argument, and an assignment without an executable is rejected. Use the `env` builtin to change the Scope seen by later sequence steps.
 
 Operators map as follows:
 
@@ -84,9 +69,7 @@ Operators map as follows:
 
 ## 执行级资源
 
-Configure static, JSON stdio, or NVIDIA providers in
-`$XDG_CONFIG_HOME/cue/daemon.toml` (fallback `~/.config/cue/daemon.toml`),
-or start with `cued start --config PATH`. No providers are enabled by default.
+Configure static, JSON stdio, or NVIDIA providers in `$XDG_CONFIG_HOME/cue/daemon.toml` (fallback `~/.config/cue/daemon.toml`), or start with `cued start --config PATH`. No providers are enabled by default.
 
 ```toml
 [[resources.providers]]
@@ -103,29 +86,13 @@ cue resources --json
 cue providers --json
 ```
 
-Needs apply to the whole Execution, including parallel branches and PTYs.
-Waiting executions have IDs and can be cancelled; disconnecting does not cancel
-them. Allocation and cleanup are independent of the program exit status.
-[资源配置与 provider 协议](docs/design/resources.md) covers quantities,
-GPU budgets, external providers, and recovery.
+Needs apply to the whole Execution, including parallel branches and PTYs. Waiting executions have IDs and can be cancelled; disconnecting does not cancel them. Allocation and cleanup are independent of the program exit status. [资源配置与 provider 协议](docs/design/resources.md) covers quantities, GPU budgets, external providers, and recovery.
 
 ## IPC v5 与持久化
 
-IPC v5 uses strict length-prefixed JSON on a private Unix socket. Every
-connection begins with `Hello`; read-only Queries use `RequestId`, while every
-side-effecting Command also carries an idempotent `OperationId`. The protocol
-contains explicit Scope, Execution, output, PTY attachment, and daemon
-lifecycle operations—no raw source or ambient session handshake.
+IPC v5 uses strict length-prefixed JSON on a private Unix socket. Every connection begins with `Hello`; read-only Queries use `RequestId`, while every side-effecting Command also carries an idempotent `OperationId`. The protocol contains explicit Scope, Execution, output, PTY attachment, and daemon lifecycle operations—no raw source or ambient session handshake.
 
-The default database is `$XDG_DATA_HOME/cue/cued-v4.db` (or the corresponding
-XDG fallback). Each running daemon exclusively owns its socket and database;
-use a distinct `--db PATH` for an independent instance with another socket.
-A legacy `cued.db` is renamed to a read-only
-`cued-v3-<timestamp>.db.archive` with its sidecars. Cue does not import or
-dual-read incompatible v3 semantics. Environment values carry explicit
-sensitivity; this host rejects Sensitive values before persistence. Variable
-names never determine classification. An uncertain physical Run after a crash
-blocks recovery instead of replaying it or inventing completion.
+The default database is `$XDG_DATA_HOME/cue/cued-v4.db` (or the corresponding XDG fallback). Each running daemon exclusively owns its socket and database; use a distinct `--db PATH` for an independent instance with another socket. A legacy `cued.db` is renamed to a read-only `cued-v3-<timestamp>.db.archive` with its sidecars. Cue does not import or dual-read incompatible v3 semantics. Environment values carry explicit sensitivity; this host rejects Sensitive values before persistence. Variable names never determine classification. An uncertain physical Run after a crash blocks recovery instead of replaying it or inventing completion.
 
 ## CLI
 
@@ -140,41 +107,15 @@ cue-client fg E7/S2 [--observe]
 cue-client restart|shutdown
 ```
 
-`cue run` and `cue fg` are shortcuts. `exec` and `run` wait for completion,
-then print retained output and return the execution exit status. Spawn, builtin,
-and runtime failures include a Step ID and diagnostic on stderr. They currently
-do not stream output or forward stdin during that wait. To run an interactive
-program, submit it in `cue tui`, press F3 and `f` to attach its selected PTY Step, or use
-`cue fg E7/S2` in another terminal. PTY control uses one controller and any number of observers; Ctrl-]
-detaches the controller CLI. Disconnecting the client does not cancel its work;
-use `list`/`show` to find it and `cancel`/`kill` to stop it.
+`cue run` and `cue fg` are shortcuts. `exec` and `run` wait for completion, then print retained output and return the execution exit status. Spawn, builtin, and runtime failures include a Step ID and diagnostic on stderr. They currently do not stream output or forward stdin during that wait. To run an interactive program, submit it in `cue tui`, press F3 and `f` to attach its selected PTY Step, or use `cue fg E7/S2` in another terminal. PTY control uses one controller and any number of observers; Ctrl-] detaches the controller CLI. Disconnecting the client does not cancel its work; use `list`/`show` to find it and `cancel`/`kill` to stop it.
 
-`cue tui` opens an execution sidebar and follows the selected Step's output
-without requiring an `:out` command. F2 focuses the sidebar; F3 focuses output;
-F4 returns to command input. With output focused, 1–6 select combined output,
-stdout, stderr, terminal, details, or activity. Use `[` / `]` to change Steps,
-PgUp/PgDn to scroll, and End to follow live output again. Delete cancels the
-selected execution, `K` force-cancels, and `f` / `o` attach / observe a PTY.
-Ctrl-] returns from PTY interaction to the workbench. F1 shows all shortcuts.
+`cue tui` opens an execution sidebar and follows the selected Step's output without requiring an `:out` command. F2 focuses the sidebar; F3 focuses output; F4 returns to command input. With output focused, 1–6 select combined output, stdout, stderr, terminal, details, or activity. Use `[` / `]` to change Steps, PgUp/PgDn to scroll, and End to follow live output again. Delete cancels the selected execution, `K` force-cancels, and `f` / `o` attach / observe a PTY. Ctrl-] returns from PTY interaction to the workbench. F1 shows all shortcuts.
 
-Tab completes input, ↑/↓ recall command history, and bracketed paste inserts
-multiline source for review before Enter submits it. Ctrl-Y copies the active
-view when the terminal supports OSC 52. Ctrl-B toggles the sidebar; narrow
-terminals show it when F2 is focused. A disconnected daemon leaves the last
-snapshot and input draft visible while the TUI reconnects automatically.
-Pending commands are never automatically resubmitted. Command history is stored
-under `$XDG_DATA_HOME/cue` (or `~/.local/share/cue`).
+Tab completes input, ↑/↓ recall command history, and bracketed paste inserts multiline source for review before Enter submits it. Ctrl-Y copies the active view when the terminal supports OSC 52. Ctrl-B toggles the sidebar; narrow terminals show it when F2 is focused. A disconnected daemon leaves the last snapshot and input draft visible while the TUI reconnects automatically. Pending commands are never automatically resubmitted. Command history is stored under `$XDG_DATA_HOME/cue` (or `~/.local/share/cue`).
 
-The bundled output store retains only the last 1 MiB per Step stream in memory.
-`exec`, `run`, and stream reads warn when the requested prefix has been evicted.
-All output bytes are lost on daemon restart even though execution history and
-output-range facts remain. These commands are not a complete log archive.
-An abrupt crash with an unresolved Run attempt can block startup; there is no
-supported abandon/repair command yet. See [recovery limits](docs/design/daemon.md#bootstrap).
+The bundled output store retains only the last 1 MiB per Step stream in memory. `exec`, `run`, and stream reads warn when the requested prefix has been evicted. All output bytes are lost on daemon restart even though execution history and output-range facts remain. These commands are not a complete log archive. An abrupt crash with an unresolved Run attempt can block startup; there is no supported abandon/repair command yet. See [recovery limits](docs/design/daemon.md#bootstrap).
 
-Cue passes `$VAR` and `~` literally when they reach Cue source; it does not
-perform shell expansion. Changes through `cd`/`env`/`umask` apply only within
-one composed execution, not to the invoking shell or the next TUI submission.
+Cue passes `$VAR` and `~` literally when they reach Cue source; it does not perform shell expansion. Changes through `cd`/`env`/`umask` apply only within one composed execution, not to the invoking shell or the next TUI submission.
 
 ## Repository structure
 
@@ -191,9 +132,7 @@ one composed execution, not to the invoking shell or the next TUI submission.
 
 Development gates:
 
-Changes to Cue's public contracts start with a numbered
-[Feature Proposal](fps/README.md). Candidate proposals live directly in `fps/`;
-there is no separate drafts directory.
+Changes to Cue's public contracts start with a numbered [Feature Proposal](fps/README.md). Candidate proposals live directly in `fps/`; there is no separate drafts directory.
 
 ```bash
 just check
@@ -203,36 +142,20 @@ just package-smoke
 just npm-package-smoke
 ```
 
-Repository guidance: [协作约定](AGENTS.md)、[愿景](VISION.md)、
-[设计原则](PRINCIPLES.md)、[贡献指南](CONTRIBUTING.md)。
+Repository guidance: [协作约定](AGENTS.md)、[愿景](VISION.md)、 [设计原则](PRINCIPLES.md)、[贡献指南](CONTRIBUTING.md)。
 
-See [architecture](ARCHITECTURE.md), [design](docs/design/README.md),
-[testing](docs/testing.md), and the canonical [agent Skill](skills/cue/SKILL.md).
+See [architecture](ARCHITECTURE.md), [design](docs/design/README.md), [testing](docs/testing.md), and the canonical [agent Skill](skills/cue/SKILL.md).
 
 ### Recovering after a daemon upgrade
 
-Replacing the `cued` executable does not replace an already running daemon.
-If `status`, `stop`, or `restart` reports that the socket is listening but the
-IPC v5 handshake failed, stop the old process independently of its protocol:
+Replacing the `cued` executable does not replace an already running daemon. If `status`, `stop`, or `restart` reports that the socket is listening but the IPC v5 handshake failed, stop the old process independently of its protocol:
 
 ```sh
 cued stop --force
 cued start
 ```
 
-Use the same `--socket PATH` for both commands when using a custom socket.
-`stop --force` sends SIGTERM to the same-user process identified by the socket's
-kernel peer credentials and waits up to fifteen seconds for exit. It does not send
-SIGKILL, delete sockets, or use PID files. A timeout is a failed stop, not a
-success; if a service manager restarts the process, stop that service first.
-Normal shutdown still drains owned Runs when receiving SIGTERM.
-`cued start` returns after background readiness. A service manager should run
-`cued start --fg` and own its restart policy.
-When restarting a custom database, also pass the original `--db PATH` to `start`.
-The `cued-v4.db` path is retained. Schema 2 execution history is preserved;
-resource tables and schema version 3 are installed transactionally after
-ownership checks. Old daemons reject the new schema. Preserve `--config PATH`
-when manually starting a replacement; `restart` forwards it automatically.
+Use the same `--socket PATH` for both commands when using a custom socket. `stop --force` sends SIGTERM to the same-user process identified by the socket's kernel peer credentials and waits up to fifteen seconds for exit. It does not send SIGKILL, delete sockets, or use PID files. A timeout is a failed stop, not a success; if a service manager restarts the process, stop that service first. Normal shutdown still drains owned Runs when receiving SIGTERM. `cued start` returns after background readiness. A service manager should run `cued start --fg` and own its restart policy. When restarting a custom database, also pass the original `--db PATH` to `start`. The `cued-v4.db` path is retained. Schema 2 execution history is preserved; resource tables and schema version 3 are installed transactionally after ownership checks. Old daemons reject the new schema. Preserve `--config PATH` when manually starting a replacement; `restart` forwards it automatically.
 
 ## 项目演进
 
