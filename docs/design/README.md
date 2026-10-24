@@ -1,7 +1,6 @@
 # Cue design index
 
-These documents describe the shipped IPC v5 architecture. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the normative
-contract; these documents describe its implementation.
+These documents describe the shipped IPC v5 architecture. [FP-0001](../../fps/FP-0001-structured-execution-kernel.md) owns the normative contract; these documents describe its implementation.
 
 - [Execution kernel](kernel.md): product boundary, closed plan ADT, Scope,
   process environment, PTY topology, and Composition laws.
