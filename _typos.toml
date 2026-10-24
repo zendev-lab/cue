@@ -17,4 +17,4 @@ transprt = "transprt"
 extensons = "extensons"
 
 [files]
-extend-exclude = ["docs/research/"]
+extend-exclude = [".agents/notes/research/"]

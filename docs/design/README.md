@@ -17,7 +17,4 @@ These documents describe the shipped IPC v5 architecture. [FP-0001](../../fps/FP
 - [Client](client.md): frontend Scope snapshots, typed dispatch, correlation,
   and multiplexed response/event routing.
 - [Frontends](frontends.md): CLI, PTY passthrough, TUI, and extension boundary.
-
-Research notes under `docs/research/` are historical inputs, not current API or compatibility promises.
-
 - [执行级资源扩展](resources.md): provider 配置、通用 IPC 接入、预算及安全清理。
