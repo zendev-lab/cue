@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
 
       - name: Check PR title
-        uses: zendev-lab/zendev/actions/validate-title@91087d4d4e9841aaf8cead8b7c6d294a3db63b10 # v0.4.0
+        uses: zendev-lab/zendev/actions/validate-title@f3b5d8e7c55524e34be316c9824275ad43e8de56 # v0.5.0
         with:
           text: ${{ github.event.pull_request.title }}
           profile: zendev
@@ -31,7 +31,7 @@ jobs:
         if: >-
           github.event.pull_request.user.login != 'renovate[bot]' &&
           github.event.pull_request.user.login != 'zendev-release[bot]'
-        uses: zendev-lab/zendev/actions/validate-body@91087d4d4e9841aaf8cead8b7c6d294a3db63b10 # v0.4.0
+        uses: zendev-lab/zendev/actions/validate-body@f3b5d8e7c55524e34be316c9824275ad43e8de56 # v0.5.0
         with:
           body: ${{ github.event.pull_request.body }}
 

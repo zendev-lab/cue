@@ -1,7 +1,6 @@
 # Test architecture
 
-Cue tests protect observable product contracts at the closest owning boundary. Repository policy
-is checked by dedicated static tools, not by tests that mirror the current source tree.
+Cue tests protect observable product contracts at the closest owning boundary. Repository policy is checked by dedicated static tools, not by tests that mirror the current source tree.
 
 ## Lanes
 
@@ -13,32 +12,17 @@ is checked by dedicated static tools, not by tests that mirror the current sourc
 | npm Skill package | `scripts/smoke_npm_package.mjs` | Packed file allowlist, version alignment, exported root, and canonical Skill bytes |
 | Repository policy | `just pre-commit` | Formatting, lint, workflow syntax and security, links, spelling, and commit messages |
 
-Keep Linux-only process behavior in the integration lane instead of replacing it with a mock that
-cannot exercise `/proc`, pidfd, signal, socket, or lock semantics. Keep package smoke separate from
-source execution: it must install the produced artifact and invoke the public command names.
+Keep Linux-only process behavior in the integration lane instead of replacing it with a mock that cannot exercise `/proc`, pidfd, signal, socket, or lock semantics. Keep package smoke separate from source execution: it must install the produced artifact and invoke the public command names.
 
-Daemon process tests cover default background readiness, explicit foreground
-mode, log-visible startup failure, competing starts, independent database
-ownership, and stop/restart completion. CLI process tests cover surfaced failure
-reasons and retained-output truncation. Package smoke uses the default background
-command without a shell `&` or readiness retry, then verifies immediate use after
-restart. Its explicit `CUE_SOCKET` keeps inherited endpoints outside the test.
+Daemon process tests cover default background readiness, explicit foreground mode, log-visible startup failure, competing starts, independent database ownership, and stop/restart completion. CLI process tests cover surfaced failure reasons and retained-output truncation. Package smoke uses the default background command without a shell `&` or readiness retry, then verifies immediate use after restart. Its explicit `CUE_SOCKET` keeps inherited endpoints outside the test.
 
 ## Tests versus static policy
 
-Code tests assert return values, state transitions, persisted effects, boundary calls, process exit
-status, output, and compatibility behavior. They do not read the repository's current Rust source,
-workflow YAML, manifests, Just recipes, or documentation and assert that selected text fragments
-still exist.
+Code tests assert return values, state transitions, persisted effects, boundary calls, process exit status, output, and compatibility behavior. They do not read the repository's current Rust source, workflow YAML, manifests, Just recipes, or documentation and assert that selected text fragments still exist.
 
-If a constraint is about repository shape, use the standard static tool that owns that format. If
-wording in a design document is not itself a public serialized contract, review or generate the
-document instead of mirroring its prose in a unit test. Use complete golden files only when the
-whole representation is the contract.
+If a constraint is about repository shape, use the standard static tool that owns that format. If wording in a design document is not itself a public serialized contract, review or generate the document instead of mirroring its prose in a unit test. Use complete golden files only when the whole representation is the contract.
 
-Mutation testing is a useful continuous-evaluation lane once it has an owner, command, budget, and
-reporting workflow. Until then, Cue does not commit a partial configuration that excludes the most
-important modules while implying that mutation testing is an active gate.
+Mutation testing is a useful continuous-evaluation lane once it has an owner, command, budget, and reporting workflow. Until then, Cue does not commit a partial configuration that excludes the most important modules while implying that mutation testing is an active gate.
 
 ## Gates
 
@@ -49,11 +33,6 @@ important modules while implying that mutation testing is an active gate.
 - `just npm-package-smoke` packs and installs `@zendev-lab/cue`, then verifies the canonical Skill.
 - `just ci` is the serial local aggregate of those gates; hosted CI keeps independent lanes parallel.
 
-The primary toolchain is pinned in `rust-toolchain.toml` and advances through a dedicated Renovate
-change instead of making unrelated pull requests absorb a new stable compiler implicitly. Hosted CI
-also runs the Rust 1.95 MSRV check as its own job, so primary-toolchain and compatibility failures
-remain attributable to the lane that owns them.
+The primary toolchain is pinned in `rust-toolchain.toml` and advances through a dedicated Renovate change instead of making unrelated pull requests absorb a new stable compiler implicitly. Hosted CI also runs the Rust 1.95 MSRV check as its own job, so primary-toolchain and compatibility failures remain attributable to the lane that owns them.
 
-When reviewing a test, ask what observable regression becomes invisible if it is removed, whether a
-wording-only refactor would break it, whether fail-closed and recovery behavior have negative paths,
-and whether the test runs at the boundary that owns the contract.
+When reviewing a test, ask what observable regression becomes invisible if it is removed, whether a wording-only refactor would break it, whether fail-closed and recovery behavior have negative paths, and whether the test runs at the boundary that owns the contract.

@@ -1,4 +1,4 @@
-//! Cue's IPC v4 local execution daemon.
+//! Cue's IPC v5 local execution daemon.
 
 mod dirs;
 mod host;
@@ -39,3 +39,5 @@ mod tests {
         assert!(!crate::version().is_empty());
     }
 }
+
+mod extensions;

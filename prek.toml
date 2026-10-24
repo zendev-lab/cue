@@ -16,18 +16,10 @@ hooks = [
 
 [[repos]]
 repo = "https://github.com/tombi-toml/tombi-pre-commit"
-rev = "v0.9.20"
+rev = "v1.9.0"
 hooks = [
-  {
-    id = "tombi-format",
-    exclude = "^Cargo\\.lock$",
-    stages = ["pre-commit"]
-  },
-  {
-    id = "tombi-lint",
-    args = ["--error-on-warnings"],
-    stages = ["pre-commit"]
-  },
+  { id = "tombi-format", exclude = "^Cargo\\.lock$", stages = ["pre-commit"] },
+  { id = "tombi-lint", args = ["--error-on-warnings"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
@@ -37,42 +29,33 @@ hooks = [{ id = "actionlint", stages = ["pre-commit"] }]
 
 [[repos]]
 repo = "https://github.com/zizmorcore/zizmor-pre-commit"
-rev = "v1.29.0"
+rev = "v1.31.1"
 hooks = [
-  {
-    id = "zizmor",
-    args = ["--min-severity", "medium"],
-    stages = ["pre-commit"]
-  },
+  { id = "zizmor", args = ["--min-severity", "medium"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
 repo = "https://github.com/lycheeverse/lychee"
 rev = "lychee-v0.24.2"
 hooks = [
-  {
-    id = "lychee",
-    files = "\\.md$",
-    args = ["--offline", "--scheme", "file", "--no-progress"],
-    stages = ["pre-commit"]
-  },
+  { id = "lychee", files = "\\.md$", args = ["--offline", "--scheme", "file", "--no-progress"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
 repo = "https://github.com/crate-ci/typos"
-rev = "v1.48.0"
+rev = "v1.51.1"
 hooks = [
   { id = "typos", args = ["--force-exclude"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
 repo = "https://github.com/asamarts/alint-pre-commit"
-rev = "v0.17.0"
+rev = "v0.20.0"
 hooks = [{ id = "alint", stages = ["pre-commit"] }]
 
 [[repos]]
 repo = "https://github.com/zendev-lab/zendev"
-rev = "v0.4.0"
+rev = "v0.5.0"
 hooks = [
   { id = "zendev-proposal-check", stages = ["pre-commit"] },
   { id = "zendev-message-check", stages = ["commit-msg"] },
@@ -81,22 +64,6 @@ hooks = [
 [[repos]]
 repo = "local"
 hooks = [
-  {
-    id = "cargo-fmt",
-    name = "cargo-fmt",
-    entry = "cargo fmt --all --",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false,
-    stages = ["pre-commit"]
-  },
-  {
-    id = "cargo-clippy",
-    name = "cargo-clippy",
-    entry = "cargo clippy --all-targets -- -D warnings",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false,
-    stages = ["pre-commit"]
-  },
+  { id = "cargo-fmt", name = "cargo-fmt", entry = "cargo fmt --all --", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
+  { id = "cargo-clippy", name = "cargo-clippy", entry = "cargo clippy --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
 ]

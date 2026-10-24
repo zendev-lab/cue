@@ -5,23 +5,23 @@ prefix = "FP"
 number_field = "fp"
 documents_dir = "fps"
 schema = "schemas/fp.schema.json"
-index = "fps-index.json"
 metadata_title = "plain"
 
-[templates]
+[proposal.templates]
 Feature = "templates/fp.md"
 Governance = "templates/fp.md"
 
-[graph]
+[proposal.graph]
 # Cue records relations without an Accepted/Superseded lifecycle.
 fields = ["supersedes"]
 
-[defines]
+[proposal.defines]
 field = "defines"
 anchor_prefix = "term-"
 id_pattern = "[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
 
-[index]
+[proposal.index]
+path = "fps-index.json"
 version = 2
 entries_key = "fps"
 fields = [

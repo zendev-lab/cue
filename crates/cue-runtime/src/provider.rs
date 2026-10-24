@@ -119,12 +119,14 @@ pub struct SpawnRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnContext {
     pub cwd: cue_core::AbsolutePath,
+    pub environment: BTreeMap<String, String>,
 }
 
 impl SpawnContext {
     pub fn local(scope: &Scope) -> Self {
         Self {
             cwd: scope.cwd().clone(),
+            environment: BTreeMap::new(),
         }
     }
 }

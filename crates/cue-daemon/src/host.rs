@@ -24,6 +24,7 @@ enum HostCommand {
         socket: PathBuf,
         database: PathBuf,
         foreground: bool,
+        config: Option<PathBuf>,
     },
     GatewayStdio {
         socket: PathBuf,
@@ -73,11 +74,12 @@ async fn run(command: HostCommand) -> Result<i32> {
             socket,
             database,
             foreground,
+            config,
         } => {
             if foreground {
-                serve(socket, database).await?;
+                serve_with_config(socket, database, config).await?;
             } else {
-                crate::startup::start(&socket, &database).await?;
+                crate::startup::start(&socket, &database, config.as_deref()).await?;
             }
             Ok(0)
         }
@@ -116,7 +118,24 @@ async fn run(command: HostCommand) -> Result<i32> {
     }
 }
 
+#[cfg(test)]
 async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
+    serve_with_config(socket, database, None).await
+}
+
+async fn serve_with_config(
+    socket: PathBuf,
+    database: PathBuf,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config: cue_resources::Config = match &config_path {
+        Some(path) => toml::from_str(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("read config {}", path.display()))?,
+        )
+        .context("parse daemon resource configuration")?,
+        None => cue_resources::Config::default(),
+    };
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
     dirs::ensure_private_parent(&socket)?;
@@ -138,7 +157,7 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
     let connection = Connection::open(&database)
         .with_context(|| format!("open v4 database {}", database.display()))?;
     let store = cue_store_sqlite::Store::from_connection(connection)?;
-    let service = DaemonService::from_store(store)?;
+    let service = DaemonService::from_store_with_resources(store, config.resources)?;
     service.recover().await?;
 
     let listener = UnixListener::bind(&socket)
@@ -147,22 +166,22 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
     let socket_guard = SocketGuard(socket.clone());
     let mut lifecycle = service.subscribe_lifecycle();
     let mut connections = tokio::task::JoinSet::new();
-    tracing::info!(socket = %socket.display(), database = %database.display(), "IPC v4 daemon ready");
+    tracing::info!(socket = %socket.display(), database = %database.display(), "IPC v5 daemon ready");
 
     let signal = loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept IPC v4 connection")?;
+                let (stream, _) = accepted.context("accept IPC v5 connection")?;
                 let service = service.clone();
                 connections.spawn(async move {
                     if let Err(error) = serve_stream(service, stream).await {
-                        tracing::warn!(%error, "IPC v4 connection closed with error");
+                        tracing::warn!(%error, "IPC v5 connection closed with error");
                     }
                 });
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    tracing::warn!(%error, "IPC v4 connection task failed");
+                    tracing::warn!(%error, "IPC v5 connection task failed");
                 }
             }
             signal = lifecycle.recv() => {
@@ -206,7 +225,12 @@ async fn serve(socket: PathBuf, database: PathBuf) -> Result<()> {
         target_instance_id, ..
     } = signal
     {
-        crate::startup::spawn_daemon(&socket, &database, &target_instance_id)?;
+        crate::startup::spawn_daemon(
+            &socket,
+            &database,
+            &target_instance_id,
+            config_path.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -283,18 +307,18 @@ fn recovery_hint(socket: &Path) -> String {
          cued stop --force --socket {quoted}\n  \
          cued start --socket {quoted}\n\
          start runs in the background; preserve any custom --db setting (use --fg for a supervisor).\n\
-         First default v4 start archives the legacy database without importing old sessions."
+         Legacy cued.db is archived; execution history in cued-v4.db is preserved."
     )
 }
 
 async fn control_hello(stream: &mut UnixStream, socket: &Path) -> Result<String> {
     tokio::time::timeout(CONTROL_TIMEOUT, hello(stream))
         .await
-        .context("IPC v4 handshake timed out")
+        .context("IPC v5 handshake timed out")
         .and_then(|result| result)
         .map_err(|error| {
             anyhow::anyhow!(
-                "IPC v4 handshake failed at {}: {error:#}\n{}",
+                "IPC v5 handshake failed at {}: {error:#}\n{}",
                 socket.display(),
                 recovery_hint(socket)
             )
@@ -304,11 +328,11 @@ async fn control_hello(stream: &mut UnixStream, socket: &Path) -> Result<String>
 async fn status(socket: &Path) -> (i32, String) {
     match connect_control(socket).await {
         Ok(mut stream) => match control_hello(&mut stream, socket).await {
-            Ok(_) => (0, format!("running {} (IPC v4)", socket.display())),
+            Ok(_) => (0, format!("running {} (IPC v5)", socket.display())),
             Err(error) => (
                 1,
                 format!(
-                    "listening {} but IPC v4 unavailable: {error:#}",
+                    "listening {} but IPC v5 unavailable: {error:#}",
                     socket.display()
                 ),
             ),
@@ -400,7 +424,7 @@ where
                     ..
                 }),
         } if actual == request_id => Ok(instance_id),
-        message => bail!("unexpected IPC v4 Hello response: {message:?}"),
+        message => bail!("unexpected IPC v5 Hello response: {message:?}"),
     }
 }
 
@@ -421,7 +445,7 @@ where
     reader.read_exact(&mut header).await?;
     let length = u32::from_be_bytes(header) as usize;
     if length > cue_protocol::MAX_MESSAGE_SIZE {
-        bail!("daemon message exceeds IPC v4 limit")
+        bail!("daemon message exceeds IPC v5 limit")
     }
     let mut frame = Vec::with_capacity(4 + length);
     frame.extend_from_slice(&header);
@@ -539,6 +563,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<HostCommand> {
         .map(PathBuf::from)
         .unwrap_or_else(dirs::socket_path);
     let mut database = None;
+    let mut config = None;
     let mut foreground = false;
     let mut force = false;
     let mut options = options.into_iter();
@@ -550,6 +575,13 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<HostCommand> {
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("--socket expects a path"))?,
                 )
+            }
+            Some("--config") if command == "start" && config.is_none() => {
+                config = Some(PathBuf::from(
+                    options
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--config expects a path"))?,
+                ));
             }
             Some("--db") if command == "start" => {
                 database = Some(PathBuf::from(
@@ -574,6 +606,19 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<HostCommand> {
             })
             .context("resolve daemon database path")?,
             foreground,
+            config: config
+                .or_else(|| {
+                    std::env::var_os("XDG_CONFIG_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
+                        })
+                        .map(|p| p.join("cue/daemon.toml"))
+                        .filter(|p| p.exists())
+                })
+                .map(std::path::absolute)
+                .transpose()
+                .context("resolve config path")?,
         },
         "gateway-stdio" => HostCommand::GatewayStdio { socket },
         "status" => HostCommand::Status { socket },
@@ -606,7 +651,7 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "cued {}\n\nUsage:\n  cued start [--fg|-f] [--socket PATH] [--db PATH]\n  cued status|restart [--socket PATH]\n  cued stop [--force] [--socket PATH]\n  cued gateway-stdio [--socket PATH]\n  cued --version\n\nstart runs in the background and returns after IPC v4 readiness.\n  --fg/-f runs in the foreground for terminals and service managers.\n  stop waits for shutdown; restart waits for the requested successor to be ready.\n  Background logs are appended to <socket>.log.\n\nThe daemon serves only strict IPC v4 and uses a fresh v4 SQLite database.\n  stop --force sends SIGTERM to the same-user socket peer without IPC and waits for exit; it never sends SIGKILL.",
+        "cued {}\n\nUsage:\n  cued start [--fg|-f] [--socket PATH] [--db PATH] [--config PATH]\n  cued status|restart [--socket PATH]\n  cued stop [--force] [--socket PATH]\n  cued gateway-stdio [--socket PATH]\n  cued --version\n\nstart runs in the background and returns after IPC v5 readiness.\n  --fg/-f runs in the foreground for terminals and service managers.\n  stop waits for shutdown; restart waits for the requested successor to be ready.\n  Background logs are appended to <socket>.log.\n\nThe daemon serves only strict IPC v5 and retains cued-v4.db with guarded schema 3.\n  stop --force sends SIGTERM to the same-user socket peer without IPC and waits for exit; it never sends SIGKILL.",
         crate::version()
     );
 }
@@ -645,7 +690,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unix_host_serves_v4_control_and_removes_its_socket_on_shutdown() {
+    async fn unix_host_serves_v5_control_and_removes_its_socket_on_shutdown() {
         let root = PathBuf::from("/tmp").join(format!("cued-host-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let socket = root.join("cued.sock");
