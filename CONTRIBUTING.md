@@ -50,4 +50,4 @@ uvx prek run --all-files
 🐛 fix(client): correct wait command exit codes
 ```
 
-提案 PR 新增、修订、替代分别使用 `propose`、`revise`、`supersede`，不表示生命周期状态。提交描述继续使用中文。使用 [仓库 PR 模板](.github/pull_request_template.md)，保留所需章节，说明问题、最终变更、实际验证及后续工作。默认以 Draft PR 交付，CI、合并和发布状态分别报告。安全漏洞请私下报告，流程见 [SECURITY.md](SECURITY.md)。
+提案 PR 新增、修订、替代分别使用 `propose`、`revise`、`supersede`，不表示生命周期状态。提交描述继续使用中文。使用 [仓库 PR 模板](.github/pull_request_template.md)，保留所需章节，说明问题、最终变更、必要影响及后续工作。正文不罗列本地测试情况、命令或 CI 状态；可选章节没有内容时省略。安全漏洞请私下报告，流程见 [SECURITY.md](SECURITY.md)。
