@@ -14,9 +14,9 @@ socket 执行停止、重启、迁移或安装。
 历史研究不是当前产品承诺。Core、store、protocol 和 runtime 的完整行为 suite
 用于回归验证；这不是对每个实现分支完成形式化验证或对全部 TUI 交互做过屏幕测试的声明。
 
-[FP-0001](../../fps/FP-0001-structured-execution-kernel.md#兼容性) 明确切断 v3
+[FP-0001](../../../fps/FP-0001-structured-execution-kernel.md#兼容性) 明确切断 v3
 协议以及 session/schedule/resource/target 的内核兼容入口，但没有要求删除 `--fg`
-或改成默认前台。[FP-0000](../../fps/FP-0000-governance.md#设计) 明确允许恢复
+或改成默认前台。[FP-0000](../../../fps/FP-0000-governance.md#设计) 明确允许恢复
 既有契约的缺陷修复不新增 FP。本次恢复启动行为，不修改执行代数或恢复 v3 codec。
 
 ## 本次修复
@@ -37,17 +37,17 @@ socket 执行停止、重启、迁移或安装。
 
 对应行为测试：
 
-- [daemon lifecycle](../../crates/cue-daemon/tests/lifecycle.rs)：后台/前台、就绪身份、启动错误、竞争启动、数据库排他与 drain；
-- [control recovery](../../crates/cue-daemon/tests/control_recovery.rs)：不兼容/无响应 listener、信号退出失败、丢失 ACK；
-- [CLI workflows](../../crates/cue-cli/tests/user_workflows.rs)：错误原因、截断提示、聚合命令、无 HOME 的显式路径；
-- [installed package smoke](../../scripts/smoke_package.sh)：wheel/sdist 的真实命令入口，显式隔离 CUE_SOCKET。
+- [daemon lifecycle](../../../crates/cue-daemon/tests/lifecycle.rs)：后台/前台、就绪身份、启动错误、竞争启动、数据库排他与 drain；
+- [control recovery](../../../crates/cue-daemon/tests/control_recovery.rs)：不兼容/无响应 listener、信号退出失败、丢失 ACK；
+- [CLI workflows](../../../crates/cue-cli/tests/user_workflows.rs)：错误原因、截断提示、聚合命令、无 HOME 的显式路径；
+- [installed package smoke](../../../scripts/smoke_package.sh)：wheel/sdist 的真实命令入口，显式隔离 CUE_SOCKET。
 
 ## 仍需单独处理的用户体验缺口
 
 ### 高优先级：等待期间没有实时输出，也不传 stdin
 
-[script runner](../../crates/cue-client/src/script_runner.rs) 与
-[exec](../../crates/cue-client/src/cli.rs) 仍先 WaitExecution，再读取输出。
+[script runner](../../../crates/cue-client/src/script_runner.rs) 与
+[exec](../../../crates/cue-client/src/cli.rs) 仍先 WaitExecution，再读取输出。
 隔离运行 `print → sleep 1s → print` 时，前 400 ms 看不到首段输出，约 1.034 秒后
 才一次得到两行。需要交互输入的 PTY 程序也不会被这个等待路径自动 attach。
 
@@ -56,7 +56,7 @@ runner 的流式输出、stdin、Ctrl-C 与 detach 契约；不能仅靠把等�
 
 ### 高优先级：输出字节不是持久日志
 
-[MemoryOutputStore](../../crates/cue-runtime/src/output.rs) 每个 Step/stream
+[MemoryOutputStore](../../../crates/cue-runtime/src/output.rs) 每个 Step/stream
 只保留最后 1 MiB。daemon 重启后缓冲区为空，执行事实与 OutputAppended ranges 则
 仍持久存在。当前截断告警只解决仍可由返回 offset 证明的前缀丢失；重启后的空缓冲
 不能证明原执行没有输出。
@@ -66,7 +66,7 @@ provider、保留策略和“已不可用”的明确查询表达需要独立设
 
 ### 高优先级：有未知物理 attempt 的崩溃可能阻断再次启动
 
-[daemon bootstrap](../design/daemon.md#bootstrap) 与 store recovery 拒绝对
+[daemon bootstrap](../../../docs/design/daemon.md#bootstrap) 与 store recovery 拒绝对
 未知 Run attempt 重放。这符合 FP 的 quiescence 要求，但当前没有 operator repair /
 abandon 入口，因此“持久执行”不能被理解为任意 crash 后都可以无操作恢复。
 
@@ -75,7 +75,7 @@ abandon 入口，因此“持久执行”不能被理解为任意 crash 后都�
 
 ### 中优先级：TUI 对其他客户端提交的工作没有全局自动刷新
 
-[TUI](../../crates/cue-tui/src/lib.rs) 只对本连接新提交的 Execution 调用
+[TUI](../../../crates/cue-tui/src/lib.rs) 只对本连接新提交的 Execution 调用
 WatchExecution。初次 list 不会为已有执行建 watch，也没有定时全局刷新；daemon
 只向已 watch 的连接推送对应 facts。因此共享使用时，其他客户端的新任务或已有
 任务的变化需要手动 `:jobs`。这是调用路径检查结论，没有宣称完成视觉交互验证。

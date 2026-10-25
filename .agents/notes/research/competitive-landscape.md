@@ -2,7 +2,7 @@
 
 > Historical research only. Commands, wrappers, and product capabilities below
 > describe the pre-v4 design, not the current release. Use the
-> [design index](../design/README.md) and [README](../../README.md) for supported behavior.
+> [design index](../../../docs/design/README.md) and [README](../../../README.md) for supported behavior.
 
 
 > **调研日期**: 2025-07
