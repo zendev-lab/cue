@@ -6,7 +6,7 @@
 
 改变公开契约前使用 [FP 模板](templates/fp.md) 提交独立提案 PR。候选直接放在 `fps/`；不增加单独的草案目录或采纳状态。实现 PR 关联对应提案，并分别提供验证证据。
 
-提案标题及正文使用中文，PR 标题使用英文、正文沿用中文模板。代码标识与 zendev 语法按原样保留，具体写作规则见 AGENTS.md。
+提案、提交和 PR 的语言与写作规则统一见 [AGENTS.md 的“写作与标题”](AGENTS.md#写作与标题)。代码标识与 zendev 语法按原样保留。
 
 ## 本地准备
 
@@ -42,7 +42,7 @@ uvx prek run --all-files
 
 ## 提交与 PR
 
-提交和 PR 遵循 zendev profile，保留 emoji、type 和可选 scope。PR 标题使用英文：
+提交和 PR 遵循 zendev profile，保留 emoji、type 和可选 scope；语言规则以 [AGENTS.md 的“写作与标题”](AGENTS.md#写作与标题) 为准。示例：
 
 ```text
 📝 docs(fp): propose execution-level resource management
@@ -50,4 +50,4 @@ uvx prek run --all-files
 🐛 fix(client): correct wait command exit codes
 ```
 
-提案 PR 新增、修订、替代分别使用 `propose`、`revise`、`supersede`，不表示生命周期状态。提交描述继续使用中文。使用 [仓库 PR 模板](.github/pull_request_template.md)，保留所需章节，说明问题、最终变更、实际验证及后续工作。默认以 Draft PR 交付，CI、合并和发布状态分别报告。安全漏洞请私下报告，流程见 [SECURITY.md](SECURITY.md)。
+提案 PR 新增、修订、替代分别使用 `propose`、`revise`、`supersede`，不表示生命周期状态。使用 [仓库 PR 模板](.github/pull_request_template.md)，保留所需章节，说明问题、最终变更、必要影响及后续工作。正文不罗列本地测试情况、命令或 CI 状态；可选章节没有内容时省略。安全漏洞请私下报告，流程见 [SECURITY.md](SECURITY.md)。
