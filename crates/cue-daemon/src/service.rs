@@ -83,6 +83,27 @@ impl StoreProvider {
             .ok_or_else(|| RuntimeError::infrastructure("execution ID space exhausted"))
     }
 
+    fn replay_operation(
+        &self,
+        client: &ClientId,
+        operation: &OperationId,
+        command: &Command,
+    ) -> Result<Option<ResponsePayload>, RuntimeError> {
+        let Some(saved) = self
+            .lock_store()?
+            .get_operation(client, operation)
+            .map_err(store_error)?
+        else {
+            return Ok(None);
+        };
+        if saved.fingerprint
+            != cue_store_sqlite::command_fingerprint(command).map_err(store_error)?
+        {
+            return Err(operation_conflict());
+        }
+        saved.response.map(Some).ok_or_else(operation_expired)
+    }
+
     fn record_durable_operation(
         &self,
         client: &ClientId,
@@ -1313,19 +1334,12 @@ impl DaemonConnection {
         let client = self.require_client()?.clone();
         match &command {
             Command::Extension(request) => {
-                if let Some(saved) = self
+                if let Some(response) = self
                     .service
                     .store
-                    .lock_store()?
-                    .get_operation(&client, &operation)
-                    .map_err(store_error)?
+                    .replay_operation(&client, &operation, &command)?
                 {
-                    if saved.fingerprint
-                        != cue_store_sqlite::command_fingerprint(&command).map_err(store_error)?
-                    {
-                        return Err(operation_conflict());
-                    }
-                    return saved.response.ok_or_else(operation_expired);
+                    return Ok(response);
                 }
                 let extension = self.service.extensions.resolve(request)?;
                 let prepared = extension
@@ -1608,19 +1622,12 @@ impl DaemonConnection {
         id: ExecutionId,
         mode: cue_core::CancelMode,
     ) -> Result<ResponsePayload, RuntimeError> {
-        if let Some(saved) = self
+        if let Some(response) = self
             .service
             .store
-            .lock_store()?
-            .get_operation(client, operation)
-            .map_err(store_error)?
+            .replay_operation(client, operation, command)?
         {
-            if saved.fingerprint
-                != cue_store_sqlite::command_fingerprint(command).map_err(store_error)?
-            {
-                return Err(operation_conflict());
-            }
-            return saved.response.ok_or_else(operation_expired);
+            return Ok(response);
         }
         let task = self.service.tasks.lock().await.get(&id).cloned();
         let task = match task {
@@ -1697,19 +1704,11 @@ impl DaemonConnection {
         step: StepId,
         replay_bytes: u32,
     ) -> Result<ResponsePayload, RuntimeError> {
-        if let Some(saved) = self
+        if let Some(response) = self
             .service
             .store
-            .lock_store()?
-            .get_operation(client, operation)
-            .map_err(store_error)?
+            .replay_operation(client, operation, command)?
         {
-            if saved.fingerprint
-                != cue_store_sqlite::command_fingerprint(command).map_err(store_error)?
-            {
-                return Err(operation_conflict());
-            }
-            let response = saved.response.ok_or_else(operation_expired)?;
             if let ResponsePayload::Ok(ResultPayload::PtyAttached { attachment, .. }) = &response {
                 let attachments = self.service.lock_attachments()?;
                 if require_attachment_owner(&attachments, *attachment, client, self.id).is_err() {
