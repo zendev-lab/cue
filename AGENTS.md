@@ -24,9 +24,9 @@ Cue 是持久、可观察的本地结构化进程执行内核。本仓库同时�
   Cue、IPC、API 和代码标识可按需保留，已有英文文档不要求顺带全文翻译。
 - FP 标题用中文表达主题，例如“执行级资源管理”；正文首次使用可注明 Execution。
   元数据 title 不含 FP 编号，文件名和一级标题保留 FP-NNNN 的四位编号格式。
-- PR 标题使用英文，保留 zendev 的 emoji、type、scope 语法；PR 正文沿用中文模板。
+- 提交描述和 PR 标题使用英文，保留 zendev 的 emoji、type、scope 语法；PR 描述使用中文并沿用仓库模板。
   提案 PR 使用 `propose`、`revise`、`supersede` 表达动作，例如
-  `📝 docs(fp): propose execution-level resource management`。提交描述与PR标题要求一致，使用英文。
+  `📝 docs(fp): propose execution-level resource management`。
 - 作者填写 GitHub 用户名，不加 `@`。使用 [提案模板](templates/fp.md)，保留所需章节。
 - 区分观察到的行为、拟议契约和未来验收，不把提案中的命令写成已经可用的产品说明。
 
