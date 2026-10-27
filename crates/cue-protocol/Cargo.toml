@@ -7,9 +7,17 @@ description = "Strict IPC v4 transport contract for Cue"
 repository.workspace = true
 license.workspace = true
 
+[[bench]]
+harness = false
+name = "framing"
+
 [dependencies]
 base64.workspace = true
 cue-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "=6.0.0" }
+proptest.workspace = true

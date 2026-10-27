@@ -18,27 +18,36 @@ hooks = [
 repo = "https://github.com/tombi-toml/tombi-pre-commit"
 rev = "v1.9.0"
 hooks = [
-  { id = "tombi-format", exclude = "^Cargo\\.lock$", stages = ["pre-commit"] },
-  { id = "tombi-lint", args = ["--error-on-warnings"], stages = ["pre-commit"] },
+  { id = "tombi-format", args = ["--check", "--offline"], exclude = "(^|/)Cargo\\.lock$", stages = ["pre-commit"] },
+  { id = "tombi-lint", args = ["--error-on-warnings", "--offline"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
-repo = "https://github.com/rhysd/actionlint"
-rev = "v1.7.12"
-hooks = [{ id = "actionlint", stages = ["pre-commit"] }]
+repo = "local"
+hooks = [
+  {
+    id = "jactionlint",
+    name = "GitHub Actions correctness and security",
+    entry = "jactionlint --no-online --shellcheck=shellcheck --pyflakes=pyflakes",
+    language = "python",
+    additional_dependencies = ["jactionlint==2.3.0", "shellcheck-py==0.11.0.1", "pyflakes==3.4.0"],
+    pass_filenames = false,
+    files = '^(\.github/|(.*/)?action\.ya?ml$|prek\.toml$)',
+    stages = ["pre-commit"],
+  },
+]
 
 [[repos]]
 repo = "https://github.com/zizmorcore/zizmor-pre-commit"
 rev = "v1.31.1"
 hooks = [
-  { id = "zizmor", args = ["--min-severity", "medium"], stages = ["pre-commit"] },
+  { id = "zizmor", args = ["--offline", "--min-severity", "medium"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
-repo = "https://github.com/lycheeverse/lychee"
-rev = "lychee-v0.24.2"
+repo = "local"
 hooks = [
-  { id = "lychee", files = "\\.md$", args = ["--offline", "--scheme", "file", "--no-progress"], stages = ["pre-commit"] },
+  { id = "lychee", name = "Local documentation links", entry = "lychee --offline --scheme file --no-progress", language = "python", additional_dependencies = ["lychee-bin==0.24.2"], files = "\\.md$", stages = ["pre-commit"] },
 ]
 
 [[repos]]
@@ -64,6 +73,25 @@ hooks = [
 [[repos]]
 repo = "local"
 hooks = [
-  { id = "cargo-fmt", name = "cargo-fmt", entry = "cargo fmt --all --", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
+  { id = "cargo-fmt", name = "cargo-fmt", entry = "cargo fmt --all -- --check", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
   { id = "cargo-clippy", name = "cargo-clippy", entry = "cargo clippy --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
 ]
+
+[[repos]]
+repo = "local"
+hooks = [
+  { id = "rumdl", name = "Markdown structure", entry = "rumdl check", language = "python", additional_dependencies = ["rumdl==0.3.0"], types = ["markdown"], stages = ["pre-commit"] },
+  { id = "vale", name = "Documentation terminology", entry = "vale", language = "python", additional_dependencies = ["vale==3.25.1.0"], require_serial = true, types = ["markdown"], stages = ["pre-commit"] },
+  { id = "ast-grep", name = "Core process boundaries", entry = "ast-grep scan", language = "python", additional_dependencies = ["ast-grep-cli==0.51.0"], pass_filenames = false, files = "(\\.rs$|^quality/ast-grep/|^sgconfig\\.yml$)", stages = ["pre-commit"] },
+  { id = "ast-grep-tests", name = "Structure rule examples", entry = "ast-grep test --skip-snapshot-tests", language = "python", additional_dependencies = ["ast-grep-cli==0.51.0"], pass_filenames = false, files = "^quality/ast-grep/", stages = ["pre-commit"] },
+  { id = "semgrep", name = "Daemon private-file permissions", entry = "semgrep scan --config quality/semgrep --metrics=off --error crates", language = "python", language_version = "python3.13", additional_dependencies = ["semgrep==1.182.1"], pass_filenames = false, files = "(\\.rs$|^quality/semgrep/)", stages = ["pre-commit"] },
+  { id = "semgrep-tests", name = "Security rule examples", entry = "semgrep --test --config quality/semgrep quality/semgrep --metrics=off", language = "python", language_version = "python3.13", additional_dependencies = ["semgrep==1.182.1"], pass_filenames = false, files = "^quality/semgrep/", stages = ["pre-commit"] },
+  { id = "shellcheck", name = "Shell script analysis", entry = "shellcheck", language = "python", additional_dependencies = ["shellcheck-py==0.11.0.1"], types = ["shell"], stages = ["pre-commit"] },
+  { id = "shfmt", name = "Shell script formatting", entry = "shfmt -d -i 4", language = "python", additional_dependencies = ["shfmt-py==4.2.0"], types = ["shell"], stages = ["pre-commit"] },
+  { id = "renovate-schema", name = "Renovate configuration schema", entry = "check-jsonschema --builtin-schema vendor.renovate", language = "python", additional_dependencies = ["check-jsonschema==0.39.0"], files = "^\\.github/renovate\\.json$", stages = ["pre-commit"] },
+]
+
+[[repos]]
+repo = "https://github.com/gitleaks/gitleaks"
+rev = "v8.30.1"
+hooks = [{ id = "gitleaks", args = ["--redact"], stages = ["pre-commit"] }]

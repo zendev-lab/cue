@@ -24,6 +24,7 @@ env:
 
 jobs:
   msrv:
+    timeout-minutes: 20
     name: MSRV (Rust 1.95)
     runs-on: ubuntu-latest
     steps:
@@ -32,16 +33,20 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.99"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: msrv
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --locked
 
   test:
+    timeout-minutes: 30
     name: Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -57,18 +62,26 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.6.21
           fallback: none
 
       - name: Run tests with coverage
-        run: cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
+        run: cargo llvm-cov test --workspace --locked --lcov --output-path lcov.info -- --no-capture
 
       - name: Run doc tests
-        run: cargo test --doc --all-features
+        run: cargo test --workspace --doc --all-features --locked
+
+      - name: Preserve coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-coverage
+          path: lcov.info
+          if-no-files-found: error
 
       - name: Upload coverage
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           files: lcov.info
-          fail_ci_if_error: false
+          fail_ci_if_error: true

@@ -25,6 +25,7 @@ env:
 
 jobs:
   crate-package:
+    timeout-minutes: 20
     name: Crate package verification
     runs-on: ubuntu-latest
     steps:
@@ -38,6 +39,7 @@ jobs:
         run: cargo package --workspace --registry crates-io --locked
 
   npm-skill:
+    timeout-minutes: 10
     name: npm Skill package
     runs-on: ubuntu-latest
     steps:
@@ -51,6 +53,7 @@ jobs:
       - run: npm test
 
   build-wheel:
+    timeout-minutes: 45
     name: wheel (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -94,6 +97,7 @@ jobs:
         run: ./scripts/smoke_package.sh dist/*.whl
 
   build-sdist:
+    timeout-minutes: 30
     name: sdist
     runs-on: ubuntu-latest
     steps:

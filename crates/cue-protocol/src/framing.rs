@@ -53,6 +53,8 @@ pub enum FrameError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use crate::{ClientId, Hello, Query, RequestId};
 
     use super::*;
@@ -95,5 +97,70 @@ mod tests {
             decode_message(&trailing),
             Err(FrameError::LengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn size_limit_is_checked_before_body_deserialization() {
+        let maximum = u32::try_from(MAX_MESSAGE_SIZE).unwrap();
+        assert!(matches!(
+            decode_message(&maximum.to_be_bytes()),
+            Err(FrameError::LengthMismatch {
+                declared: MAX_MESSAGE_SIZE,
+                actual: 0
+            })
+        ));
+        assert!(matches!(
+            decode_message(&(maximum + 1).to_be_bytes()),
+            Err(FrameError::MessageTooLarge {
+                maximum: MAX_MESSAGE_SIZE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn encoder_accepts_limit_and_rejects_one_byte_more() {
+        fn extension(data: String) -> Message {
+            Message::Query {
+                request_id: RequestId::new(1).unwrap(),
+                query: Query::Extension(crate::ExtensionRequest {
+                    namespace: "test".into(),
+                    version: 1,
+                    method: "payload".into(),
+                    data: serde_json::Value::String(data),
+                }),
+            }
+        }
+        let overhead = serde_json::to_vec(&extension(String::new())).unwrap().len();
+        let message = extension("x".repeat(MAX_MESSAGE_SIZE - overhead));
+        let frame = encode_message(&message).unwrap();
+        assert_eq!(frame.len(), MAX_MESSAGE_SIZE + 4);
+        assert_eq!(decode_message(&frame).unwrap(), message);
+        let too_large = extension("x".repeat(MAX_MESSAGE_SIZE - overhead + 1));
+        assert!(matches!(
+            encode_message(&too_large),
+            Err(FrameError::MessageTooLarge { .. })
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn frames_preserve_request_identity_and_reject_extra_bytes(
+            id in 1..=u64::MAX,
+            client in "[a-zA-Z0-9_-]{1,128}",
+            extra in proptest::collection::vec(any::<u8>(), 1..16),
+        ) {
+            let message = Message::Query {
+                request_id: RequestId::new(id).unwrap(),
+                query: Query::Hello(Hello {
+                    protocol_version: crate::PROTOCOL_VERSION,
+                    client_id: ClientId::new(client).unwrap(),
+                }),
+            };
+            let mut frame = encode_message(&message).unwrap();
+            prop_assert_eq!(decode_message(&frame).unwrap(), message);
+            frame.extend(extra);
+            prop_assert!(matches!(decode_message(&frame), Err(FrameError::LengthMismatch { .. })), "extra bytes must be rejected");
+        }
     }
 }

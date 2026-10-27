@@ -3,8 +3,7 @@
 > Historical research only. Commands, wrappers, and product capabilities below
 > describe the pre-v4 design, not the current release. Use the
 > [design index](../../../docs/design/README.md) and [README](../../../README.md) for supported behavior.
-
-
+>
 > **调研日期**: 2025-07
 > **调研范围**: Agent 友好型 Shell、进程管理器、任务运行器、现代 Shell、编码 Agent 工具接口、调度器
 > **核心定位**: Cue Shell 是一个异步进程运行时 + TUI + MCP 接口，为人机协作设计，**不是**传统 Shell，**不是**终端复用器，而是带会话/环境管理的异步任务调度器。
@@ -39,6 +38,7 @@
 **关键创新**：利用 MCP 的持久连接解决 Shell 超时问题。Agent 在 MCP 调用上无限阻塞等待任务完成，绕过了 CLI wrapper 的 30-120 秒 shell 超时限制。
 
 **对 Cue Shell 的启示**：
+
 - MCP 长连接绕过超时是核心洞见，Cue Shell 应直接内化
 - FIFO + 命名队列的概念可直接复用
 - **缺失**：无交互式 Shell 支持、无流式输出、无优先级系统、无安全模型
@@ -140,6 +140,7 @@
 Dagger 的核心抽象是**不可变、内容寻址的容器状态链**，与 Cue Shell 环境累积最相关：
 
 **工作原理**：
+
 1. **不可变状态链**：每个 `.With*()` 返回新对象，前一状态永不变更
 2. **环境累积**：`.WithEnvVariable()` 追加到容器 env 映射，后续 `.WithExec()` 看到累积环境
 3. **懒求值**：链是规格说明，调用终端方法才执行
