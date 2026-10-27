@@ -18,8 +18,8 @@ hooks = [
 repo = "https://github.com/tombi-toml/tombi-pre-commit"
 rev = "v1.9.0"
 hooks = [
-  { id = "tombi-format", args = ["--check", "--offline"], exclude = "(^|/)Cargo\\.lock$", stages = ["pre-commit"] },
-  { id = "tombi-lint", args = ["--error-on-warnings", "--offline"], stages = ["pre-commit"] },
+  { id = "tombi-format", args = ["--check"], exclude = "(^|/)Cargo\\.lock$", stages = ["pre-commit"] },
+  { id = "tombi-lint", args = ["--error-on-warnings"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
