@@ -5,26 +5,22 @@ on:
     branches:
       - main
   pull_request:
-    branches:
-      - main
   merge_group:
     types:
       - checks_requested
 
+  schedule:
+    - cron: "47 3 * * 1"
+  workflow_dispatch:
 concurrency:
-  group: ci-tests-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
-
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-
 jobs:
   msrv:
     timeout-minutes: 20
+    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: MSRV (Rust 1.95)
     runs-on: ubuntu-latest
     steps:
@@ -40,14 +36,20 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo check --workspace --all-targets --locked
 
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
   test:
     timeout-minutes: 30
+    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: Tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,3 +87,233 @@ jobs:
           use_oidc: true
           files: lcov.info
           fail_ci_if_error: true
+  crate-package:
+    timeout-minutes: 20
+    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
+    name: Crate package verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.1"
+      - name: Verify unpublished workspace packages
+        run: cargo package --workspace --registry crates-io --locked
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  npm-skill:
+    timeout-minutes: 10
+    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
+    name: npm Skill package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - run: npm test
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  build-wheel:
+    timeout-minutes: 45
+    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
+    name: wheel (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-latest
+          - label: macos-x86_64
+            runner: macos-15-intel
+          - label: macos-arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.15"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: package-${{ matrix.label }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          rust-toolchain: "1.95"
+          command: build
+          manylinux: "2014"
+          args: --release --locked --compatibility pypi --out dist
+
+      - name: Smoke-test built wheel
+        run: ./scripts/smoke_package.sh dist/*.whl
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  build-sdist:
+    timeout-minutes: 30
+    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.15"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: package-sdist
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          rust-toolchain: "1.95"
+          command: sdist
+          args: --out dist
+
+      - name: Smoke-test source distribution
+        run: ./scripts/smoke_package.sh dist/*.tar.gz
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  benchmarks:
+    name: Protocol Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.99.1"
+      - run: cargo install cargo-codspeed --version 6.0.0 --locked
+      - run: cargo codspeed build -p cue-protocol --locked
+      - uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
+        with:
+          mode: simulation
+          run: cargo codspeed run
+
+  sonar:
+    name: Sonar Rust Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.99.1"
+          components: clippy, llvm-tools
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.6.21
+          fallback: none
+      - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Analyze Rust and helper sources
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  model-check:
+    name: Concurrent Output Model
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.99.1"
+      - run: |
+          RUSTFLAGS='--cfg cue_loom' CARGO_TARGET_DIR=target/loom cargo test -p cue-runtime --lib output::loom_tests --locked
+
+
+        shell: bash
+  robustness:
+    name: Mutation Fuzz and Miri
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.99.1"
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-mutants@27.1.0,cargo-fuzz@0.13.2
+          fallback: none
+      - run: rustup toolchain install nightly-2026-10-26 --profile minimal --component miri
+      - run: |
+          set -euo pipefail
+          mkdir -p reports/mutation
+          status=0
+          # Mutated storage panics can strand PTY tasks; process tests run in the native suite.
+          cargo mutants --package cue-core --package cue-protocol --package cue-runtime --file crates/cue-core/src/kernel/env.rs --file crates/cue-protocol/src/framing.rs --file crates/cue-runtime/src/output.rs --jobs 2 --cargo-arg=--locked --output reports/mutation -- --lib -- --skip runner::tests || status=$?
+          if [[ "$status" -ne 0 && "$status" -ne 2 ]]; then
+              exit "$status"
+          fi
+        shell: bash
+      - run: |
+          cargo +nightly-2026-10-26 fetch --manifest-path fuzz/Cargo.toml --locked
+          mkdir -p fuzz/corpus/boundaries
+          CARGO_NET_OFFLINE=true cargo +nightly-2026-10-26 fuzz run boundaries fuzz/corpus/boundaries fuzz/seeds/boundaries -- -max_total_time=60 -max_len=4096
+        if: ${{ !cancelled() }}
+        shell: bash
+      - run: |
+          MIRIFLAGS='-Zmiri-env-set=PROPTEST_CASES=8 -Zmiri-env-set=PROPTEST_RNG_SEED=1 -Zmiri-env-set=PROPTEST_DISABLE_FAILURE_PERSISTENCE=1' cargo +nightly-2026-10-26 miri test -p cue-core -p cue-protocol --lib --locked -- --skip encoder_accepts_limit_and_rejects_one_byte_more
+        if: ${{ !cancelled() }}
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: robustness-reports
+          path: |
+            reports/mutation
+            fuzz/corpus
+            fuzz/artifacts
+          if-no-files-found: error
