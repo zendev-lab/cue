@@ -9,9 +9,6 @@ on:
     types:
       - checks_requested
 
-  schedule:
-    - cron: "47 3 * * 1"
-  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,7 +17,6 @@ permissions:
 jobs:
   msrv:
     timeout-minutes: 20
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: MSRV (Rust 1.95)
     runs-on: ubuntu-latest
     steps:
@@ -39,9 +35,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   test:
     timeout-minutes: 30
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: Tests
     runs-on: ubuntu-latest
     permissions:
@@ -87,9 +83,9 @@ jobs:
           use_oidc: true
           files: lcov.info
           fail_ci_if_error: true
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   crate-package:
     timeout-minutes: 20
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: Crate package verification
     runs-on: ubuntu-latest
     steps:
@@ -106,9 +102,9 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   npm-skill:
     timeout-minutes: 10
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: npm Skill package
     runs-on: ubuntu-latest
     steps:
@@ -125,9 +121,9 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   build-wheel:
     timeout-minutes: 45
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: wheel (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -174,9 +170,9 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   build-sdist:
     timeout-minutes: 30
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: sdist
     runs-on: ubuntu-latest
     steps:
@@ -211,6 +207,7 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   benchmarks:
     name: Protocol Benchmarks
     runs-on: ubuntu-latest
@@ -271,49 +268,3 @@ jobs:
 
 
         shell: bash
-  robustness:
-    name: Mutation Fuzz and Miri
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-        with:
-          toolchain: "1.99.1"
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-mutants@27.1.0,cargo-fuzz@0.13.2
-          fallback: none
-      - run: rustup toolchain install nightly-2026-10-26 --profile minimal --component miri
-      - run: |
-          set -euo pipefail
-          mkdir -p reports/mutation
-          status=0
-          # Mutated storage panics can strand PTY tasks; process tests run in the native suite.
-          cargo mutants --package cue-core --package cue-protocol --package cue-runtime --file crates/cue-core/src/kernel/env.rs --file crates/cue-protocol/src/framing.rs --file crates/cue-runtime/src/output.rs --jobs 2 --cargo-arg=--locked --output reports/mutation -- --lib -- --skip runner::tests || status=$?
-          if [[ "$status" -ne 0 && "$status" -ne 2 ]]; then
-              exit "$status"
-          fi
-        shell: bash
-      - run: |
-          cargo +nightly-2026-10-26 fetch --manifest-path fuzz/Cargo.toml --locked
-          mkdir -p fuzz/corpus/boundaries
-          CARGO_NET_OFFLINE=true cargo +nightly-2026-10-26 fuzz run boundaries fuzz/corpus/boundaries fuzz/seeds/boundaries -- -max_total_time=60 -max_len=4096
-        if: ${{ !cancelled() }}
-        shell: bash
-      - run: |
-          MIRIFLAGS='-Zmiri-env-set=PROPTEST_CASES=8 -Zmiri-env-set=PROPTEST_RNG_SEED=1 -Zmiri-env-set=PROPTEST_DISABLE_FAILURE_PERSISTENCE=1' cargo +nightly-2026-10-26 miri test -p cue-core -p cue-protocol --lib --locked -- --skip encoder_accepts_limit_and_rejects_one_byte_more
-        if: ${{ !cancelled() }}
-        shell: bash
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: robustness-reports
-          path: |
-            reports/mutation
-            fuzz/corpus
-            fuzz/artifacts
-          if-no-files-found: error

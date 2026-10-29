@@ -9,9 +9,6 @@ on:
     types:
       - checks_requested
 
-  schedule:
-    - cron: "47 3 * * 1"
-  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,7 +17,6 @@ permissions:
 jobs:
   pre-commit:
     timeout-minutes: 30
-    if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.base_ref == 'main')) || (github.event_name == 'merge_group')
     name: Pre-commit Checks
     runs-on: ubuntu-latest
     steps:
@@ -35,6 +31,7 @@ jobs:
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   rust-quality:
     name: Rust Dependency and API Checks
     runs-on: ubuntu-latest
@@ -85,43 +82,8 @@ jobs:
             --lockfile=Cargo.lock
             --lockfile=fuzz/Cargo.lock
 
-  hygiene:
-    name: Structure and External Links
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .node-version
-          package-manager-cache: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          version: "0.13.5"
-      - run: |
-          mkdir -p reports
-          npx --yes jscpd@5.4.2 --reporters json --output reports/jscpd --ignore '**/target/**,**/tests/**' crates scripts
-          uvx lizard==1.24.3 --ignore_warnings -1 --xml crates > reports/complexity.xml
-        shell: bash
-      - run: |
-          set -euo pipefail
-          mkdir -p reports
-          git ls-files -z '*.md' ':(exclude).agents/notes/**' | xargs -0 uvx --from lychee-bin==0.24.2 lychee --scheme https --scheme http --timeout 20 --max-retries 1 --no-progress --format json --output reports/links.json
-        if: ${{ !cancelled() }}
-        shell: bash
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: hygiene-reports
-          path: reports
-          if-no-files-found: error
-
   workflow-audit:
     name: Online Workflow Audit
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -134,10 +96,12 @@ jobs:
       - name: Audit action provenance and references
         env:
           GH_TOKEN: ${{ github.token }}
-        run: uvx --with shellcheck-py==0.11.0.1 --with pyflakes==3.4.0 jactionlint==2.3.0 --online=strict --online-report=workflow-audit.json --shellcheck=shellcheck --pyflakes=pyflakes
+        run: uvx --with shellcheck-py==0.11.0.1 --with pyflakes==3.4.0 jactionlint==2.3.0 --online=strict
+          --online-report=workflow-audit.json --shellcheck=shellcheck --pyflakes=pyflakes
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: workflow-audit
           path: workflow-audit.json
           if-no-files-found: error
+    if: github.ref == 'refs/heads/main'

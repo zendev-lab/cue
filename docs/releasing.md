@@ -34,7 +34,7 @@ Publishing does not filter crates by source changes. It only skips crate version
 
 `cd-publish.yml` 只订阅 `v*` tag push，直接包含版本检查、产物构建、安装 smoke、 PyPI/npm/crates.io 上传，以及最后的 GitHub Release。crates.io 使用 `katyo/publish-crates` Action，按依赖顺序发布 workspace crate，跳过已经上传的精确版本并等待 crates.io 索引可见；它把 `--locked` 传给 Cargo。PyPI 使用 PyPA 官方发布 Action，保留 Trusted Publishing 和默认的 PEP 740 发布证明。上传 jobs 与构建 jobs 分离，仅上传 jobs 获得对应 registry 的 OIDC 权限。GitHub Release 只依赖版本检查、打包和 smoke 检查；三个 registry 上传相互独立，某个 registry 暂时失败时不会阻止 GitHub Release 创建或其他 registry 的重试。
 
-`ci-tests.yml` 直接运行 PR 阶段的 Cargo 打包和 wheel/sdist/npm 安装 smoke，提前发现发行包缺文件、无法安装或启动等问题。它不上传 registry，也不调用共用 workflow。 `ci-static-checks.yml` 和 `ci-tests.yml` 分别负责静态检查与代码测试。 `policy-pr.yml` 只监听 PR 事件，检查 PR 格式。
+`ci-tests.yml` 直接运行 PR 阶段的 Cargo 打包和 wheel/sdist/npm 安装 smoke，提前发现发行包缺文件、无法安装或启动等问题。它不上传 registry，也不调用共用 workflow。 `ci-static-checks.yml` 和 `ci-tests.yml` 分别负责静态检查与代码测试。`ce-quality.yml` 独立负责每周和手动持续评估，单独配置触发条件。 `policy-pr.yml` 只监听 PR 事件，检查 PR 格式。
 
 版本检查直接使用 `cargo metadata` 和 `jq -e` 断言 tag 与全部 crate 的版本一致。 `cargo package` 验证的是包能否构建，不能替代仓库的 tag 命名约定。
 
