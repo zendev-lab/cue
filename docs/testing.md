@@ -28,7 +28,7 @@ If a constraint is about repository shape, use the standard static tool that own
 
 [测试工作流](../.github/workflows/ci-tests.yml) 的 `Concurrent Output Model` 将输出存储的实际 Mutex 替换为 Loom 模型，遍历两个写入者的交错，检查偏移不重叠以及容量淘汰后的最终内容。`cue_loom` 只用于这一测试入口；普通构建继续使用标准库 Mutex。性质测试随原有 crate 测试运行，覆盖环境补丁序列化、协议帧身份与长度、输出保留后缀。
 
-CI 按 PR / push 执行集成检查。[持续评估工作流](../.github/workflows/ce-quality.yml) 独立维护每周一及手动触发的有界检查，具体命令由对应 job 维护：
+常规 CI 仅在目标为 `main` 的 PR 和合并队列中执行，合并后的 push 不重复执行。[持续评估工作流](../.github/workflows/ce-quality.yml) 独立维护每周一及手动触发的有界检查，具体命令由对应 job 维护：
 
 - 变异测试：Core 环境补丁、协议 framing 与运行时输出存储。使用库单元测试，并跳过 runner 进程测试，避免变异引发的存储 panic 让 PTY 任务挂住；完整进程测试仍由原生测试入口运行。保留完整报告，存活变异作为待审阅证据；只把 cargo-mutants 的存活状态码 2 转为报告结果，基线失败和工具错误仍失败。该目标不代表 reducer、SQLite 或全部进程代码的变异覆盖。
 - Fuzz：固定 nightly 与 libFuzzer，对任意 IPC 帧和 UTF-8 命令运行 60 秒 AddressSanitizer 检查；保存 corpus 和崩溃样例。

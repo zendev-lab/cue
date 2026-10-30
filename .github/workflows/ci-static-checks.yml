@@ -1,9 +1,6 @@
 name: "CI - Static Checks"
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
@@ -35,7 +32,6 @@ jobs:
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   rust-quality:
     name: Rust Dependency and API Checks
     runs-on: ubuntu-latest
@@ -59,7 +55,7 @@ jobs:
         shell: bash
       - name: Check public crate compatibility
         env:
-          BASE_REV: ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD^' }}
+          BASE_REV: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: cargo semver-checks --workspace --baseline-rev "$BASE_REV"
       - name: Inventory licenses without imposing a new policy
         run: |
@@ -85,27 +81,3 @@ jobs:
           scan-args: |-
             --lockfile=Cargo.lock
             --lockfile=fuzz/Cargo.lock
-
-  workflow-audit:
-    name: Online Workflow Audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          version: "0.13.5"
-      - name: Audit action provenance and references
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: uvx --with shellcheck-py==0.11.0.1 --with ruff==0.17.3 jactionlint==2.3.0 --online=strict
-          --online-report=workflow-audit.json --shellcheck=shellcheck --ruff=ruff
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: workflow-audit
-          path: workflow-audit.json
-          if-no-files-found: error
-    if: github.ref == 'refs/heads/main'

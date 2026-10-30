@@ -1,9 +1,6 @@
 name: "CI - Tests"
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
@@ -39,7 +36,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   test:
     timeout-minutes: 30
     name: Tests
@@ -87,7 +83,6 @@ jobs:
           use_oidc: true
           files: lcov.info
           fail_ci_if_error: true
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   crate-package:
     timeout-minutes: 20
     name: Crate package verification
@@ -106,7 +101,6 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   npm-skill:
     timeout-minutes: 10
     name: npm Skill package
@@ -125,7 +119,6 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   build-wheel:
     timeout-minutes: 45
     name: wheel (${{ matrix.label }})
@@ -174,7 +167,6 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   build-sdist:
     timeout-minutes: 30
     name: sdist
@@ -211,7 +203,6 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
   benchmarks:
     name: Protocol Benchmarks
     runs-on: ubuntu-latest
