@@ -30,7 +30,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: msrv
-          save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo check --workspace --all-targets --locked
 
     env:
@@ -56,8 +55,6 @@ jobs:
           toolchain: "1.99.1"
           components: llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov@0.6.21
@@ -149,7 +146,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: package-${{ matrix.label }}
-          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -187,7 +183,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: package-sdist
-          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -207,6 +202,8 @@ jobs:
     name: Protocol Benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      CARGO_CODSPEED_VERSION: "6.0.0"
     permissions:
       contents: read
       id-token: write
@@ -217,7 +214,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: "1.99.1"
-      - run: cargo install cargo-codspeed --version 6.0.0 --locked
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: codspeed-${{ env.CARGO_CODSPEED_VERSION }}
+          cache-on-failure: true
+      - run: cargo install cargo-codspeed --version "$CARGO_CODSPEED_VERSION" --locked
       - run: cargo codspeed build -p cue-protocol --locked
       - uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
         with:

@@ -29,8 +29,6 @@ jobs:
           toolchain: "1.99.1"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
   rust-quality:
     name: Rust Dependency and API Checks
