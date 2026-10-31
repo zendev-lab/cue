@@ -38,7 +38,7 @@ If a constraint is about repository shape, use the standard static tool that own
 
 `just benchmark` 测量真实 Hello 帧的编码和解码，并先验证往返结果。普通执行产生本机 walltime，CI 的 CodSpeed CPU 模拟提供云端测量；没有兼容基线时不推断性能提升或退化。
 
-Codecov 上传失败会使测试任务失败，LCOV 仍保留为构建产物。Sonar 在静态 CI 和独立 CE 中只分析代码质量与安全，排除覆盖率，不重复执行测试或导入 LCOV；覆盖率由 Tests 和 Codecov 负责。Sonar 仍需要仓库或组织配置 `SONAR_TOKEN`；自动分析不支持 Rust。配置提交、上传成功和质量门禁通过分别验收。
+Codecov 上传失败会使测试任务失败，LCOV 仍保留为构建产物。SonarQube Cloud 统一使用自动分析，范围由根目录的 `.sonarcloud.properties` 配置；CI 和 CE 不运行 SonarScanner，也不需要 `SONAR_TOKEN`。自动分析只覆盖支持的脚本与辅助源码，不支持 Rust 本体；Rust 继续由既有 Cargo、Clippy 和测试入口验证。自动分析不接收 LCOV，覆盖率由 Tests 和 Codecov 负责。配置提交、服务启用和质量门禁通过分别验收。
 
 ## Gates
 
