@@ -1,0 +1,7 @@
+id: core-process-exit
+valid:
+  - 'fn result() -> i32 { 1 }'
+  - 'fn state() { let _status = "std::process::exit(1)"; }'
+invalid:
+  - 'fn stop() { std::process::exit(1); }'
+  - 'fn stop() { process::abort(); }'

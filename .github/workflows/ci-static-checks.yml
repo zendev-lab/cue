@@ -1,25 +1,23 @@
 name: "CI - Static Checks"
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
   merge_group:
+    branches:
+      - main
     types:
       - checks_requested
 
 concurrency:
-  group: ci-static-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
-
 permissions:
   contents: read
-
 jobs:
   pre-commit:
+    timeout-minutes: 30
     name: Pre-commit Checks
     runs-on: ubuntu-latest
     steps:
@@ -31,6 +29,53 @@ jobs:
           toolchain: "1.99.1"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+  rust-quality:
+    name: Rust Dependency and API Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.99.1"
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-machete@0.9.2,cargo-deny@0.20.2,cargo-semver-checks@0.51.0
+          fallback: none
+      - run: |
+          cargo machete
+          cargo deny check advisories
+          cargo deny --manifest-path fuzz/Cargo.toml check advisories
+        shell: bash
+      - name: Check public crate compatibility
+        env:
+          BASE_REV: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: cargo semver-checks --workspace --baseline-rev "$BASE_REV"
+      - name: Inventory licenses without imposing a new policy
+        run: |
+          mkdir -p reports
+          cargo deny list --format json > reports/rust-licenses.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: rust-licenses
+          path: reports/rust-licenses.json
+          if-no-files-found: error
+
+  vulnerabilities:
+    name: Dependency Vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        with:
+          scan-args: |-
+            --lockfile=Cargo.lock
+            --lockfile=fuzz/Cargo.lock

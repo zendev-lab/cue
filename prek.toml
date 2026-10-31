@@ -18,27 +18,30 @@ hooks = [
 repo = "https://github.com/tombi-toml/tombi-pre-commit"
 rev = "v1.9.0"
 hooks = [
-  { id = "tombi-format", exclude = "^Cargo\\.lock$", stages = ["pre-commit"] },
+  { id = "tombi-format", args = ["--check"], exclude = "(^|/)Cargo\\.lock$", stages = ["pre-commit"] },
   { id = "tombi-lint", args = ["--error-on-warnings"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
-repo = "https://github.com/rhysd/actionlint"
-rev = "v1.7.12"
-hooks = [{ id = "actionlint", stages = ["pre-commit"] }]
+repo = "local"
+hooks = [
+  {
+    id = "jactionlint",
+    name = "GitHub Actions correctness and security",
+    entry = "jactionlint --no-online --shellcheck=shellcheck --ruff=ruff",
+    language = "python",
+    additional_dependencies = ["jactionlint==2.3.0", "shellcheck-py==0.11.0.1", "ruff==0.17.3"],
+    pass_filenames = false,
+    files = '^(\.github/|(.*/)?action\.ya?ml$|prek\.toml$)',
+    stages = ["pre-commit"],
+  },
+]
 
 [[repos]]
 repo = "https://github.com/zizmorcore/zizmor-pre-commit"
 rev = "v1.31.1"
 hooks = [
-  { id = "zizmor", args = ["--min-severity", "medium"], stages = ["pre-commit"] },
-]
-
-[[repos]]
-repo = "https://github.com/lycheeverse/lychee"
-rev = "lychee-v0.24.2"
-hooks = [
-  { id = "lychee", files = "\\.md$", args = ["--offline", "--scheme", "file", "--no-progress"], stages = ["pre-commit"] },
+  { id = "zizmor", args = ["--offline", "--min-severity", "medium"], stages = ["pre-commit"] },
 ]
 
 [[repos]]
@@ -64,6 +67,68 @@ hooks = [
 [[repos]]
 repo = "local"
 hooks = [
-  { id = "cargo-fmt", name = "cargo-fmt", entry = "cargo fmt --all --", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
+  { id = "cargo-fmt", name = "cargo-fmt", entry = "cargo fmt --all -- --check", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
   { id = "cargo-clippy", name = "cargo-clippy", entry = "cargo clippy --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false, stages = ["pre-commit"] },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+  { id = "ast-grep", name = "Core process boundaries", entry = "ast-grep scan", language = "python", additional_dependencies = ["ast-grep-cli==0.51.0"], pass_filenames = false, files = "(\\.rs$|^quality/ast-grep/|^sgconfig\\.yml$)", stages = ["pre-commit"] },
+  { id = "ast-grep-tests", name = "Structure rule examples", entry = "ast-grep test --skip-snapshot-tests", language = "python", additional_dependencies = ["ast-grep-cli==0.51.0"], pass_filenames = false, files = "^quality/ast-grep/", stages = ["pre-commit"] },
+]
+
+[[repos]]
+repo = "https://github.com/gitleaks/gitleaks"
+rev = "v8.30.1"
+hooks = [{ id = "gitleaks", args = ["--redact"], stages = ["pre-commit"] }]
+
+[[repos]]
+repo = "https://github.com/lycheeverse/lychee"
+rev = "lychee-v0.24.2"
+hooks = [
+  { id = "lychee", name = "Local documentation links", files = "\\.md$", stages = ["pre-commit"], args = ["LYCHEE_VERSION=0.24.2", "--offline", "--scheme", "file", "--no-progress"] },
+]
+
+[[repos]]
+repo = "https://github.com/python-jsonschema/check-jsonschema"
+rev = "0.39.0"
+hooks = [
+  { id = "check-jsonschema", alias = "renovate-schema", name = "Renovate configuration schema", files = "^\\.github/renovate\\.json$", stages = ["pre-commit"], args = ["--builtin-schema", "vendor.renovate"] },
+]
+
+[[repos]]
+repo = "https://github.com/shellcheck-py/shellcheck-py"
+rev = "v0.11.0.1-1"
+hooks = [
+  { id = "shellcheck", name = "Shell script analysis", types = ["shell"], stages = ["pre-commit"], args = [] },
+]
+
+[[repos]]
+repo = "https://github.com/semgrep/pre-commit"
+rev = "v1.182.1"
+hooks = [
+  { id = "semgrep", name = "Daemon private-file permissions", language_version = "python3.13", pass_filenames = false, files = "(\\.rs$|^quality/semgrep/)", stages = ["pre-commit"], args = ["scan", "--config", "quality/semgrep", "--metrics=off", "--error", "crates"] },
+  { id = "semgrep", alias = "semgrep-tests", name = "Security rule examples", language_version = "python3.13", pass_filenames = false, files = "^quality/semgrep/", stages = ["pre-commit"], args = ["--test", "--config", "quality/semgrep", "quality/semgrep", "--metrics=off"] },
+]
+
+[[repos]]
+repo = "https://github.com/vale-cli/vale"
+rev = "v3.25.1"
+hooks = [
+  { id = "vale", name = "Documentation terminology", require_serial = true, types = ["markdown"], stages = ["pre-commit"], args = [] },
+]
+
+[[repos]]
+repo = "https://github.com/rvben/rumdl-pre-commit"
+rev = "v0.3.0"
+hooks = [
+  { id = "rumdl-check", alias = "rumdl", name = "Markdown structure", types = ["markdown"], stages = ["pre-commit"], args = [] },
+]
+
+[[repos]]
+repo = "https://github.com/scop/pre-commit-shfmt"
+rev = "v3.14.1-1"
+hooks = [
+  { id = "shfmt", name = "Shell script formatting", types = ["shell"], stages = ["pre-commit"], args = ["-d", "-i", "4"] },
 ]

@@ -137,9 +137,9 @@ Changes to Cue's public contracts start with a numbered [Feature Proposal](fps/R
 ```bash
 just check
 just test
-just msrv
-just package-smoke
-just npm-package-smoke
+rustup run 1.95 cargo check --workspace --all-targets
+bash scripts/check_packages.sh
+node scripts/smoke_npm_package.mjs
 ```
 
 Repository guidance: [协作约定](AGENTS.md)、[愿景](VISION.md)、 [设计原则](PRINCIPLES.md)、[贡献指南](CONTRIBUTING.md)。

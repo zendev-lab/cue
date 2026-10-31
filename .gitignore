@@ -29,3 +29,12 @@ lcov.info
 
 # Python release tooling
 __pycache__/
+
+# Quality reports and generated fuzz inputs
+/reports/
+/mutants.out/
+/mutants.out.old/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/crates/*/proptest-regressions/

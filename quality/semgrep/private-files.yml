@@ -1,0 +1,19 @@
+rules:
+  - id: daemon-private-files
+    languages: [rust]
+    severity: ERROR
+    message: Daemon files and directories are private; other users must not receive access.
+    metadata:
+      references:
+        - docs/design/daemon.md
+    paths:
+      include:
+        - crates/cue-daemon/src/**
+    patterns:
+      - pattern-either:
+          - pattern: Permissions::from_mode($MODE)
+          - pattern: std::fs::Permissions::from_mode($MODE)
+          - pattern: $OPTIONS.mode($MODE)
+      - metavariable-comparison:
+          metavariable: $MODE
+          comparison: $MODE & 0o077 != 0

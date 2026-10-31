@@ -83,6 +83,7 @@
 | 流式/自然语言 | gocron, every(Python), Ofelia | `.Do()` / `@` 前缀 | `do` 边界和 `@` 前缀在多工具中独立涌现 |
 
 **核心发现**：
+
 - `.do()` / `do` 作为 schedule↔action 边界是跨工具涌现的模式
 - `@` 前缀标记调度 token 是另一个涌现模式
 - 关键字驱动的确定性语法在 systemd/APScheduler 中验证过
@@ -92,7 +93,7 @@
 
 #### 方案 A: 单 Token 调度（Zero-Ambiguity Compact）
 
-```
+```text
 5m cargo build                    # interval
 @2:30pm ./deploy.sh              # timepoint
 cron:*/5:*:*:*:* curl api/health # crontab (用 : 代替空格)
@@ -110,7 +111,7 @@ weekdays@9am cargo test          # complex
 
 #### 方案 B: 关键字文法驱动（Keyword-Grammar Driven）
 
-```
+```text
 every 5m cargo build                    # 关键字 "every" 消耗 1 token
 at 2:30pm ./deploy.sh                  # 关键字 "at" 消耗 1 token
 at 9am on weekdays cargo test          # "at" + lookahead "on"
@@ -127,7 +128,7 @@ daily cargo clippy                     # 预设关键字，消耗 0 token
 
 #### 方案 C: `do` 终结符（Natural-Language Terminated）
 
-```
+```text
 every 5m do cargo build                # "do" 分界
 */5 * * * * do curl api/health        # 原生 crontab + do
 every 30m between 9am-5pm on mon-fri do ./check.sh  # 复杂自由格式
@@ -155,7 +156,7 @@ every 30m between 9am-5pm on mon-fri do ./check.sh  # 复杂自由格式
 
 > **关键字模式覆盖 90% 的日常场景（简洁高效），`do` 终结符作为通用回退覆盖剩余 10%（完备兜底）。**
 
-```
+```text
 <cron-input> := <keyword-schedule> <command>    # 主路径：关键字驱动
               | <free-schedule> "do" <command>   # 回退：do 终结符
 ```
@@ -197,11 +198,13 @@ v1 使用 **3 个模式** + **`cmd:` 分隔符语法**：
 内建命令使用后缀冒号：`kill: J1`, `run: cargo build`, `env: set FOO=bar`。
 
 解析规则：
+
 1. 如果第一个 token 以 `:` 结尾 → 内建命令
 2. 如果单个 token 精确匹配无参命令 → 内建命令
 3. 否则 → 模式默认包装（CMD 模式报错）
 
 **v1 的问题**：
+
 - `cmd:` 语法无先例，需要用户"学习"新语法
 - CMD 模式与 `:` 前缀功能重复
 - `echo "foo:bar"` 可能被误判为内建命令（需额外检测逻辑）
@@ -219,6 +222,7 @@ v2 改为 **2 个模式** + **`:` 前缀语法**：
 内建命令使用前缀冒号：`:kill J1`, `:run cargo build`, `:env set FOO=bar`。
 
 解析规则（极简化）：
+
 1. 首字符 `:` → 内建命令
 2. 否则 → 模式默认包装
 
