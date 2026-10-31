@@ -148,12 +148,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: "1.99.1"
-          components: clippy, llvm-tools
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-llvm-cov@0.6.21
-          fallback: none
-      - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
       - name: Analyze Rust and helper sources
         uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
         env:
