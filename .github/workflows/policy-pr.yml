@@ -2,18 +2,27 @@ name: Policy - PR
 
 on:
   pull_request:
+    branches:
+      - main
     types: [opened, edited, reopened, synchronize]
+  merge_group:
+    branches:
+      - main
+    types:
+      - checks_requested
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: policy-pr-${{ github.event.pull_request.number }}
+  group: policy-pr-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   pr-message:
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
     name: PR message
     runs-on: ubuntu-latest
     steps:

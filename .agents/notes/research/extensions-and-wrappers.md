@@ -3,8 +3,7 @@
 > Historical research only. Commands, wrappers, and product capabilities below
 > describe the pre-v4 design, not the current release. Use the
 > [design index](../../../docs/design/README.md) and [README](../../../README.md) for supported behavior.
-
-
+>
 > Status: research note; implementation TODOs identified.
 > Date: 2026-05-20
 

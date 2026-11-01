@@ -15,5 +15,5 @@ FP 标题和正文使用中文，技术标识按需保留。PR 标题使用英�
 提交的[索引](../fps-index.json)由提案 frontmatter 确定性生成，并通过 prek 统一检查：
 
 ```shell
-just pre-commit
+just check
 ```

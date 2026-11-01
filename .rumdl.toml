@@ -1,0 +1,12 @@
+[global]
+disable = ["MD013"]  # Existing prose uses semantic paragraphs, including Chinese text.
+
+[MD025]
+front-matter-title = ""  # Proposal metadata does not replace its visible heading.
+
+[MD033]
+allowed-elements = ["a"]  # FP terminology anchors are stable public links.
+
+[per-file-ignores]
+".github/pull_request_template.md" = ["MD041"]  # Required sections are H2.
+".agents/notes/**/*.md" = ["MD036"]  # Historical notes use emphasized summary sentences.

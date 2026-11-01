@@ -1,0 +1,8 @@
+# https://github.com/RustCrypto/utils/security/advisories/GHSA-qwgh-2vcv-g2f7
+# The locked 0.10.4 implementation keeps pos outside the buffer (src/lib.rs:55-63).
+# Its adapted caught-panic reproducer passes Miri; ReadBuffer does not exist there.
+# It is also only in Ratatui's disabled termwiz backend, absent with --target all.
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2027-01-28
+reason = "block-buffer 0.10.4 does not use the advisory's inline cursor representation. Reassess this exception when its locked version or the Ratatui backend changes."

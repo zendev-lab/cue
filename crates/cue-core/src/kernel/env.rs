@@ -183,7 +183,34 @@ fn valid_env_key(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        #[test]
+        fn patch_roundtrip_preserves_edits_and_classification(
+            name in r"[^\x00=]{1,32}",
+            text in r"[^\x00]{0,64}",
+            sensitive in any::<bool>(),
+        ) {
+            let key = EnvKey::new(name.clone()).unwrap();
+            prop_assert_eq!(key.as_str(), name.as_str());
+            prop_assert_eq!(key.to_string(), name);
+            let sensitivity = if sensitive { Sensitivity::Sensitive } else { Sensitivity::Normal };
+            let value = EnvValue::classified(text, sensitivity).unwrap();
+            let base = BTreeMap::from([(key.clone(), value.clone())]);
+            let patch = EnvPatch::new(BTreeMap::from([(key.clone(), EnvEdit::Set(value))]));
+            let decoded: EnvPatch = serde_json::from_slice(&serde_json::to_vec(&patch).unwrap()).unwrap();
+            let applied = decoded.apply(&Env::new());
+            prop_assert_eq!(&applied, &base);
+            prop_assert_eq!(decoded.apply(&applied), applied);
+            prop_assert_eq!(decoded.len(), 1);
+            let removed = EnvPatch::new(BTreeMap::from([(key, EnvEdit::Unset)])).apply(&base);
+            prop_assert!(removed.is_empty());
+            prop_assert_eq!(base.len(), 1);
+        }
+    }
 
     fn key(value: &str) -> EnvKey {
         EnvKey::new(value).unwrap()
@@ -230,5 +257,15 @@ mod tests {
         assert_eq!(applied.get(&key("KEEP")).unwrap().as_str(), "yes");
         assert_eq!(applied.get(&key("ADD")).unwrap().as_str(), "");
         assert!(!applied.contains_key(&key("REMOVE")));
+        assert_eq!(patch.len(), 2);
+        assert_eq!(patch.get(&key("REMOVE")), Some(&EnvEdit::Unset));
+        assert_eq!(
+            patch
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["ADD", "REMOVE"]
+        );
+        assert_eq!(patch.into_iter().collect::<BTreeMap<_, _>>().len(), 2);
     }
 }

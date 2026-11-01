@@ -1,88 +1,37 @@
-# List all available commands
 default:
     @just --list
 
-# Format all code
+# Prepare Git hooks without pinning the local prek runner.
+install:
+    uvx --isolated prek install --prepare-hooks
+
+# Format Rust sources and this command file.
 format:
     just --fmt --unstable
     cargo fmt
 
-# Run all static checks (fmt check + clippy)
-check: architecture
-    cargo fmt --all -- --check
-    cargo clippy --all-targets -- -D warnings
+# Run formatting, Clippy, architecture and repository policy checks.
+check:
+    uvx --isolated prek run --all-files
 
-# Enforce crate boundaries that keep execution semantics closed.
-architecture:
-    uvx prek run alint --all-files
+# Build the workspace binaries.
+build *args:
+    cargo build --workspace --locked {{ args }}
 
-# Run tests
-test *ARGS:
-    cargo test {{ ARGS }}
+# Run workspace behavior tests or a selected Cargo test target.
+test *args:
+    cargo test --locked {{ args }}
 
-# Run tests with coverage (requires cargo-llvm-cov)
-cov:
+# Generate measured line coverage.
+coverage:
     cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
 
-# Open coverage HTML report
-cov-open:
-    cargo llvm-cov test --html -- --no-capture
-    open target/llvm-cov/html/index.html || xdg-open target/llvm-cov/html/index.html
+# Measure protocol framing on the local machine.
+benchmark:
+    cargo bench -p cue-protocol --bench framing --locked
 
-# Compile with the actual minimum supported Rust toolchain.
-msrv:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! command -v rustup >/dev/null 2>&1; then
-        echo "rustup is required to verify MSRV 1.95" >&2
-        exit 1
-    fi
+# Reproduce the source, compatibility and installed-package gates.
+ci: check test
     rustup run 1.95 cargo check --workspace --all-targets
-
-# Build and exercise the public wheel command surface.
-package-smoke:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    package_dir="$(mktemp -d "${TMPDIR:-/tmp}/cue-package-smoke.XXXXXX")"
-    trap 'rm -rf "$package_dir"' EXIT
-    uvx --from maturin==1.13.3 maturin build --release --locked --out "$package_dir"
-    uvx --from maturin==1.13.3 maturin sdist --out "$package_dir"
-    ./scripts/smoke_package.sh "$package_dir"/*.whl
-    ./scripts/smoke_package.sh "$package_dir"/*.tar.gz
-
-# Pack and exercise the canonical Cue Skill npm package.
-npm-package-smoke:
+    bash scripts/check_packages.sh
     node scripts/smoke_npm_package.mjs
-
-# Clean build artifacts
-clean:
-    rm -rf target/
-    rm -f lcov.info
-
-# Verify normalized crate packages, using Cargo's temporary workspace registry.
-crate-package-smoke:
-    cargo package --workspace --registry crates-io --locked
-
-# Full local CI gate.
-ci: check test msrv package-smoke npm-package-smoke
-
-# Run pre-commit on all files
-pre-commit:
-    uvx prek run --all-files
-
-# Install local git hooks via prek
-pre-commit-install:
-    uvx prek install --prepare-hooks
-
-# Remove local git hooks installed by prek
-pre-commit-uninstall:
-    uvx prek uninstall
-
-# Display project information
-info:
-    @echo "=== Cue ==="
-    @echo "Rust: $(rustc --version)"
-    @echo "Cargo: $(cargo --version)"
-    @echo ""
-    @echo "Workspace members:"
-    @cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.packages[].name' 2>/dev/null || echo "  (install jq for detailed info)"

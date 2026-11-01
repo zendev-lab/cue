@@ -1,0 +1,24 @@
+[package]
+name = "cue-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[[bin]]
+bench = false
+doc = false
+name = "boundaries"
+path = "fuzz_targets/boundaries.rs"
+test = false
+
+[dependencies]
+cue-core = { path = "../crates/cue-core" }
+cue-language = { path = "../crates/cue-language" }
+cue-protocol = { path = "../crates/cue-protocol" }
+libfuzzer-sys = "=0.4.13"

@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -11,6 +15,7 @@ permissions:
 # identify a merged release PR through GitHub's associated-PR API.
 jobs:
   create-tags:
+    timeout-minutes: 10
     name: Tag the merged release PR
     if: github.repository == 'zendev-lab/cue'
     runs-on: ubuntu-latest
@@ -22,7 +27,7 @@ jobs:
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         id: app
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
+          client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
@@ -38,6 +43,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
 
   release-pr:
+    timeout-minutes: 20
     name: Prepare the next release PR
     if: github.repository == 'zendev-lab/cue'
     # The release command pushes the vX.Y.Z tags for a merged release PR.
@@ -45,9 +51,6 @@ jobs:
     # concurrent release-pr run can treat the just-merged release commit as
     # unreleased work and open a redundant PR.
     needs: create-tags
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,7 +60,7 @@ jobs:
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         id: app
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
+          client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write

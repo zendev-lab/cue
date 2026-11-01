@@ -1,0 +1,13 @@
+id: core-process-exit
+language: Rust
+severity: error
+message: Core returns execution state; only executable owners may terminate the host process.
+note: ARCHITECTURE.md keeps physical process lifecycle outside cue-core.
+files:
+  - crates/cue-core/src/**/*.rs
+rule:
+  any:
+    - pattern: std::process::exit($CODE)
+    - pattern: std::process::abort()
+    - pattern: process::exit($CODE)
+    - pattern: process::abort()

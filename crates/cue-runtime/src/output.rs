@@ -1,4 +1,7 @@
+#[cfg(cue_loom)]
+use loom::sync::Mutex;
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(not(cue_loom))]
 use std::sync::Mutex;
 
 use cue_core::OutputStream;
@@ -161,9 +164,10 @@ impl RetainedStream {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(cue_loom)))]
 mod tests {
     use cue_core::ExecutionId;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -171,6 +175,30 @@ mod tests {
         StepId {
             execution: ExecutionId(1),
             index: 1,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn retention_is_the_bounded_suffix_of_all_appends(
+            capacity in 0usize..128,
+            chunks in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..64), 0..16),
+        ) {
+            let store = MemoryOutputStore::new(capacity);
+            let mut all = Vec::new();
+            for chunk in chunks {
+                let start = all.len();
+                all.extend_from_slice(&chunk);
+                let appended = store.append(step(), OutputStream::Stdout, &chunk).unwrap();
+                prop_assert_eq!(appended.start_offset, start as u64);
+                prop_assert_eq!(appended.end_offset, all.len() as u64);
+                let retained = store.read(step(), OutputStream::Stdout, 0, usize::MAX).unwrap();
+                let discarded = all.len().saturating_sub(capacity);
+                prop_assert_eq!(retained.offset, discarded as u64);
+                prop_assert_eq!(retained.next_offset, all.len() as u64);
+                prop_assert_eq!(retained.data, &all[discarded..]);
+                prop_assert_eq!(retained.truncated, discarded > 0);
+            }
         }
     }
 
@@ -209,5 +237,43 @@ mod tests {
             store.tail(step(), OutputStream::Stderr, 16).unwrap().data,
             b"err"
         );
+    }
+}
+
+#[cfg(all(test, cue_loom))]
+mod loom_tests {
+    use cue_core::ExecutionId;
+    use loom::{sync::Arc, thread};
+
+    use super::*;
+
+    #[test]
+    fn concurrent_appends_have_disjoint_offsets_and_keep_the_last_chunk() {
+        loom::model(|| {
+            let step = StepId {
+                execution: ExecutionId(1),
+                index: 1,
+            };
+            let store = Arc::new(MemoryOutputStore::new(2));
+            let writers = [b"aa", b"bb"].map(|data| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    let range = store.append(step, OutputStream::Stdout, data).unwrap();
+                    (range, data)
+                })
+            });
+            let [first, second] = writers.map(|writer| writer.join().unwrap());
+            let mut results = [first, second];
+            results.sort_by_key(|(range, _)| range.start_offset);
+            assert_eq!(results[0].0.start_offset, 0);
+            assert_eq!(results[0].0.end_offset, 2);
+            assert_eq!(results[1].0.start_offset, 2);
+            assert_eq!(results[1].0.end_offset, 4);
+            let retained = store.read(step, OutputStream::Stdout, 0, 8).unwrap();
+            assert_eq!(retained.offset, 2);
+            assert_eq!(retained.next_offset, 4);
+            assert_eq!(retained.data, results[1].1);
+            assert!(retained.truncated);
+        });
     }
 }

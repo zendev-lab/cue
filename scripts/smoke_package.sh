@@ -38,7 +38,7 @@ uv tool run --from "$package_path" cue-tui --version
 uv tool run --from "$package_path" cued --version
 
 mkdir -p "$XDG_CONFIG_HOME/cue"
-cat > "$XDG_CONFIG_HOME/cue/daemon.toml" <<'TOML'
+cat >"$XDG_CONFIG_HOME/cue/daemon.toml" <<'TOML'
 [[resources.providers]]
 id = "workers"
 kind = "static"
