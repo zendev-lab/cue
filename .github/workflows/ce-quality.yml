@@ -76,13 +76,13 @@ jobs:
           version: "0.13.5"
       - run: |
           mkdir -p reports
-          npx --yes jscpd@5.4.2 --reporters json --output reports/jscpd --ignore '**/target/**,**/tests/**' crates scripts
-          uvx lizard==1.24.3 --ignore_warnings -1 --xml crates > reports/complexity.xml
+          npx --yes --ignore-scripts jscpd@5.4.2 --reporters json --output reports/jscpd --ignore '**/target/**,**/tests/**' crates scripts
+          uvx --no-build lizard==1.24.3 --ignore_warnings -1 --xml crates > reports/complexity.xml
         shell: bash
       - run: |
           set -euo pipefail
           mkdir -p reports
-          git ls-files -z '*.md' ':(exclude).agents/notes/**' | xargs -0 uvx --from lychee-bin==0.24.2 lychee --scheme https --scheme http --timeout 20 --max-retries 1 --no-progress --format json --output reports/links.json
+          git ls-files -z '*.md' ':(exclude).agents/notes/**' | xargs -0 uvx --no-build --from lychee-bin==0.24.2 lychee --scheme https --scheme http --timeout 20 --max-retries 1 --no-progress --format json --output reports/links.json
         if: ${{ !cancelled() }}
         shell: bash
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -107,7 +107,7 @@ jobs:
       - name: Audit action provenance and references
         env:
           GH_TOKEN: ${{ github.token }}
-        run: uvx --with shellcheck-py==0.11.0.1 --with ruff==0.17.3 jactionlint==2.3.0 --online=strict
+        run: uvx --no-build --with shellcheck-py==0.11.0.1 --with ruff==0.17.3 jactionlint==2.3.0 --online=strict
           --online-report=workflow-audit.json --shellcheck=shellcheck --ruff=ruff
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
