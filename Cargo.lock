@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "cue-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "cue-client",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "cue-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "cue-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "proptest",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "cue-daemon"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "cue-core",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "cue-language"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "cue-core",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "cue-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.23.1",
  "codspeed-criterion-compat",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "cue-resources"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "cue-core",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "cue-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cue-core",
  "libc",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "cue-store-sqlite"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "cue-core",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "cue-tui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
